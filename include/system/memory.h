@@ -1508,9 +1508,10 @@ void memory_region_set_skip_iommu_map(MemoryRegion *mr, bool skip);
 
 /**
  * memory_region_has_guest_memfd: check whether a memory region has guest_memfd
- *     associated
+ *     associated with it for handling private memory
  *
- * Returns %true if a memory region's ram_block has valid guest_memfd assigned.
+ * Returns %true if a memory region's ram_block has valid guest_memfd assigned
+ * for handling private memory.
  *
  * @mr: the memory region being queried
  */
