@@ -144,3 +144,9 @@ int kvm_create_guest_memfd_private(uint64_t size, Error **errp)
     error_setg(errp, "guest_memfd is not supported for this configuration");
     return -ENOSYS;
 }
+
+int kvm_create_guest_memfd_shared(uint64_t size, Error **errp)
+{
+    error_setg(errp, "guest_memfd is not supported for this configuration");
+    return -ENOSYS;
+}

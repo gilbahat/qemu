@@ -22,6 +22,7 @@ if host_os != 'windows'
 endif
 if host_os == 'linux'
   system_ss.add(files('host_iommu_device.c'))
+  system_ss.add(files('hostmem-guest-memfd.c'))
 endif
 # memfd_create(2) is Linux-only, but hostmem-memfd.c falls back to a plain
 # anonymous file elsewhere, so build it on every host (needed by the

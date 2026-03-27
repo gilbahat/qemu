@@ -5962,6 +5962,11 @@ SRST
         off will cause a failure during allocation because it is not supported
         by this backend.
 
+    ``-object memory-backend-guest-memfd,id=id,prealloc=on|off,size=size,host-nodes=host-nodes,policy=default|preferred|bind|interleave``
+        Creates an anonymous memory file backend object that has similar
+        semantics to memfd, but is also usable as private memory when
+        running as a confidential VM. (Linux only)
+
     ``-object iommufd,id=id[,fd=fd]``
         Creates an iommufd backend which allows control of DMA mapping
         through the ``/dev/iommu`` device.
