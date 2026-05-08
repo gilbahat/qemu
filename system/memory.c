@@ -35,6 +35,7 @@
 #include "hw/core/boards.h"
 #include "migration/vmstate.h"
 #include "system/address-spaces.h"
+#include "system/confidential-guest-support.h"
 
 #include "memory-internal.h"
 
@@ -3621,10 +3622,25 @@ bool memory_region_init_ram_guest_memfd(MemoryRegion *mr, Object *owner,
                                         const char *name, uint64_t size,
                                         Error **errp)
 {
-    if (!memory_region_init_ram_flags_nomigrate(mr, owner, name, size,
-                                                RAM_GUEST_MEMFD, errp)) {
-        return false;
+    if (current_machine->cgs && current_machine->cgs->convert_in_place) {
+        int fd = kvm_create_guest_memfd_shared(size, errp);
+        if (fd < 0) {
+            return false;
+        }
+
+        if (!memory_region_init_ram_from_fd(mr, owner, name, size,
+                                            RAM_SHARED | RAM_GUEST_MEMFD |
+                                            RAM_GUEST_MEMFD_SHARED,
+                                            fd, 0, errp)) {
+                return false;
+        }
+    } else {
+        if (!memory_region_init_ram_flags_nomigrate(mr, owner, name, size,
+                                                    RAM_GUEST_MEMFD, errp)) {
+            return false;
+        }
     }
+
     memory_region_register_ram(mr, owner);
     return true;
 }
