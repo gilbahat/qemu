@@ -102,6 +102,7 @@ Board-specific documentation
    arm/stellaris
    arm/stm32
    arm/virt
+   arm/nitro-enclave
    arm/vmapple
    arm/xenpvh
    arm/xlnx-versal-virt

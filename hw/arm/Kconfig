@@ -38,6 +38,16 @@ config ARM_VIRT
     select ACPI_HMAT
     select WDT_SBSA
 
+config NITRO_ENCLAVE_AARCH64
+    default y
+    depends on AARCH64 && FDT # for ARM_VIRT
+    depends on LIBCBOR && GNUTLS # for EIF and VIRTIO_NSM
+    depends on VHOST_USER # for VHOST_USER_VSOCK
+    select EIF
+    select ARM_VIRT
+    select VHOST_USER_VSOCK
+    select VIRTIO_NSM
+
 config CUBIEBOARD
     bool
     default y

@@ -446,8 +446,13 @@ bool read_eif_file(const char *eif_path, const char *machine_initrd,
         goto cleanup;
     }
 
-    if (eif_header.flags != 0) {
-        error_setg(errp, "Expected EIF flags to be 0");
+    /*
+     * The only defined header flag is the architecture bit (0 = x86_64,
+     * EIF_HDR_ARCH_ARM64 = aarch64). Accept it so aarch64 EIFs load; reject
+     * any other (unknown) flag bits.
+     */
+    if (eif_header.flags & ~EIF_HDR_ARCH_ARM64) {
+        error_setg(errp, "Unexpected EIF header flags 0x%x", eif_header.flags);
         goto cleanup;
     }
 
