@@ -18,9 +18,12 @@ if host_os != 'windows'
   endif
 endif
 if host_os == 'linux'
-  system_ss.add(files('hostmem-memfd.c'))
   system_ss.add(files('host_iommu_device.c'))
 endif
+# memfd_create(2) is Linux-only, but hostmem-memfd.c falls back to a plain
+# anonymous file elsewhere, so build it on every host (needed by the
+# nitro-enclave machine's default memory backend on macOS).
+system_ss.add(files('hostmem-memfd.c'))
 if keyutils.found()
     system_ss.add(keyutils, files('cryptodev-lkcf.c'))
 endif

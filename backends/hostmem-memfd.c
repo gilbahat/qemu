@@ -50,9 +50,29 @@ memfd_backend_memory_alloc(HostMemoryBackend *backend, Error **errp)
     fd = qemu_memfd_create(TYPE_MEMORY_BACKEND_MEMFD, backend->size,
                            m->hugetlb, m->hugetlbsize, m->seal ?
                            F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL : 0,
-                           errp);
+                           NULL);
     if (fd == -1) {
-        return false;
+        /*
+         * memfd_create(2) is Linux-only. Fall back to an anonymous,
+         * unlinked file, which is enough to hand a shareable fd to a
+         * vhost-user backend (e.g. for the nitro-enclave machine on
+         * macOS) even without memfd sealing support.
+         */
+        g_autofree char *tmpl = g_strdup_printf("%s/qemu-memfd-XXXXXX",
+                                                g_get_tmp_dir());
+        fd = mkstemp(tmpl);
+        if (fd == -1) {
+            error_setg_errno(errp, errno,
+                             "failed to create memfd backend file");
+            return false;
+        }
+        unlink(tmpl);
+        if (ftruncate(fd, backend->size) == -1) {
+            error_setg_errno(errp, errno,
+                             "failed to resize memfd backend file");
+            close(fd);
+            return false;
+        }
     }
     cpr_save_fd(name, 0, fd);
 
@@ -169,9 +189,13 @@ static const TypeInfo memfd_backend_info = {
 
 static void register_types(void)
 {
-    if (qemu_memfd_check(MFD_ALLOW_SEALING)) {
-        type_register_static(&memfd_backend_info);
-    }
+    /*
+     * Always register: memfd_backend_memory_alloc() falls back to a plain
+     * anonymous file when the host has no memfd_create(2) (e.g. macOS), so
+     * this backend stays usable there, just without sealing. This is needed
+     * by the nitro-enclave machine's default memory backend.
+     */
+    type_register_static(&memfd_backend_info);
 }
 
 type_init(register_types);

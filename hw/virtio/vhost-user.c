@@ -1495,7 +1495,14 @@ static int vhost_user_set_vring_kick(struct vhost_dev *dev,
     /*
      * Inject a kick in case the back-end only starts vring processing upon
      * receiving a kick. The spec suggests this to improve compatibility.
+     *
+     * This writes to the kick fd, which is only valid when it is a
+     * bidirectional eventfd. On hosts without eventfd (e.g. macOS) the notifier
+     * is emulated with a pipe and file->fd is the read end, which cannot be
+     * written (write() fails with EBADF). Skip the best-effort injection there
+     * and rely on the guest's real kicks to start vring processing.
      */
+#ifdef CONFIG_EVENTFD
     if (file->fd != -1) {
         uint64_t val = 1;
         ssize_t nwritten;
@@ -1508,6 +1515,7 @@ static int vhost_user_set_vring_kick(struct vhost_dev *dev,
             return -errno;
         }
     }
+#endif
 
     return 0;
 }
