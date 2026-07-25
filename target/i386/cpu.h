@@ -186,6 +186,7 @@ typedef enum X86Seg {
 #define HF_MPX_IU_SHIFT     26 /* BND registers in-use */
 #define HF_UMIP_SHIFT       27 /* CR4.UMIP */
 #define HF_AVX_EN_SHIFT     28 /* AVX Enabled (CR4+XCR0) */
+#define HF_TDX_SHIFT        29 /* emulated TDX guest (TCG only, x-tdx-guest) */
 
 #define HF_CPL_MASK          (3 << HF_CPL_SHIFT)
 #define HF_INHIBIT_IRQ_MASK  (1 << HF_INHIBIT_IRQ_SHIFT)
@@ -213,6 +214,7 @@ typedef enum X86Seg {
 #define HF_MPX_IU_MASK       (1 << HF_MPX_IU_SHIFT)
 #define HF_UMIP_MASK         (1 << HF_UMIP_SHIFT)
 #define HF_AVX_EN_MASK       (1 << HF_AVX_EN_SHIFT)
+#define HF_TDX_MASK          (1 << HF_TDX_SHIFT)
 
 /* hflags2 */
 
@@ -1503,6 +1505,9 @@ uint64_t x86_cpu_get_supported_feature_word(X86CPU *cpu, FeatureWord w);
 #define EXCP10_COPR     16
 #define EXCP11_ALGN     17
 #define EXCP12_MCHK     18
+#define EXCP13_XMERR    19
+#define EXCP14_VE       20 /* virtualization exception (emulated TDX guest) */
+#define EXCP15_CP       21
 
 #define EXCP_VMEXIT     0x100 /* only for system emulation */
 #define EXCP_SYSCALL    0x101 /* only for user emulation */
@@ -2213,6 +2218,20 @@ typedef struct CPUArchState {
     uint64_t msr_rapl_power_unit;
     uint64_t msr_pkg_energy_status;
 
+    /*
+     * Emulated-TDX #VE information latch (TCG only).  A TD guest reads this
+     * with TDG.VP.VEINFO.GET; there is no VE-info page and no
+     * IA32_VE_INFO_ADDRESS MSR (those are plain-VMX constructs).  Placed
+     * before end_reset_fields so that a reset invalidates the latch.
+     */
+    uint64_t tdx_ve_exit_qual;
+    uint64_t tdx_ve_gla;
+    uint64_t tdx_ve_gpa;
+    uint32_t tdx_ve_exit_reason;
+    uint32_t tdx_ve_instr_len;
+    uint32_t tdx_ve_instr_info;
+    bool tdx_ve_valid;
+
     /* Fields up to this point are cleared by a CPU reset */
     struct {} end_reset_fields;
 
@@ -2517,6 +2536,22 @@ struct ArchCPU {
     int32_t hv_max_vps;
 
     bool xen_vapic;
+
+    /*
+     * Experimental TCG-only emulation of the Intel TDX *guest* ABI.  This is
+     * not Intel TDX: there is no memory encryption, no measured launch and no
+     * genuine attestation.  See docs/system/i386/tdx-tcg.rst.
+     */
+    bool tdx_guest;
+    bool tdx_strict;
+    bool tdx_ve_io;
+    bool tdx_ve_msr;
+    bool tdx_ve_cpuid;
+    bool tdx_ve_hlt;
+    uint8_t tdx_gpaw;
+    uint64_t tdx_attributes;
+    /* Derived from the x-tdx-ve-* properties at realize; see TDX_VE_*. */
+    uint32_t tdx_ve_mask;
 };
 
 typedef struct X86CPUModel X86CPUModel;

@@ -90,6 +90,13 @@ DEF_HELPER_2(vmload, void, env, int)
 DEF_HELPER_2(vmsave, void, env, int)
 DEF_HELPER_1(stgi, void, env)
 DEF_HELPER_1(clgi, void, env)
+#ifdef TARGET_X86_64
+DEF_HELPER_1(tdcall, void, env)
+DEF_HELPER_2(tdx_ve_hlt, void, env, i32)
+DEF_HELPER_4(tdx_ve_io, void, env, i32, i32, i32)
+DEF_HELPER_3(tdx_ve_msr, void, env, i32, i32)
+DEF_HELPER_2(tdx_ve_cpuid, void, env, i32)
+#endif
 DEF_HELPER_FLAGS_2(flush_page, TCG_CALL_NO_RWG, void, env, tl)
 DEF_HELPER_FLAGS_1(hlt, TCG_CALL_NO_WG, noreturn, env)
 DEF_HELPER_FLAGS_2(monitor, TCG_CALL_NO_WG, void, env, tl)

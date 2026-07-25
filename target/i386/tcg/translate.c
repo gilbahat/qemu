@@ -176,12 +176,14 @@ typedef struct DisasContext {
 #define IOPL(S)   0
 #define SVME(S)   false
 #define GUEST(S)  false
+#define TDX(S)    false
 #else
 #define PE(S)     (((S)->flags & HF_PE_MASK) != 0)
 #define CPL(S)    ((S)->cpl)
 #define IOPL(S)   ((S)->iopl)
 #define SVME(S)   (((S)->flags & HF_SVME_MASK) != 0)
 #define GUEST(S)  (((S)->flags & HF_GUEST_MASK) != 0)
+#define TDX(S)    (((S)->flags & HF_TDX_MASK) != 0)
 #endif
 #if defined(CONFIG_USER_ONLY) && defined(TARGET_X86_64)
 #define VM86(S)   false
@@ -245,6 +247,14 @@ STUB_HELPER(stgi, TCGv_env env)
 STUB_HELPER(svm_check_intercept, TCGv_env env, TCGv_i32 type)
 STUB_HELPER(vmload, TCGv_env env, TCGv_i32 aflag)
 STUB_HELPER(vmmcall, TCGv_env env)
+#ifdef TARGET_X86_64
+STUB_HELPER(tdcall, TCGv_env env)
+STUB_HELPER(tdx_ve_hlt, TCGv_env env, TCGv_i32 len)
+STUB_HELPER(tdx_ve_io, TCGv_env env, TCGv_i32 port, TCGv_i32 qual,
+            TCGv_i32 len)
+STUB_HELPER(tdx_ve_msr, TCGv_env env, TCGv_i32 is_write, TCGv_i32 len)
+STUB_HELPER(tdx_ve_cpuid, TCGv_env env, TCGv_i32 len)
+#endif
 STUB_HELPER(vmrun, TCGv_env env, TCGv_i32 aflag, TCGv_i32 pc_ofs)
 STUB_HELPER(vmsave, TCGv_env env, TCGv_i32 aflag)
 STUB_HELPER(write_crN, TCGv_env env, TCGv_i32 reg, TCGv val)
@@ -761,6 +771,31 @@ static bool gen_check_io(DisasContext *s, MemOp ot, TCGv_i32 port,
     if (PE(s) && (CPL(s) > IOPL(s) || VM86(s))) {
         gen_helper_check_io(tcg_env, port, tcg_constant_i32(1 << ot));
     }
+#ifdef TARGET_X86_64
+    if (TDX(s)) {
+        /*
+         * VMX I/O exit qualification: bits 2:0 size-1, bit 3 direction (1 =
+         * IN), bit 4 string, bit 5 REP.  Everything needed is known here and
+         * not inside the helper_inb/helper_outb family, which is why the hook
+         * lives in the translator; it also covers the string forms for free.
+         */
+        uint32_t qual = (1 << ot) - 1;
+
+        if (svm_flags & SVM_IOIO_TYPE_MASK) {
+            qual |= 1 << 3;
+        }
+        if (svm_flags & SVM_IOIO_STR_MASK) {
+            qual |= 1 << 4;
+        }
+        if (s->prefix & (PREFIX_REPZ | PREFIX_REPNZ)) {
+            qual |= 1 << 5;
+        }
+        gen_update_cc_op(s);
+        gen_update_eip_cur(s);
+        gen_helper_tdx_ve_io(tcg_env, port, tcg_constant_i32(qual),
+                             cur_insn_len_i32(s));
+    }
+#endif
     if (GUEST(s)) {
         gen_update_cc_op(s);
         gen_update_eip_cur(s);
@@ -2874,6 +2909,27 @@ static void gen_multi0F(DisasContext *s, X86DecodedInsn *decode)
             s->base.is_jmp = DISAS_EOB_NEXT;
             break;
 
+#ifdef TARGET_X86_64
+        case 0xcc: /* TDCALL (66 0F 01 CC), emulated Intel TDX guest */
+            /*
+             * The 66 prefix is mandatory: a bare 0F 01 CC stays undefined.
+             * Restricted to 64-bit mode, where the TDCALL register ABI is
+             * defined and R8-R15 exist.
+             */
+            if (!TDX(s) || !CODE64(s) || !(s->prefix & PREFIX_DATA)
+                || (s->prefix & (PREFIX_REPZ | PREFIX_REPNZ))) {
+                goto illegal_op;
+            }
+            if (!check_cpl0(s)) {
+                break;
+            }
+            gen_update_cc_op(s);
+            gen_update_eip_cur(s);
+            gen_helper_tdcall(tcg_env);
+            s->base.is_jmp = DISAS_EOB_NEXT;
+            break;
+#endif
+
         CASE_MODRM_MEM_OP(1): /* sidt */
             if (s->flags & HF_UMIP_MASK && !check_cpl0(s)) {
                 break;
@@ -3464,6 +3520,7 @@ static void i386_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)
     g_assert(ADDSEG(dc) == ((flags & HF_ADDSEG_MASK) != 0));
     g_assert(SVME(dc) == ((flags & HF_SVME_MASK) != 0));
     g_assert(GUEST(dc) == ((flags & HF_GUEST_MASK) != 0));
+    g_assert(TDX(dc) == ((flags & HF_TDX_MASK) != 0));
 
     dc->cc_op = CC_OP_DYNAMIC;
     dc->cc_op_dirty = false;

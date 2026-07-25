@@ -32,6 +32,7 @@ Architectural features
    i386/sgx
    i386/amd-memory-encryption
    i386/tdx
+   i386/tdx-tcg
 
 OS requirements
 ~~~~~~~~~~~~~~~

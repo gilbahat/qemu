@@ -8,6 +8,12 @@ in a CPU mode that is designed to protect the confidentiality of its memory
 contents and its CPU state from any other software, including the hosting
 Virtual Machine Monitor (VMM), unless explicitly shared by the TD itself.
 
+This document describes real TDX, which requires KVM and TDX-capable hardware
+and is configured with ``-object tdx-guest``. QEMU also has a separate,
+experimental, TCG-only *emulation* of the guest-visible TDX interface, enabled
+with ``-cpu ...,x-tdx-guest=on``; it is unrelated to anything below, enforces
+no security properties whatsoever, and is documented in :doc:`tdx-tcg`.
+
 Prerequisites
 -------------
 

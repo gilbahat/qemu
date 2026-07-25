@@ -7,4 +7,5 @@ i386_system_ss.add(when: ['CONFIG_TCG', 'CONFIG_SYSTEM_ONLY'], if_true: files(
   'fpu_helper.c',
   'svm_helper.c',
   'seg_helper.c',
+  'tdx.c',
 ))

@@ -24,6 +24,8 @@
 #include "qemu/hw-version.h"
 #include "cpu.h"
 #include "tcg/helper-tcg.h"
+/* Emulated TDX guest (TCG); unrelated to kvm/tdx.h, which drives real TDX. */
+#include "tcg/system/tdx.h"
 #include "exec/translation-block.h"
 #include "system/hvf.h"
 #include "system/mshv.h"
@@ -9043,6 +9045,19 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
 
         encode_topo_cpuid1f(env, count, topo_info, eax, ebx, ecx, edx);
         break;
+    case 0x21:
+        /*
+         * Intel TDX guest identification leaf.  Reports "IntelTDX    " in
+         * EBX:EDX:ECX, exactly as the TDX module does, so that a guest which
+         * probes for real hardware sees the same bytes here.
+         */
+        *eax = *ebx = *ecx = *edx = 0;
+        if (cpu->tdx_guest && count == 0) {
+            *ebx = TDX_CPUID_SIG_EBX;
+            *edx = TDX_CPUID_SIG_EDX;
+            *ecx = TDX_CPUID_SIG_ECX;
+        }
+        break;
     case 0x24: {
         *eax = 0;
         *ebx = 0;
@@ -9398,6 +9413,17 @@ static void x86_cpu_reset_hold(Object *obj, ResetType type)
     env->hflags2 |= HF2_GIF_MASK;
     env->hflags2 |= HF2_VGIF_MASK;
     env->hflags &= ~HF_GUEST_MASK;
+#ifdef TARGET_X86_64
+    /*
+     * hflags lies before end_reset_fields, so the memset above has just
+     * cleared it.  Unlike HF_SVME_MASK, which cpu_load_efer() re-derives,
+     * nothing else reinstates the emulated-TDX bit -- do it here so it is
+     * correct after both realize and a machine reset.
+     */
+    if (cpu->tdx_guest) {
+        env->hflags |= HF_TDX_MASK;
+    }
+#endif
 
     cpu_x86_update_cr0(env, 0x60000010);
     env->a20_mask = ~0x0;
@@ -9844,6 +9870,11 @@ void x86_cpu_expand_features(X86CPU *cpu, Error **errp)
         x86_cpu_adjust_level(cpu, &env->cpuid_min_level, 0x24);
     }
 
+    /* The emulated TDX guest is enumerated through CPUID[0x21] */
+    if (cpu->tdx_guest) {
+        x86_cpu_adjust_level(cpu, &env->cpuid_min_level, 0x21);
+    }
+
     /* Advanced Performance Extensions (APX) requires CPUID[0x29] */
     if (env->features[FEAT_7_1_EDX] & CPUID_7_1_EDX_APXF) {
         x86_cpu_adjust_level(cpu, &env->cpuid_min_level, 0x29);
@@ -10083,6 +10114,50 @@ static void x86_cpu_realizefn(DeviceState *dev, Error **errp)
         error_setg(errp, "x-vendor-cpuid-only-v2 property "
                    "depends on x-vendor-cpuid-only");
         return;
+    }
+
+    if (cpu->tdx_guest) {
+#ifndef TARGET_X86_64
+        error_setg(errp, "x-tdx-guest requires a 64-bit x86 target");
+        return;
+#else
+        if (!tcg_enabled()) {
+            error_setg(errp, "x-tdx-guest emulates the TDX guest ABI in TCG "
+                       "and is only supported with -accel tcg; for real TDX "
+                       "use -object tdx-guest with KVM");
+            return;
+        }
+        if (cpu->tdx_gpaw < 32 || cpu->tdx_gpaw > 63) {
+            error_setg(errp, "x-tdx-gpaw must be in [32,63] "
+                       "(real TDX reports 48 or 52)");
+            return;
+        }
+        if (cpu->tdx_attributes & TDX_TD_ATTR_DEBUG) {
+            error_setg(errp, "x-tdx-attributes: the DEBUG bit (0) cannot be "
+                       "set; a debuggable TD is not emulated");
+            return;
+        }
+        if (cpu->tdx_strict) {
+            cpu->tdx_ve_io = true;
+            cpu->tdx_ve_msr = true;
+            cpu->tdx_ve_cpuid = true;
+            cpu->tdx_ve_hlt = true;
+        }
+        cpu->tdx_ve_mask = (cpu->tdx_ve_io ? TDX_VE_IO : 0)
+                         | (cpu->tdx_ve_msr ? TDX_VE_MSR : 0)
+                         | (cpu->tdx_ve_cpuid ? TDX_VE_CPUID : 0)
+                         | (cpu->tdx_ve_hlt ? TDX_VE_HLT : 0);
+        /*
+         * Note: cpu->phys_bits is not assigned until later in realize, so the
+         * GPAW-vs-phys_bits relationship cannot be checked here.  TCG pins
+         * phys_bits to 40 while the default GPAW is 48, so the SHARED GPA bit
+         * is above the addressable range; tdx_strip_shared() masks it off.
+         */
+        warn_report("x-tdx-guest is an EXPERIMENTAL TCG emulation of the "
+                    "Intel TDX *guest* ABI. There is no memory encryption, "
+                    "no measured launch and NO GENUINE ATTESTATION. Do not "
+                    "rely on it for any security property.");
+#endif
     }
 
     if (cpu->apic_id == UNASSIGNED_APIC_ID) {
@@ -10849,6 +10924,22 @@ static const Property x86_cpu_properties[] = {
                      arch_cap_always_on, false),
     DEFINE_PROP_BOOL("x-pdcm-on-even-without-pmu", X86CPU,
                      pdcm_on_even_without_pmu, false),
+
+    /*
+     * Experimental TCG-only emulation of the Intel TDX *guest* ABI, for
+     * developing and testing TD guest software without TDX hardware.  The
+     * "x-" prefix is a reminder that this is experimental and may change or
+     * be removed without notice.  It provides no confidentiality and no
+     * genuine attestation; see docs/system/i386/tdx-tcg.rst.
+     */
+    DEFINE_PROP_BOOL("x-tdx-guest", X86CPU, tdx_guest, false),
+    DEFINE_PROP_UINT8("x-tdx-gpaw", X86CPU, tdx_gpaw, 48),
+    DEFINE_PROP_UINT64("x-tdx-attributes", X86CPU, tdx_attributes, 0),
+    DEFINE_PROP_BOOL("x-tdx-strict", X86CPU, tdx_strict, false),
+    DEFINE_PROP_BOOL("x-tdx-ve-io", X86CPU, tdx_ve_io, false),
+    DEFINE_PROP_BOOL("x-tdx-ve-msr", X86CPU, tdx_ve_msr, false),
+    DEFINE_PROP_BOOL("x-tdx-ve-cpuid", X86CPU, tdx_ve_cpuid, false),
+    DEFINE_PROP_BOOL("x-tdx-ve-hlt", X86CPU, tdx_ve_hlt, false),
 };
 
 #ifndef CONFIG_USER_ONLY

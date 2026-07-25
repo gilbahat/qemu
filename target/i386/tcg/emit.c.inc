@@ -1907,6 +1907,11 @@ static void gen_CPUID(DisasContext *s, X86DecodedInsn *decode)
 {
     gen_update_cc_op(s);
     gen_update_eip_cur(s);
+#ifdef TARGET_X86_64
+    if (TDX(s)) {
+        gen_helper_tdx_ve_cpuid(tcg_env, cur_insn_len_i32(s));
+    }
+#endif
     gen_helper_cpuid(tcg_env);
 }
 
@@ -2053,6 +2058,17 @@ static void gen_HLT(DisasContext *s, X86DecodedInsn *decode)
 {
 #ifdef CONFIG_SYSTEM_ONLY
     gen_update_cc_op(s);
+#ifdef TARGET_X86_64
+    /*
+     * A TD guest takes #VE on HLT.  Check before gen_update_eip_next() so the
+     * fault is reported at the HLT itself: with CF_PCREL, unwinding from an
+     * already-advanced EIP mis-resolves when the HLT ends a page.
+     */
+    if (TDX(s)) {
+        gen_update_eip_cur(s);
+        gen_helper_tdx_ve_hlt(tcg_env, cur_insn_len_i32(s));
+    }
+#endif
     gen_update_eip_next(s);
     gen_helper_hlt(tcg_env);
     s->base.is_jmp = DISAS_NORETURN;
@@ -3562,6 +3578,12 @@ static void gen_RDMSR(DisasContext *s, X86DecodedInsn *decode)
 {
     gen_update_cc_op(s);
     gen_update_eip_cur(s);
+#ifdef TARGET_X86_64
+    if (TDX(s)) {
+        gen_helper_tdx_ve_msr(tcg_env, tcg_constant_i32(0),
+                              cur_insn_len_i32(s));
+    }
+#endif
     gen_helper_rdmsr(tcg_env);
 }
 #else
@@ -4702,6 +4724,12 @@ static void gen_WRMSR(DisasContext *s, X86DecodedInsn *decode)
 {
     gen_update_cc_op(s);
     gen_update_eip_cur(s);
+#ifdef TARGET_X86_64
+    if (TDX(s)) {
+        gen_helper_tdx_ve_msr(tcg_env, tcg_constant_i32(1),
+                              cur_insn_len_i32(s));
+    }
+#endif
     gen_helper_wrmsr(tcg_env);
     s->base.is_jmp = DISAS_EOB_NEXT;
 }
