@@ -248,6 +248,15 @@ It is computed at the transition to running: ROMs reach guest memory in the
 initial reset, which happens after every machine-init-done notifier, and no vCPU
 has executed yet — which is launch time.
 
+Which pages count as the launch image depends on the loader. One placed as a ROM
+is found with ``rom_ptr()``; a multiboot kernel using
+``MULTIBOOT_HEADER_HAS_ADDR`` or a Linux bzImage is published through fw_cfg and
+copied in by a DMA option ROM running inside the guest, so those loaders record
+their extent at load time and the model consults that too. Without it such a
+guest cannot boot in strict mode and cannot fix it from inside — the first
+checked access is the fetch right after paging is enabled, on the page being
+fetched from.
+
 Not modelled
 ------------
 

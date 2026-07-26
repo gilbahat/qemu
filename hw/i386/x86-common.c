@@ -32,6 +32,7 @@
 #include "trace.h"
 
 #include "hw/i386/x86.h"
+#include "hw/i386/x86-launch-image.h"
 #include "target/i386/cpu.h"
 #include "hw/rtc/mc146818rtc.h"
 #include "target/i386/sev.h"
@@ -967,6 +968,10 @@ void x86_load_linux(X86MachineState *x86ms,
     fw_cfg_add_i32(fw_cfg, FW_CFG_KERNEL_SIZE, kernel_size - setup_size);
     fw_cfg_add_bytes(fw_cfg, FW_CFG_KERNEL_DATA,
                      kernel + setup_size, kernel_size - setup_size);
+
+    /* Same reasoning as the multiboot path: published, not placed. */
+    x86_launch_image_add(prot_addr, kernel + setup_size,
+                         kernel_size - setup_size, kernel_size - setup_size);
     sev_load_ctx.kernel_data = (char *)kernel + setup_size;
     sev_load_ctx.kernel_size = kernel_size - setup_size;
 

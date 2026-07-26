@@ -27,6 +27,7 @@
 #include "target/i386/cpu.h"
 #include "hw/nvram/fw_cfg.h"
 #include "multiboot.h"
+#include "hw/i386/x86-launch-image.h"
 #include "hw/core/loader.h"
 #include "elf.h"
 #include "exec/target_page.h"
@@ -288,6 +289,15 @@ int load_multiboot(X86MachineState *x86ms,
     mbs.mb_buf_phys = mh_load_addr;
 
     mbs.mb_buf_size = TARGET_PAGE_ALIGN(mb_kernel_size);
+
+    /*
+     * Record the payload as the launch image.  The bytes go out through fw_cfg
+     * and only reach guest memory once multiboot_dma.bin has run inside the
+     * guest, so nothing else can tell an emulated confidential guest that these
+     * pages are the image it booted from.
+     */
+    x86_launch_image_add(mbs.mb_buf_phys, mbs.mb_buf, mb_kernel_size,
+                         mbs.mb_buf_size);
     mbs.offset_mbinfo = mbs.mb_buf_size;
 
     /* Calculate space for cmdlines, bootloader name, and mb_mods */

@@ -19,6 +19,7 @@
 #include "system/memory.h"
 #include "migration/vmstate.h"
 #include "hw/i386/tdx-dma.h"
+#include "hw/i386/x86-launch-image.h"
 #include "tcg/helper-tcg.h"
 #include "hw/core/loader.h"
 #include "exec/target_page.h"
@@ -198,12 +199,26 @@ static void tdx_measure_launch_image(void *opaque, bool running, RunState state)
     for (gpa = 0; gpa < ram_size; gpa += TARGET_PAGE_SIZE) {
         uint64_t le_gpa;
 
-        if (!rom_ptr(gpa, 1)) {
-            continue;
-        }
-        if (address_space_read(&address_space_memory, gpa,
-                               MEMTXATTRS_UNSPECIFIED, page,
-                               TARGET_PAGE_SIZE) != MEMTX_OK) {
+        const void *src;
+        size_t valid;
+
+        if (x86_launch_image_page(gpa, &src, &valid)) {
+            /*
+             * Measure the emulator's own copy: for this load path the bytes are
+             * not in guest memory yet, and once they are the guest has already
+             * been running.
+             */
+            memset(page, 0, TARGET_PAGE_SIZE);
+            if (src && valid) {
+                memcpy(page, src, valid);
+            }
+        } else if (rom_ptr(gpa, 1)) {
+            if (address_space_read(&address_space_memory, gpa,
+                                   MEMTXATTRS_UNSPECIFIED, page,
+                                   TARGET_PAGE_SIZE) != MEMTX_OK) {
+                continue;
+            }
+        } else {
             continue;
         }
         le_gpa = cpu_to_le64(gpa);
@@ -303,8 +318,18 @@ static TdxPageState tdx_sept_default(CPUX86State *env, hwaddr gpa)
     if (cpu->tdx_sept == TDX_SEPT_LAZY) {
         return TDX_PAGE_PRIVATE_ACCEPTED;
     }
-    return rom_ptr(gpa & TARGET_PAGE_MASK, 1) ? TDX_PAGE_PRIVATE_ACCEPTED
-                                              : TDX_PAGE_PRIVATE_PENDING;
+    /*
+     * Two oracles, because there are two ways an image reaches guest memory.
+     * rom_ptr() covers what the loader placed as a ROM; the launch-image
+     * registry covers the -kernel paths that publish through fw_cfg and let a
+     * DMA option ROM copy it in, where there is no ROM to find and the bytes
+     * are not in memory until the guest itself has run.
+     */
+    if (rom_ptr(gpa & TARGET_PAGE_MASK, 1) ||
+        x86_launch_image_contains(gpa & TARGET_PAGE_MASK)) {
+        return TDX_PAGE_PRIVATE_ACCEPTED;
+    }
+    return TDX_PAGE_PRIVATE_PENDING;
 }
 
 static gpointer tdx_sept_key(hwaddr gpa)

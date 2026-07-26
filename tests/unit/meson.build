@@ -84,6 +84,7 @@ if have_block
     # message protocol, which needs an AEAD mode the crypto API does not have.
     # Compiled in directly: it lives in a target-specific library otherwise.
     'test-snp-gcm': [files('../../target/i386/tcg/system/snp-gcm.c'), crypto],
+    'test-x86-launch-image': [files('../../hw/i386/x86-launch-image.c')],
     'test-crypto-akcipher': [crypto],
     'test-crypto-secret': [crypto, keyutils],
     'test-crypto-der': [crypto],

@@ -31,6 +31,7 @@
 #include "snp.h"
 #include "snp-gcm.h"
 #include "hw/i386/snp-dma.h"
+#include "hw/i386/x86-launch-image.h"
 
 #ifdef TARGET_X86_64
 
@@ -186,12 +187,21 @@ static void snp_measure_launch_image(void *opaque, bool running, RunState state)
     for (gpa = 0; gpa < ram_size; gpa += TARGET_PAGE_SIZE) {
         uint64_t le_gpa;
 
-        if (!rom_ptr(gpa, 1)) {
-            continue;
-        }
-        if (address_space_read(&address_space_memory, gpa,
-                               MEMTXATTRS_UNSPECIFIED, page,
-                               TARGET_PAGE_SIZE) != MEMTX_OK) {
+        const void *src;
+        size_t valid;
+
+        if (x86_launch_image_page(gpa, &src, &valid)) {
+            memset(page, 0, TARGET_PAGE_SIZE);
+            if (src && valid) {
+                memcpy(page, src, valid);
+            }
+        } else if (rom_ptr(gpa, 1)) {
+            if (address_space_read(&address_space_memory, gpa,
+                                   MEMTXATTRS_UNSPECIFIED, page,
+                                   TARGET_PAGE_SIZE) != MEMTX_OK) {
+                continue;
+            }
+        } else {
             continue;
         }
         le_gpa = cpu_to_le64(gpa);
@@ -416,8 +426,16 @@ static SnpPageState snp_rmp_default(CPUX86State *env, hwaddr gpa)
     if (cpu->sev_snp_rmp == SNP_RMP_LAZY) {
         return SNP_PAGE_SHARED;
     }
-    return rom_ptr(gpa & TARGET_PAGE_MASK, 1) ? SNP_PAGE_PRIVATE_VALIDATED
-                                              : SNP_PAGE_PRIVATE_UNVALIDATED;
+    /*
+     * Two oracles, as on the TDX side: rom_ptr() for images the loader placed
+     * as ROMs, and the launch-image registry for the -kernel paths that publish
+     * through fw_cfg and let a DMA option ROM copy them in.
+     */
+    if (rom_ptr(gpa & TARGET_PAGE_MASK, 1) ||
+        x86_launch_image_contains(gpa & TARGET_PAGE_MASK)) {
+        return SNP_PAGE_PRIVATE_VALIDATED;
+    }
+    return SNP_PAGE_PRIVATE_UNVALIDATED;
 }
 
 /*

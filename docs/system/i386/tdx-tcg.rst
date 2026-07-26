@@ -309,6 +309,22 @@ initial reset — after every machine-init-done notifier — and no vCPU has exe
 by then. MRTD survives a reset, measuring an image a reset does not change; the
 RTMRs do not, being runtime measurements.
 
+Which pages *are* the launch image depends on how the payload was loaded, and
+there are two answers. An image the loader placed as a ROM is found with
+``rom_ptr()``. But ``-kernel`` does not always place one: a multiboot kernel that
+sets ``MULTIBOOT_HEADER_HAS_ADDR``, and a Linux bzImage, are published through
+fw_cfg and copied into guest memory by a DMA option ROM running *inside* the
+guest. There is no ROM at the load address, and the bytes are not in memory until
+the guest has already started, so those loaders record the extent at load time
+and both models consult that as well.
+
+Without it such a guest cannot boot in strict mode and cannot fix it from inside.
+Everything before paging runs, because unpaged accesses are never walked; the
+first checked access is the instruction fetch immediately after ``CR0.PG`` is
+set, and it faults on the page it is fetching from. There is no window in which
+guest code could accept anything, because ``TDCALL`` needs 64-bit mode, which
+needs paging.
+
 Not modelled
 ------------
 

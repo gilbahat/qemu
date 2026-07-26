@@ -18,6 +18,7 @@ i386_ss.add(when: 'CONFIG_ISAPC', if_true: files('isapc.c'))
 i386_ss.add(when: 'CONFIG_MICROVM', if_true: files('x86-common.c', 'microvm.c', 'acpi-microvm.c', 'microvm-dt.c'))
 i386_ss.add(when: 'CONFIG_NITRO_ENCLAVE', if_true: files('nitro_enclave.c'))
 i386_ss.add(when: 'CONFIG_Q35', if_true: files('pc_q35.c'))
+i386_ss.add(files('x86-launch-image.c'))
 # Both consult the TCG page-state maps, so they only exist where those do.
 i386_ss.add(when: 'CONFIG_TCG', if_true: files('tdx-dma.c', 'snp-dma.c'))
 i386_ss.add(when: 'CONFIG_VMMOUSE', if_true: files('vmmouse.c'))
