@@ -1760,6 +1760,37 @@ static const VMStateDescription vmstate_apx = {
         VMSTATE_END_OF_LIST()
     }
 };
+
+static bool tdx_ve_needed(void *opaque)
+{
+    X86CPU *cpu = opaque;
+
+    return cpu->tdx_guest;
+}
+
+/*
+ * The emulated-TDX #VE latch.  A guest reads this with TDG.VP.VEINFO.GET, so a
+ * snapshot taken between the #VE and that call must carry the pending
+ * information across; otherwise the guest resumes and is told there is no #VE
+ * information to collect.  env.hflags, which carries HF_TDX_MASK, is already
+ * migrated by the parent description.
+ */
+static const VMStateDescription vmstate_tdx_ve = {
+    .name = "cpu/tdx_ve",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = tdx_ve_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT64(env.tdx_ve_exit_qual, X86CPU),
+        VMSTATE_UINT64(env.tdx_ve_gla, X86CPU),
+        VMSTATE_UINT64(env.tdx_ve_gpa, X86CPU),
+        VMSTATE_UINT32(env.tdx_ve_exit_reason, X86CPU),
+        VMSTATE_UINT32(env.tdx_ve_instr_len, X86CPU),
+        VMSTATE_UINT32(env.tdx_ve_instr_info, X86CPU),
+        VMSTATE_BOOL(env.tdx_ve_valid, X86CPU),
+        VMSTATE_END_OF_LIST()
+    }
+};
 #endif
 
 const VMStateDescription vmstate_x86_cpu = {
@@ -1915,6 +1946,7 @@ const VMStateDescription vmstate_x86_cpu = {
         &vmstate_cet,
 #ifdef TARGET_X86_64
         &vmstate_apx,
+        &vmstate_tdx_ve,
 #endif
         NULL
     }
