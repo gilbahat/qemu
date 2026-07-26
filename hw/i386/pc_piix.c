@@ -31,6 +31,8 @@
 #include "hw/i386/pc.h"
 #include "hw/i386/apic.h"
 #include "hw/pci-host/i440fx.h"
+#include "hw/i386/tdx-dma.h"
+#include "hw/i386/snp-dma.h"
 #include "hw/southbridge/piix.h"
 #include "hw/display/ramfb.h"
 #include "hw/pci/pci.h"
@@ -212,6 +214,19 @@ static void pc_init1(MachineState *machine, const char *pci_type)
     sysbus_realize_and_unref(SYS_BUS_DEVICE(phb), &error_fatal);
 
     pcms->pcibus = PCI_BUS(qdev_get_child_bus(DEVICE(phb), "pci.0"));
+
+    /*
+     * Restrict device DMA to guest-shared memory for an emulated confidential
+     * guest.  Must run before any device is created, since a device captures
+     * its DMA address space when realized.  Both are no-ops unless the matching
+     * CPU property is set -- but they have to be here as well as in q35, or the
+     * guard would be silently absent on whichever machine the user picked.
+     */
+    tdx_dma_setup(pcms->pcibus);
+#ifdef CONFIG_TCG
+    snp_dma_setup(pcms->pcibus);
+#endif
+
     pci_bus_map_irqs(pcms->pcibus,
                      xen_enabled() ? xen_pci_slot_get_pirq
                                    : pc_pci_slot_get_pirq);

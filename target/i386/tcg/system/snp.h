@@ -189,6 +189,12 @@ bool snp_rmp_enabled(CPUX86State *env);
 /* Check an access against the page's state; @priv is the PTE's C-bit. */
 SnpRmpResult snp_rmp_check(CPUX86State *env, hwaddr gpa, bool priv);
 
+/*
+ * Is this GPA shared?  The question the DMA filter asks: SNP has no shared
+ * address bit, so a device's access can only be judged by the page's state.
+ */
+bool snp_rmp_gpa_is_shared(CPUX86State *env, hwaddr gpa);
+
 /* Report an RMP failure: #VC for the guest, or terminate for a mismatch. */
 void snp_rmp_fault(CPUX86State *env, SnpRmpResult res, hwaddr gpa, bool priv,
                    uintptr_t ra);

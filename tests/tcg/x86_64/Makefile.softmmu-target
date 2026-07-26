@@ -53,6 +53,7 @@ sev-snp-nae: CFLAGS+=-mgeneral-regs-only
 sev-snp-rmp: CFLAGS+=-mgeneral-regs-only
 sev-snp-cbit: CFLAGS+=-mgeneral-regs-only
 sev-snp-strict: CFLAGS+=-mgeneral-regs-only
+sev-snp-dma: CFLAGS+=-mgeneral-regs-only
 
 # Running
 X64_SYSTEM_OPTS=-device isa-debugcon,chardev=output \
@@ -88,6 +89,12 @@ run-sev-snp-rmp: QEMU_OPTS=-cpu $(SNP_RMP_CPU) $(X64_SYSTEM_OPTS) -kernel
 # be reported by a handler whose job here is page faults.
 SNP_CBIT_CPU=$(SNP_RMP_CPU),x-sev-snp-relax-hlt=on
 run-sev-snp-cbit: QEMU_OPTS=-cpu $(SNP_CBIT_CPU) $(X64_SYSTEM_OPTS) -kernel
+
+# Device DMA, driven through the edu device's DMA engine.  Needs page-state
+# tracking, since that is what the filter consults; lazy keeps the test's own
+# memory reachable while the one page under test is private.
+run-sev-snp-dma: QEMU_OPTS=-cpu $(SNP_RMP_CPU) -device edu $(X64_SYSTEM_OPTS) \
+                 -kernel
 
 # Strict mode: guest RAM private, only the launch image validated.  Nothing
 # boots here without the C-bit bootstrap, which is the result being checked.

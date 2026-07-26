@@ -25,6 +25,7 @@
 #include "svm.h"
 #include "tcg/helper-tcg.h"
 #include "snp.h"
+#include "hw/i386/snp-dma.h"
 
 #ifdef TARGET_X86_64
 
@@ -349,6 +350,11 @@ bool snp_rmp_enabled(CPUX86State *env)
            env_archcpu(env)->sev_snp_rmp != SNP_RMP_OFF;
 }
 
+bool snp_rmp_gpa_is_shared(CPUX86State *env, hwaddr gpa)
+{
+    return snp_rmp_get(env, gpa) == SNP_PAGE_SHARED;
+}
+
 SnpRmpResult snp_rmp_check(CPUX86State *env, hwaddr gpa, bool priv)
 {
     SnpPageState st = snp_rmp_get(env, gpa);
@@ -450,8 +456,10 @@ void helper_pvalidate(CPUX86State *env)
         qemu_mutex_lock(&st->lock);
         st->vc_armed = true;
         qemu_mutex_unlock(&st->lock);
+        snp_dma_arm();
         qemu_log_mask(LOG_GUEST_ERROR,
-                      "sev-snp: first PVALIDATE; #VC reflection is now live\n");
+                      "sev-snp: first PVALIDATE; #VC reflection and the DMA "
+                      "filter are now live\n");
     }
 
     env->eflags &= ~CC_C;

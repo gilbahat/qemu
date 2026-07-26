@@ -44,6 +44,7 @@
 #include "hw/i386/x86.h"
 #include "hw/i386/pc.h"
 #include "hw/i386/tdx-dma.h"
+#include "hw/i386/snp-dma.h"
 #include "hw/i386/amd_iommu.h"
 #include "hw/i386/intel_iommu.h"
 #include "hw/vfio/types.h"
@@ -238,6 +239,9 @@ static void pc_q35_init(MachineState *machine)
      * space when realized.
      */
     tdx_dma_setup(pcms->pcibus);
+#ifdef CONFIG_TCG
+    snp_dma_setup(pcms->pcibus);
+#endif
 
     /* irq lines */
     gsi_state = pc_gsi_create(&x86ms->gsi, true);

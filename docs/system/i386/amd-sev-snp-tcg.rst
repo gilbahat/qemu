@@ -157,6 +157,38 @@ guest validating 4 GiB of RAM performs a million of them.
 The C-bit is stripped in both page-table walkers, the TLB-fill one and the debug
 one behind ``x``, gdb and ``cpu_memory_rw_debug()``.
 
+Device I/O
+----------
+
+An SNP guest's private memory is unreachable by the host, so a device may only
+DMA to pages the guest has shared. When page-state tracking is on, device DMA is
+filtered accordingly: a PCI device gets an address space whose translations
+consult the page state, and an access to a page that is not shared is refused
+and logged with its GPA.
+
+Unlike TDX, where shared memory is a different *address* — one GPA bit, testable
+without any state — SNP sharing is an RMP attribute, so there is nothing to test
+but the state itself. That is why this needs ``x-sev-snp-rmp``; with tracking off
+no filter is installed, and device DMA reaches everything. Nothing warns about
+that, because with nothing tracked there is nothing to enforce, but it does mean
+a guest that never shares its DMA buffers will work here and fail on hardware.
+
+An address that arrives with the C-bit set is refused and called out
+separately. DMA addresses are plain guest physical addresses; the C-bit is a
+page-table attribute a device knows nothing about, and a descriptor containing
+one is a guest bug that would otherwise look like a wild pointer into high
+memory.
+
+Enforcement is armed by the guest's first ``PVALIDATE``, the same trigger as
+``#VC`` reflection and for the same reason: firmware on a ``-kernel`` boot does
+DMA of its own long before the payload runs.
+
+Enabling the filter also disables legacy virtio, which cannot negotiate
+``VIRTIO_F_ACCESS_PLATFORM`` and so gives the guest driver no way to know its
+buffers must be shared. This is what ``machine_run_board_init()`` does for a
+``confidential-guest-support`` object, which the CPU-property route does not
+reach.
+
 Not modelled
 ------------
 
@@ -169,7 +201,7 @@ VMPCK, and no ``SNP_GUEST_REQUEST``.
 Testing
 -------
 
-``tests/tcg/x86_64/system/`` contains seven freestanding tests, run with
+``tests/tcg/x86_64/system/`` contains eight freestanding tests, run with
 ``make run-tcg-tests-x86_64-softmmu``:
 
 ``sev-snp``
@@ -190,6 +222,12 @@ Testing
   armed with no relaxations, and a ``#VC`` handler that services I/O through the
   GHCB. Its own output and its ACPI poweroff travel over the NAE path, so it
   could neither report nor exit if that path were broken.
+
+``sev-snp-dma``
+  Device DMA, driven through the ``edu`` test device's DMA engine — which calls
+  ``pci_dma_read()`` on the guest's behalf, the same path a virtio ring fetch
+  takes, without needing a driver. A shared page reads back correctly; the same
+  device reading a page the guest kept private comes away with zeroes.
 
 ``sev-snp-rmp``
   Page-state tracking in lazy mode: that a shared page cannot be validated, that

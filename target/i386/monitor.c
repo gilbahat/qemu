@@ -30,6 +30,29 @@
 #include "qapi/error.h"
 #include "qapi/qapi-commands-misc.h"
 #include "system/memory.h"
+#include "tcg/system/snp.h"
+
+/*
+ * Page-table address bits, minus the emulated SEV-SNP C-bit.  Without this the
+ * monitor would fold the C-bit into the physical addresses it prints, and --
+ * worse -- follow poisoned table pointers while walking.  The masks below cover
+ * bits 49:12, so at the default C-bit position of 51 they were correct by
+ * accident; at the other position hardware uses, 47, they were not.
+ */
+static inline uint64_t pte_addr_mask(CPUArchState *env)
+{
+    return 0x3fffffffff000ULL & ~snp_cbit_mask(env);
+}
+
+static inline uint64_t pde_addr_mask(CPUArchState *env)
+{
+    return 0x3ffffffe00000ULL & ~snp_cbit_mask(env);
+}
+
+static inline uint64_t pdpe_addr_mask(CPUArchState *env)
+{
+    return 0x3ffffc0000000ULL & ~snp_cbit_mask(env);
+}
 
 /* Perform linear address sign extension */
 static hwaddr addr_canonical(CPUArchState *env, hwaddr addr)
@@ -107,7 +130,7 @@ static void tlb_info_pae32(Monitor *mon, CPUArchState *env, AddressSpace *as)
     for (l1 = 0; l1 < 4; l1++) {
         pdpe = address_space_ldq_le(as, pdp_addr + l1 * 8, attrs, NULL);
         if (pdpe & PG_PRESENT_MASK) {
-            pd_addr = pdpe & 0x3fffffffff000ULL;
+            pd_addr = pdpe & pte_addr_mask(env);
             for (l2 = 0; l2 < 512; l2++) {
                 pde = address_space_ldq_le(as, pd_addr + l2 * 8, attrs, NULL);
                 if (pde & PG_PRESENT_MASK) {
@@ -116,7 +139,7 @@ static void tlb_info_pae32(Monitor *mon, CPUArchState *env, AddressSpace *as)
                         print_pte(mon, env, (l1 << 30) + (l2 << 21), pde,
                                   ~((hwaddr)(1 << 20) - 1));
                     } else {
-                        pt_addr = pde & 0x3fffffffff000ULL;
+                        pt_addr = pde & pte_addr_mask(env);
                         for (l3 = 0; l3 < 512; l3++) {
                             pte = address_space_ldq_le(as, pt_addr + l3 * 8,
                                                        attrs, NULL);
@@ -149,7 +172,7 @@ static void tlb_info_la48(Monitor *mon, CPUArchState *env, AddressSpace *as,
             continue;
         }
 
-        pdp_addr = pml4e & 0x3fffffffff000ULL;
+        pdp_addr = pml4e & pte_addr_mask(env);
         for (l2 = 0; l2 < 512; l2++) {
             pdpe = address_space_ldq_le(as, pdp_addr + l2 * 8, attrs, NULL);
             if (!(pdpe & PG_PRESENT_MASK)) {
@@ -159,11 +182,11 @@ static void tlb_info_la48(Monitor *mon, CPUArchState *env, AddressSpace *as,
             if (pdpe & PG_PSE_MASK) {
                 /* 1G pages, CR4.PSE is ignored */
                 print_pte(mon, env, (l0 << 48) + (l1 << 39) + (l2 << 30),
-                        pdpe, 0x3ffffc0000000ULL);
+                        pdpe, pdpe_addr_mask(env));
                 continue;
             }
 
-            pd_addr = pdpe & 0x3fffffffff000ULL;
+            pd_addr = pdpe & pte_addr_mask(env);
             for (l3 = 0; l3 < 512; l3++) {
                 pde = address_space_ldq_le(as, pd_addr + l3 * 8, attrs, NULL);
                 if (!(pde & PG_PRESENT_MASK)) {
@@ -173,18 +196,18 @@ static void tlb_info_la48(Monitor *mon, CPUArchState *env, AddressSpace *as,
                 if (pde & PG_PSE_MASK) {
                     /* 2M pages, CR4.PSE is ignored */
                     print_pte(mon, env, (l0 << 48) + (l1 << 39) + (l2 << 30) +
-                            (l3 << 21), pde, 0x3ffffffe00000ULL);
+                            (l3 << 21), pde, pde_addr_mask(env));
                     continue;
                 }
 
-                pt_addr = pde & 0x3fffffffff000ULL;
+                pt_addr = pde & pte_addr_mask(env);
                 for (l4 = 0; l4 < 512; l4++) {
                     pte = address_space_ldq_le(as, pt_addr + l4 * 8,
                                                attrs, NULL);
                     if (pte & PG_PRESENT_MASK) {
                         print_pte(mon, env, (l0 << 48) + (l1 << 39) +
                                 (l2 << 30) + (l3 << 21) + (l4 << 12),
-                                pte & ~PG_PSE_MASK, 0x3fffffffff000ULL);
+                                pte & ~PG_PSE_MASK, pte_addr_mask(env));
                     }
                 }
             }
@@ -199,11 +222,11 @@ static void tlb_info_la57(Monitor *mon, CPUArchState *env, AddressSpace *as)
     uint64_t pml5e;
     uint64_t pml5_addr;
 
-    pml5_addr = env->cr[3] & 0x3fffffffff000ULL;
+    pml5_addr = env->cr[3] & pte_addr_mask(env);
     for (l0 = 0; l0 < 512; l0++) {
         pml5e = address_space_ldq_le(as, pml5_addr + l0 * 8, attrs, NULL);
         if (pml5e & PG_PRESENT_MASK) {
-            tlb_info_la48(mon, env, as, l0, pml5e & 0x3fffffffff000ULL);
+            tlb_info_la48(mon, env, as, l0, pml5e & pte_addr_mask(env));
         }
     }
 }
@@ -231,7 +254,7 @@ void hmp_info_tlb(Monitor *mon, const QDict *qdict)
             if (env->cr[4] & CR4_LA57_MASK) {
                 tlb_info_la57(mon, env, as);
             } else {
-                tlb_info_la48(mon, env, as, 0, env->cr[3] & 0x3fffffffff000ULL);
+                tlb_info_la48(mon, env, as, 0, env->cr[3] & pte_addr_mask(env));
             }
         } else
 #endif
@@ -325,7 +348,7 @@ static void mem_info_pae32(Monitor *mon, CPUArchState *env, AddressSpace *as)
         pdpe = address_space_ldq_le(as, pdp_addr + l1 * 8, attrs, NULL);
         end = l1 << 30;
         if (pdpe & PG_PRESENT_MASK) {
-            pd_addr = pdpe & 0x3fffffffff000ULL;
+            pd_addr = pdpe & pte_addr_mask(env);
             for (l2 = 0; l2 < 512; l2++) {
                 pde = address_space_ldq_le(as, pd_addr + l2 * 8, attrs, NULL);
                 end = (l1 << 30) + (l2 << 21);
@@ -335,7 +358,7 @@ static void mem_info_pae32(Monitor *mon, CPUArchState *env, AddressSpace *as)
                                       PG_PRESENT_MASK);
                         mem_print(mon, env, &start, &last_prot, end, prot);
                     } else {
-                        pt_addr = pde & 0x3fffffffff000ULL;
+                        pt_addr = pde & pte_addr_mask(env);
                         for (l3 = 0; l3 < 512; l3++) {
                             pte = address_space_ldq_le(as, pt_addr + l3 * 8,
                                                        attrs, NULL);
@@ -373,14 +396,14 @@ static void mem_info_la48(Monitor *mon, CPUArchState *env, AddressSpace *as)
     uint64_t pml4e, pdpe, pde, pte;
     uint64_t pml4_addr, pdp_addr, pd_addr, pt_addr, start, end;
 
-    pml4_addr = env->cr[3] & 0x3fffffffff000ULL;
+    pml4_addr = env->cr[3] & pte_addr_mask(env);
     last_prot = 0;
     start = -1;
     for (l1 = 0; l1 < 512; l1++) {
         pml4e = address_space_ldq_le(as, pml4_addr + l1 * 8, attrs, NULL);
         end = l1 << 39;
         if (pml4e & PG_PRESENT_MASK) {
-            pdp_addr = pml4e & 0x3fffffffff000ULL;
+            pdp_addr = pml4e & pte_addr_mask(env);
             for (l2 = 0; l2 < 512; l2++) {
                 pdpe = address_space_ldq_le(as, pdp_addr + l2 * 8, attrs, NULL);
                 end = (l1 << 39) + (l2 << 30);
@@ -391,7 +414,7 @@ static void mem_info_la48(Monitor *mon, CPUArchState *env, AddressSpace *as)
                         prot &= pml4e;
                         mem_print(mon, env, &start, &last_prot, end, prot);
                     } else {
-                        pd_addr = pdpe & 0x3fffffffff000ULL;
+                        pd_addr = pdpe & pte_addr_mask(env);
                         for (l3 = 0; l3 < 512; l3++) {
                             pde = address_space_ldq_le(as, pd_addr + l3 * 8,
                                                        attrs, NULL);
@@ -404,7 +427,7 @@ static void mem_info_la48(Monitor *mon, CPUArchState *env, AddressSpace *as)
                                     mem_print(mon, env, &start,
                                               &last_prot, end, prot);
                                 } else {
-                                    pt_addr = pde & 0x3fffffffff000ULL;
+                                    pt_addr = pde & pte_addr_mask(env);
                                     for (l4 = 0; l4 < 512; l4++) {
                                         pte = address_space_ldq_le(as,
                                                                    pt_addr
@@ -452,7 +475,7 @@ static void mem_info_la57(Monitor *mon, CPUArchState *env, AddressSpace *as)
     uint64_t pml5e, pml4e, pdpe, pde, pte;
     uint64_t pml5_addr, pml4_addr, pdp_addr, pd_addr, pt_addr, start, end;
 
-    pml5_addr = env->cr[3] & 0x3fffffffff000ULL;
+    pml5_addr = env->cr[3] & pte_addr_mask(env);
     last_prot = 0;
     start = -1;
     for (l0 = 0; l0 < 512; l0++) {
@@ -464,7 +487,7 @@ static void mem_info_la57(Monitor *mon, CPUArchState *env, AddressSpace *as)
             continue;
         }
 
-        pml4_addr = pml5e & 0x3fffffffff000ULL;
+        pml4_addr = pml5e & pte_addr_mask(env);
         for (l1 = 0; l1 < 512; l1++) {
             pml4e = address_space_ldq_le(as, pml4_addr + l1 * 8, attrs, NULL);
             end = (l0 << 48) + (l1 << 39);
@@ -474,7 +497,7 @@ static void mem_info_la57(Monitor *mon, CPUArchState *env, AddressSpace *as)
                 continue;
             }
 
-            pdp_addr = pml4e & 0x3fffffffff000ULL;
+            pdp_addr = pml4e & pte_addr_mask(env);
             for (l2 = 0; l2 < 512; l2++) {
                 pdpe = address_space_ldq_le(as, pdp_addr + l2 * 8, attrs, NULL);
                 end = (l0 << 48) + (l1 << 39) + (l2 << 30);
@@ -492,7 +515,7 @@ static void mem_info_la57(Monitor *mon, CPUArchState *env, AddressSpace *as)
                     continue;
                 }
 
-                pd_addr = pdpe & 0x3fffffffff000ULL;
+                pd_addr = pdpe & pte_addr_mask(env);
                 for (l3 = 0; l3 < 512; l3++) {
                     pde = address_space_ldq_le(as, pd_addr + l3 * 8,
                                                attrs, NULL);
@@ -511,7 +534,7 @@ static void mem_info_la57(Monitor *mon, CPUArchState *env, AddressSpace *as)
                         continue;
                     }
 
-                    pt_addr = pde & 0x3fffffffff000ULL;
+                    pt_addr = pde & pte_addr_mask(env);
                     for (l4 = 0; l4 < 512; l4++) {
                         pte = address_space_ldq_le(as, pt_addr + l4 * 8,
                                                    attrs, NULL);
