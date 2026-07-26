@@ -46,7 +46,7 @@ Implemented TDCALL leaves
   ``TDG.VP.VEINFO.GET`` straight back as the sub-function. ``MapGPA`` converts
   a page between private and shared when ``x-tdx-sept`` is on, and validates its
   operands otherwise; a multi-page range converts its first page and returns
-  ``RETRY`` with the next GPA. ``GetQuote`` is refused; every other sub-function
+  ``RETRY`` with the next GPA. ``GetQuote`` is implemented; every other sub-function
   returns ``INVALID_OPERAND``.
 
   ``#VE.RequestMMIO`` (48) is also implemented, and is the counterpart of the
@@ -83,6 +83,37 @@ An unrecognised leaf returns ``TDX_OPERAND_INVALID``. It does **not** raise
 ``#UD``: that is what the TDX module does, and it matters because a guest may
 issue its first TDCALL before installing an IDT, where a fault is a silent
 triple fault.
+
+Quoting
+-------
+
+``TDVMCALL<GetQuote>`` is implemented, because the *flow* is real porting work
+even though the evidence cannot be. On hardware the VMM passes the TDREPORT to a
+Quoting Enclave, which signs it with a key whose PCK certificate chains to
+Intel's root; verification of the result needs that chain and therefore needs
+hardware. Generating the request does not.
+
+What a guest has to get right, and can now test:
+
+* **The buffer must be shared.** ``R12`` carries a GPA that has to have the
+  SHARED alias set *and* have been converted with ``TDVMCALL<MapGPA>``, and it
+  has to be reached through that alias in the guest's own page tables. This is
+  the first thing in a TD that needs a page-table entry it can change at run
+  time, since nothing else about attestation touches shared memory.
+* **It is asynchronous.** The call returns immediately with the buffer's status
+  set to ``GET_QUOTE_IN_FLIGHT``; the guest polls until it changes. The emulated
+  service answers after 100 virtual milliseconds.
+* **The header contract** — version, ``in_len`` of a full ``TDREPORT``, and an
+  ``out_len`` the service fills in, including when the buffer is too small.
+
+The reply is a structurally correct DCAP Quote v4 with the TDX TEE type, whose
+body carries the measurements and ``REPORTDATA`` from the report that was
+submitted, so a guest can confirm the quote answers the question it asked.
+
+Its signature is not a signature: like the ``REPORTMACSTRUCT`` MAC it is a fixed
+marker, and the certification-data type is left at 0 rather than fabricating a
+PCK chain. A DCAP verifier rejects it immediately, which is the correct outcome.
+``SetupEventNotifyInterrupt`` is not implemented, so a guest must poll.
 
 Why the report is not attestation
 ---------------------------------
@@ -348,13 +379,19 @@ Testing
   measurement calls, and the ``TDVMCALL`` service routines.
 
 ``tdx-attest``
-  The attestation flow: that ``REPORTDATA`` comes back, that operand alignment is
+  The attestation and quoting flow: that ``REPORTDATA`` comes back, that operand alignment is
   enforced, that MRTD is not zero, that extending an RTMR changes that register
   and no other and leaves MRTD alone, that the same data extended from the same
   state gives the same result and different data does not, and that two reports
   over identical inputs are identical. It also asserts what must *not* work: the
-  ``REPORTMACSTRUCT`` MAC is the fixed not-real marker and ``GetQuote`` is
-  refused.
+  ``REPORTMACSTRUCT`` MAC and the quote signature are the fixed not-real
+  markers.
+
+  The quoting half also covers what a guest must do to be answered at all: a
+  buffer that is private, or that carries the alias without having been
+  converted, or that is misaligned, is refused; a well-formed one comes back
+  in flight and then completes, with the submitted MRTD and ``REPORTDATA``
+  present in the quote body.
 
 ``tdx-sept``
   Page state, in lazy mode. Builds its own page tables so the SHARED alias can

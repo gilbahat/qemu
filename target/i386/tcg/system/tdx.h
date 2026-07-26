@@ -70,6 +70,8 @@
 #define TDVMCALL_SUCCESS                0x0000000000000000ULL
 #define TDVMCALL_RETRY                  0x0000000000000001ULL
 #define TDVMCALL_INVALID_OPERAND        0x8000000000000000ULL
+#define TDVMCALL_GPA_INUSE              0x8000000000000001ULL
+#define TDVMCALL_ALIGN_ERROR            0x8000000000000002ULL
 
 /* TD ATTRIBUTES bits. */
 #define TDX_TD_ATTR_DEBUG               (1ULL << 0)
@@ -111,6 +113,41 @@
  * verifier, and impossible to pass off as genuine evidence.  There is no
  * quoting path: TDVMCALL<GetQuote> is refused.
  */
+/*
+ * TDVMCALL<GetQuote>.  The guest hands over a shared buffer holding a TDREPORT
+ * and gets back a Quote; on hardware the VMM forwards it to a Quoting Enclave,
+ * which signs it with a key whose PCK certificate chains to Intel's root.
+ *
+ * Everything about the *flow* is modelled: the buffer must be shared and
+ * converted, the call completes asynchronously so the guest has to poll, and
+ * the reply is a structurally correct Quote v4 reflecting the report submitted.
+ *
+ * The signature is not.  There is no attestation key and there never can be, so
+ * the signature and attestation-key fields carry TDX_TCG_FAKE_SIG and the
+ * certification-data type is left at 0 rather than fabricating a PCK chain --
+ * a DCAP verifier rejects the result immediately, which is correct.
+ */
+#define TDX_QUOTE_VERSION               1
+#define TDX_QUOTE_HDR_LEN               24
+
+#define GET_QUOTE_SUCCESS               0x0000000000000000ULL
+#define GET_QUOTE_IN_FLIGHT             0xffffffffffffffffULL
+#define GET_QUOTE_ERROR                 0x8000000000000000ULL
+#define GET_QUOTE_SERVICE_UNAVAILABLE   0x8000000000000001ULL
+
+/* DCAP Quote v4 for TDX. */
+#define TDX_QUOTE_V4                    4
+#define TDX_ATT_KEY_ECDSA_P256          2
+#define TDX_TEE_TYPE_TDX                0x00000081U
+#define TDX_QUOTE_BODY_LEN              584
+#define TDX_QUOTE_SIG_LEN               64
+#define TDX_QUOTE_PUBKEY_LEN            64
+
+/* How long the emulated quoting service takes, in virtual milliseconds. */
+#define TDX_QUOTE_DELAY_MS              100
+
+#define TDX_TCG_FAKE_SIG    "QEMU-TCG-EMULATED-TDX-QUOTE-NOT-REAL-EVIDENCE!!!"
+
 #define TDX_TCG_FAKE_MAC    "QEMU-TCG-EMULATED-TDX-NOT-REAL!!"
 #define TDX_TCG_FAKE_CPUSVN "EMULATED-TDX\0\0\0\0"
 

@@ -78,7 +78,10 @@ QEMU_OPTS+=$(X64_SYSTEM_OPTS) -kernel
 
 # The emulated TDX guest interface is off unless asked for.
 run-tdx: QEMU_OPTS=-cpu max,x-tdx-guest=on $(X64_SYSTEM_OPTS) -kernel
-run-tdx-attest: QEMU_OPTS=-cpu max,x-tdx-guest=on $(X64_SYSTEM_OPTS) -kernel
+# sept=1 so the quote buffer genuinely has to be converted before the quoting
+# service will look at it, which is the conformance point of GetQuote.
+run-tdx-attest: QEMU_OPTS=-cpu max,x-tdx-guest=on,x-tdx-sept=1 \
+                $(X64_SYSTEM_OPTS) -kernel
 
 # Page state in lazy mode: pages start accepted, so the test's own memory keeps
 # working while the pages under test are converted.  I/O is relaxed because the

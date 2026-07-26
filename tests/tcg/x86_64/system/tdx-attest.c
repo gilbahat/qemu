@@ -30,6 +30,14 @@
 #define TDG_MR_RTMR_EXTEND          2UL
 #define TDG_MR_REPORT               4UL
 #define TDVMCALL_GET_QUOTE          0x10002UL
+#define TDVMCALL_SUCCESS            0UL
+
+#define QUOTE_HDR_LEN               24
+#define GET_QUOTE_SUCCESS           0UL
+#define GET_QUOTE_IN_FLIGHT         0xffffffffffffffffUL
+#define QUOTE_V4                    4
+#define TEE_TYPE_TDX                0x81
+#define FAKE_SIG "QEMU-TCG-EMULATED-TDX-QUOTE-NOT-REAL-EVIDENCE!!!"
 
 #define MEASUREMENT_LEN             48
 #define RTMR_COUNT                  4
@@ -91,12 +99,12 @@ static unsigned long rtmr_extend(const void *data, unsigned long index)
     return tdcall2(TDG_MR_RTMR_EXTEND, (unsigned long)data, index);
 }
 
-static unsigned long get_quote(void *buf)
+static unsigned long get_quote(unsigned long gpa, unsigned long size)
 {
     register unsigned long r10 __asm__("r10") = 0;
     register unsigned long r11 __asm__("r11") = TDVMCALL_GET_QUOTE;
-    register unsigned long r12 __asm__("r12") = (unsigned long)buf;
-    register unsigned long r13 __asm__("r13") = REPORT_LEN;
+    register unsigned long r12 __asm__("r12") = gpa;
+    register unsigned long r13 __asm__("r13") = size;
     unsigned long status;
 
     __asm__ __volatile__(".byte 0x66,0x0f,0x01,0xcc"
@@ -106,6 +114,35 @@ static unsigned long get_quote(void *buf)
                          : "memory");
     /* R10 carries the TDVMCALL-level status. */
     return r10;
+}
+
+/* TDVMCALL<MapGPA>, to convert the quote buffer to shared. */
+static unsigned long map_gpa(unsigned long gpa_with_alias, unsigned long size)
+{
+    register unsigned long r10 __asm__("r10") = 0;
+    register unsigned long r11 __asm__("r11") = 0x10001UL;
+    register unsigned long r12 __asm__("r12") = gpa_with_alias;
+    register unsigned long r13 __asm__("r13") = size;
+    unsigned long status;
+
+    __asm__ __volatile__(".byte 0x66,0x0f,0x01,0xcc"
+                         : "=a"(status), "+r"(r10), "+r"(r11), "+r"(r12),
+                           "+r"(r13)
+                         : "a"(TDG_VP_VMCALL), "c"(0xfc00)
+                         : "memory");
+    return r10;
+}
+
+/* GPAW comes from TDG.VP.INFO RCX[5:0]; the SHARED alias is bit GPAW-1. */
+static unsigned long shared_bit(void)
+{
+    unsigned long gpaw;
+
+    __asm__ __volatile__(".byte 0x66,0x0f,0x01,0xcc"
+                         : "=c"(gpaw)
+                         : "a"(1UL)
+                         : "rdx", "r8", "r9", "r10", "r11", "memory");
+    return 1UL << ((gpaw & 0x3f) - 1);
 }
 
 static int mem_eq(const void *a, const void *b, unsigned long n)
@@ -161,6 +198,52 @@ static unsigned char reportdata[REPORTDATA_LEN] __attribute__((aligned(64)));
 static unsigned char extdata[64] __attribute__((aligned(64)));
 static unsigned char saved_rtmr[RTMR_COUNT][MEASUREMENT_LEN];
 static unsigned char mrtd[MEASUREMENT_LEN];
+static unsigned char qbuf[8192] __attribute__((aligned(4096)));
+
+/*
+ * Page tables, needed only for the quoting part -- and that is the lesson.  The
+ * quote buffer has to be shared, and a shared page has to be reached through
+ * the SHARED alias, so this is the first thing in a TD needing a page-table
+ * entry it can change at runtime.  boot.S's tables are fixed, so build our own.
+ */
+static unsigned long pml4[512] __attribute__((aligned(4096)));
+static unsigned long pdp[512] __attribute__((aligned(4096)));
+static unsigned long pd[4][512] __attribute__((aligned(4096)));
+static unsigned long pt[512] __attribute__((aligned(4096)));
+static unsigned long split_base;
+
+static void build_tables(unsigned long split_addr)
+{
+    unsigned long g, i;
+
+    for (i = 0; i < 512; i++) {
+        pml4[i] = 0;
+        pdp[i] = 0;
+    }
+    for (g = 0; g < 4; g++) {
+        for (i = 0; i < 512; i++) {
+            pd[g][i] = (g << 30) | (i << 21) | 0xe7;
+        }
+        pdp[g] = (unsigned long)&pd[g][0] | 7;
+    }
+    pml4[0] = (unsigned long)pdp | 7;
+
+    split_base = split_addr & ~0x1fffffUL;
+    for (i = 0; i < 512; i++) {
+        pt[i] = (split_base + i * 4096) | 0x67;
+    }
+    pd[split_base >> 30][(split_base >> 21) & 0x1ff] = (unsigned long)pt | 7;
+
+    __asm__ __volatile__("mov %0, %%cr3"
+                         : : "r"((unsigned long)pml4) : "memory");
+}
+
+static void share_page(unsigned long va, unsigned long bit)
+{
+    map_gpa(va | bit, 4096);
+    pt[(va - split_base) / 4096] |= bit;
+    __asm__ __volatile__("invlpg (%0)" : : "r"(va) : "memory");
+}
 
 static const unsigned char *rtmr_of(const unsigned char *r, int i)
 {
@@ -173,6 +256,8 @@ int main(void)
     int i;
 
     ml_printf("Emulated TDX attestation-flow test\n");
+
+    build_tables((unsigned long)qbuf);
 
     /* --- the report, and its operand rules ------------------------------- */
 
@@ -208,7 +293,75 @@ int main(void)
 
     check(mem_eq(report + OFF_MAC, FAKE_MAC, 32),
           "the report MAC is not the not-real marker");
-    check(get_quote(report2) != 0, "TDVMCALL<GetQuote> was not refused");
+
+    /* --- quoting ---------------------------------------------------------- */
+
+    {
+        unsigned long sb = shared_bit();
+        unsigned long buf = (unsigned long)qbuf;
+        /*
+         * volatile: the quoting service writes these behind the guest's back,
+         * so the poll below has to re-read them rather than cache the first
+         * value it saw.
+         */
+        volatile unsigned long *hdr = (volatile unsigned long *)buf;
+        /* volatile for the same reason: written by the service, not by us. */
+        volatile unsigned int *lens = (volatile unsigned int *)(buf + 16);
+        unsigned char *qdata = (unsigned char *)(buf + QUOTE_HDR_LEN);
+        unsigned long spins;
+
+        /* A private buffer must be refused: the service cannot reach it. */
+        check(get_quote(buf, sizeof(qbuf)) != TDVMCALL_SUCCESS,
+              "GetQuote accepted a buffer that is not in the SHARED alias");
+
+        /* Convert it *and* map it through the alias -- both are required. */
+        share_page(buf, sb);
+        share_page(buf + 4096, sb);
+
+        /* An unaligned buffer is refused. */
+        check(get_quote((buf + 8) | sb, sizeof(qbuf)) != TDVMCALL_SUCCESS,
+              "GetQuote accepted a misaligned buffer");
+
+        /* Now a well-formed request. */
+        hdr[0] = 1;                        /* version   */
+        hdr[1] = 0;                        /* status    */
+        lens[0] = REPORT_LEN;              /* in_len    */
+        lens[1] = 0;                       /* out_len   */
+        copy(qdata, report, REPORT_LEN);
+
+        check(get_quote(buf | sb, sizeof(qbuf)) == TDVMCALL_SUCCESS,
+              "GetQuote refused a well-formed request");
+
+        /* Asynchronous: the guest waits for the status to change. */
+        check(hdr[1] == GET_QUOTE_IN_FLIGHT,
+              "GetQuote did not report the request as in flight");
+        for (spins = 0; hdr[1] == GET_QUOTE_IN_FLIGHT; spins++) {
+            if (spins > 400000000UL) {
+                break;
+            }
+        }
+        check(hdr[1] == GET_QUOTE_SUCCESS, "the quote never completed");
+        check(lens[1] > QUOTE_HDR_LEN, "the quote has no length");
+
+        /* A structurally valid Quote v4 for TDX. */
+        check(qdata[0] == QUOTE_V4 && qdata[1] == 0, "quote version is not 4");
+        check(qdata[4] == TEE_TYPE_TDX, "quote tee_type is not TDX");
+
+        /*
+         * It must carry the measurements and the nonce from the report that was
+         * submitted -- otherwise it is answering about something else.
+         */
+        check(mem_eq(qdata + 48 + 136, mrtd, MEASUREMENT_LEN),
+              "the quote does not carry the MRTD from the report");
+        check(mem_eq(qdata + 48 + 520, reportdata, REPORTDATA_LEN),
+              "the quote does not carry the REPORTDATA from the report");
+
+        /* And it must be unmistakably not evidence. */
+        check(mem_eq(qdata + 48 + 584 + 4, FAKE_SIG, 40),
+              "the quote signature is not the not-real marker");
+        ml_printf("quote: %d bytes, version %d, tee 0x%x\n",
+                  (int)lens[1], (int)qdata[0], (int)qdata[4]);
+    }
 
     /* --- the RTMRs -------------------------------------------------------- */
 

@@ -28,6 +28,7 @@
 #include "system/system.h"
 #include "system/runstate.h"
 #include "system/reset.h"
+#include "qemu/timer.h"
 #include "tdx.h"
 
 #ifdef TARGET_X86_64
@@ -51,6 +52,16 @@ typedef struct TdxTcgState {
      */
     bool ve_armed;
     bool mrtd_valid;
+
+    /*
+     * A GetQuote in flight.  Quoting is asynchronous on hardware -- the VMM
+     * hands the report to a service and answers later -- so it is asynchronous
+     * here too, and the guest has to poll the status field as it would.
+     */
+    bool quote_pending;
+    uint64_t quote_gpa;
+    uint64_t quote_size;
+    QEMUTimer *quote_timer;
 
     /*
      * Secure-EPT-lite.  Only pages whose state differs from the mode default
@@ -110,6 +121,15 @@ static int tdx_post_load(void *opaque, int version_id)
     TdxTcgState *s = opaque;
     uint32_t i;
 
+    /*
+     * Re-arm a quote that was in flight when the source was stopped; without
+     * this the guest would poll a status that never changes.
+     */
+    if (s->quote_pending && s->quote_timer) {
+        timer_mod(s->quote_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + TDX_QUOTE_DELAY_MS);
+    }
+
     if (!s->sept) {
         s->sept = g_hash_table_new(g_direct_hash, g_direct_equal);
     }
@@ -133,6 +153,9 @@ static const VMStateDescription vmstate_tdx_tcg = {
                               TDX_MEASUREMENT_LEN),
         VMSTATE_BOOL(ve_armed, TdxTcgState),
         VMSTATE_BOOL(mrtd_valid, TdxTcgState),
+        VMSTATE_BOOL(quote_pending, TdxTcgState),
+        VMSTATE_UINT64(quote_gpa, TdxTcgState),
+        VMSTATE_UINT64(quote_size, TdxTcgState),
         VMSTATE_UINT32(sept_count, TdxTcgState),
         VMSTATE_VARRAY_UINT32_ALLOC(sept_pfn, TdxTcgState, sept_count, 0,
                                     vmstate_info_uint64, uint64_t),
@@ -502,6 +525,249 @@ static void tdx_vp_info(CPUX86State *env)
  * TDG.MEM.PAGE.ACCEPT (leaf 6).  There is no SEPT emulation and all guest
  * memory is ordinary RAM, so accepting a page is a validated no-op.
  */
+/* --- TDVMCALL<GetQuote> --------------------------------------------------- */
+
+/* The buffer the guest shares: a header, the TDREPORT in, the Quote out. */
+typedef struct QEMU_PACKED TdxQuoteHdr {
+    uint64_t version;
+    uint64_t status;
+    uint32_t in_len;
+    uint32_t out_len;
+} TdxQuoteHdr;
+QEMU_BUILD_BUG_ON(sizeof(TdxQuoteHdr) != TDX_QUOTE_HDR_LEN);
+
+/* DCAP Quote v4 header. */
+typedef struct QEMU_PACKED TdxQuoteHeader {
+    uint16_t version;
+    uint16_t att_key_type;
+    uint32_t tee_type;
+    uint16_t qe_svn;
+    uint16_t pce_svn;
+    uint8_t qe_vendor_id[16];
+    uint8_t user_data[20];
+} TdxQuoteHeader;
+QEMU_BUILD_BUG_ON(sizeof(TdxQuoteHeader) != 48);
+
+/* TDQuoteBody: the measurements a relying party would judge. */
+typedef struct QEMU_PACKED TdxQuoteBody {
+    uint8_t tee_tcb_svn[16];
+    uint8_t mrseam[TDX_MEASUREMENT_LEN];
+    uint8_t mrsignerseam[TDX_MEASUREMENT_LEN];
+    uint8_t seamattributes[8];
+    uint8_t tdattributes[8];
+    uint8_t xfam[8];
+    uint8_t mrtd[TDX_MEASUREMENT_LEN];
+    uint8_t mrconfigid[TDX_MEASUREMENT_LEN];
+    uint8_t mrowner[TDX_MEASUREMENT_LEN];
+    uint8_t mrownerconfig[TDX_MEASUREMENT_LEN];
+    uint8_t rtmr[TDX_RTMR_COUNT][TDX_MEASUREMENT_LEN];
+    uint8_t reportdata[TDX_REPORTDATA_LEN];
+} TdxQuoteBody;
+QEMU_BUILD_BUG_ON(sizeof(TdxQuoteBody) != TDX_QUOTE_BODY_LEN);
+
+/*
+ * The signature section.  Shaped like the real thing so a parser can walk it,
+ * but the signature and key are the not-real marker and the certification-data
+ * type is 0 -- real types are 1..7, and inventing a PCK chain is the one thing
+ * this must never do.
+ */
+typedef struct QEMU_PACKED TdxQuoteSig {
+    uint8_t signature[TDX_QUOTE_SIG_LEN];
+    uint8_t attest_pub_key[TDX_QUOTE_PUBKEY_LEN];
+    uint16_t cert_data_type;
+    uint32_t cert_data_size;
+} TdxQuoteSig;
+
+static void tdx_fill_marker(uint8_t *dst, size_t len)
+{
+    size_t i;
+
+    for (i = 0; i < len; i += sizeof(TDX_TCG_FAKE_SIG) - 1) {
+        size_t n = MIN(sizeof(TDX_TCG_FAKE_SIG) - 1, len - i);
+
+        memcpy(dst + i, TDX_TCG_FAKE_SIG, n);
+    }
+}
+
+/*
+ * Build the Quote from the TDREPORT the guest submitted, so the measurements
+ * and REPORTDATA in it are the ones it asked about rather than freshly
+ * invented.  Offsets are into TDREPORT_STRUCT: TD_INFO starts at 512, and
+ * REPORTDATA sits at 128 inside REPORTMACSTRUCT.
+ */
+static void tdx_build_quote(const uint8_t *report, GByteArray *out)
+{
+    TdxQuoteHeader hdr = { 0 };
+    TdxQuoteBody body = { 0 };
+    TdxQuoteSig sig = { 0 };
+    uint32_t sig_len = cpu_to_le32(sizeof(sig));
+
+    hdr.version = cpu_to_le16(TDX_QUOTE_V4);
+    hdr.att_key_type = cpu_to_le16(TDX_ATT_KEY_ECDSA_P256);
+    hdr.tee_type = cpu_to_le32(TDX_TEE_TYPE_TDX);
+    memcpy(hdr.qe_vendor_id, TDX_TCG_FAKE_CPUSVN,
+           MIN(sizeof(hdr.qe_vendor_id), sizeof(TDX_TCG_FAKE_CPUSVN) - 1));
+
+    memcpy(body.reportdata, report + 128, TDX_REPORTDATA_LEN);
+    memcpy(body.tdattributes, report + 512, 8);
+    memcpy(body.xfam, report + 520, 8);
+    memcpy(body.mrtd, report + 528, TDX_MEASUREMENT_LEN);
+    memcpy(body.mrconfigid, report + 576, TDX_MEASUREMENT_LEN);
+    memcpy(body.mrowner, report + 624, TDX_MEASUREMENT_LEN);
+    memcpy(body.mrownerconfig, report + 672, TDX_MEASUREMENT_LEN);
+    memcpy(body.rtmr, report + 720, sizeof(body.rtmr));
+
+    tdx_fill_marker(sig.signature, sizeof(sig.signature));
+    tdx_fill_marker(sig.attest_pub_key, sizeof(sig.attest_pub_key));
+    sig.cert_data_type = 0;
+    sig.cert_data_size = 0;
+
+    g_byte_array_append(out, (const uint8_t *)&hdr, sizeof(hdr));
+    g_byte_array_append(out, (const uint8_t *)&body, sizeof(body));
+    g_byte_array_append(out, (const uint8_t *)&sig_len, sizeof(sig_len));
+    g_byte_array_append(out, (const uint8_t *)&sig, sizeof(sig));
+}
+
+/* The emulated quoting service answering, some virtual milliseconds later. */
+static void tdx_quote_complete(void *opaque)
+{
+    TdxTcgState *td = opaque;
+    g_autoptr(GByteArray) quote = g_byte_array_new();
+    g_autofree uint8_t *report = g_malloc0(TDX_REPORT_LEN);
+    TdxQuoteHdr hdr;
+    uint64_t gpa;
+    uint64_t size;
+
+    qemu_mutex_lock(&td->lock);
+    if (!td->quote_pending) {
+        qemu_mutex_unlock(&td->lock);
+        return;
+    }
+    gpa = td->quote_gpa;
+    size = td->quote_size;
+    td->quote_pending = false;
+    qemu_mutex_unlock(&td->lock);
+
+    if (address_space_read(&address_space_memory, gpa, MEMTXATTRS_UNSPECIFIED,
+                           &hdr, sizeof(hdr)) != MEMTX_OK ||
+        address_space_read(&address_space_memory, gpa + sizeof(hdr),
+                           MEMTXATTRS_UNSPECIFIED, report,
+                           TDX_REPORT_LEN) != MEMTX_OK) {
+        return;
+    }
+
+    tdx_build_quote(report, quote);
+
+    if (sizeof(hdr) + quote->len > size) {
+        /*
+         * Too small.  Report the size needed and fail, which is what lets a
+         * guest ask once with a small buffer and then allocate properly.
+         */
+        hdr.status = cpu_to_le64(GET_QUOTE_ERROR);
+        hdr.out_len = cpu_to_le32(quote->len);
+    } else {
+        address_space_write(&address_space_memory, gpa + sizeof(hdr),
+                            MEMTXATTRS_UNSPECIFIED, quote->data, quote->len);
+        hdr.status = cpu_to_le64(GET_QUOTE_SUCCESS);
+        hdr.out_len = cpu_to_le32(quote->len);
+    }
+    address_space_write(&address_space_memory, gpa, MEMTXATTRS_UNSPECIFIED,
+                        &hdr, sizeof(hdr));
+
+    warn_report_once("tdx: produced a NON-GENUINE Quote. Its signature is a "
+                     "fixed marker, not a signature, and it carries no "
+                     "certification data. It is not evidence and must never be "
+                     "sent to a relying party or a verification service.");
+}
+
+/*
+ * TDVMCALL<GetQuote>: R12 the shared GPA of the buffer, R13 its length.
+ *
+ * The buffer has to be genuinely shared -- alias bit set and the page
+ * converted -- which is the point at which a TD first needs working shared
+ * memory for something that is not a device.
+ */
+static void tdx_get_quote(CPUX86State *env)
+{
+    X86CPU *cpu = env_archcpu(env);
+    TdxTcgState *td = tdx_get_state();
+    uint64_t raw_gpa = env->regs[R_R12];
+    uint64_t size = env->regs[R_R13];
+    uint64_t gpa = tdx_strip_shared(cpu, raw_gpa);
+    TdxQuoteHdr hdr;
+    uint64_t status;
+
+    env->regs[R_EAX] = TDX_SUCCESS;
+
+    if (!(raw_gpa & tdx_shared_mask(env))) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "tdx: GetQuote buffer at GPA 0x%" PRIx64 " is not in the "
+                      "SHARED alias; the quoting service cannot reach TD "
+                      "private memory\n", raw_gpa);
+        env->regs[R_R10] = TDVMCALL_INVALID_OPERAND;
+        return;
+    }
+    if (gpa & 0xfff) {
+        env->regs[R_R10] = TDVMCALL_ALIGN_ERROR;
+        return;
+    }
+    if (!tdx_gpa_ok(cpu, gpa, 4096, TDX_OPERAND_ID_RCX, &status) ||
+        size < sizeof(hdr) + TDX_REPORT_LEN) {
+        env->regs[R_R10] = TDVMCALL_INVALID_OPERAND;
+        return;
+    }
+    if (tdx_sept_enabled(env) && !tdx_sept_gpa_is_shared(env, gpa)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "tdx: GetQuote buffer at GPA 0x%" PRIx64 " carries the "
+                      "SHARED alias but was never converted with "
+                      "TDVMCALL<MapGPA>\n", gpa);
+        env->regs[R_R10] = TDVMCALL_INVALID_OPERAND;
+        return;
+    }
+
+    if (address_space_read(&address_space_memory, gpa, MEMTXATTRS_UNSPECIFIED,
+                           &hdr, sizeof(hdr)) != MEMTX_OK) {
+        env->regs[R_R10] = TDVMCALL_INVALID_OPERAND;
+        return;
+    }
+    if (le64_to_cpu(hdr.version) != TDX_QUOTE_VERSION ||
+        le32_to_cpu(hdr.in_len) != TDX_REPORT_LEN) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "tdx: GetQuote header version %" PRIu64 " in_len %u; "
+                      "expected version %d and a %d-byte TDREPORT\n",
+                      le64_to_cpu(hdr.version), le32_to_cpu(hdr.in_len),
+                      TDX_QUOTE_VERSION, TDX_REPORT_LEN);
+        env->regs[R_R10] = TDVMCALL_INVALID_OPERAND;
+        return;
+    }
+
+    qemu_mutex_lock(&td->lock);
+    if (td->quote_pending) {
+        qemu_mutex_unlock(&td->lock);
+        env->regs[R_R10] = TDVMCALL_GPA_INUSE;
+        return;
+    }
+    td->quote_pending = true;
+    td->quote_gpa = gpa;
+    td->quote_size = size;
+    qemu_mutex_unlock(&td->lock);
+
+    /* Answer later; the guest polls the status field until it changes. */
+    hdr.status = cpu_to_le64(GET_QUOTE_IN_FLIGHT);
+    hdr.out_len = 0;
+    address_space_write(&address_space_memory, gpa, MEMTXATTRS_UNSPECIFIED,
+                        &hdr, sizeof(hdr));
+
+    if (!td->quote_timer) {
+        td->quote_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, tdx_quote_complete,
+                                       td);
+    }
+    timer_mod(td->quote_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + TDX_QUOTE_DELAY_MS);
+
+    env->regs[R_R10] = TDVMCALL_SUCCESS;
+}
+
 static void tdx_mem_page_accept(CPUX86State *env)
 {
     X86CPU *cpu = env_archcpu(env);
@@ -787,15 +1053,7 @@ static void tdx_vp_vmcall(CPUX86State *env, int next_eip_addend)
     }
 
     case TDVMCALL_GET_QUOTE:
-        /*
-         * Deliberately refused.  A Quote is the only form in which a TDREPORT
-         * becomes remote evidence, and the emulated report is unauthenticated
-         * by construction, so no quoting path is provided.
-         */
-        warn_report_once("tdx: refusing TDVMCALL<GetQuote>; the emulated TD "
-                         "has no attestation key and cannot produce evidence");
-        env->regs[R_EAX] = TDX_SUCCESS;
-        env->regs[R_R10] = TDVMCALL_INVALID_OPERAND;
+        tdx_get_quote(env);
         break;
 
     default:
