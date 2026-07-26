@@ -267,6 +267,30 @@ The SHARED bit is stripped in all four page-table walkers: the TLB-fill one, the
 debug one behind ``x``, gdb and ``cpu_memory_rw_debug()``, the one behind
 ``dump-guest-memory``, and the monitor's ``info mem``/``info tlb``.
 
+The launch measurement
+----------------------
+
+MRTD was a constant zero until recently, which made the root of the measurement
+chain a fixed value: a guest could not tell a correct measurement flow from no
+flow, and the report could not change when the payload did.
+
+Hardware builds MRTD from the ``TDH.MEM.PAGE.ADD`` and ``TDH.MR.EXTEND`` sequence
+the VMM performs and seals it with ``TDH.MR.FINALIZE``. There is no such sequence
+here, so the emulation hashes the launch image as loaded: SHA-384 over every page
+belonging to a loaded image, each contributing its GPA followed by its contents,
+in address order. The GPA makes it position-sensitive, as the hardware sequence
+is.
+
+It is therefore **not** the MRTD real hardware would report for the same payload
+and must not be compared against one. What it is good for is that it is stable
+across boots and changes when the payload changes. The emulated SEV-SNP launch
+measurement uses the same construction.
+
+It is computed at the transition to running, since ROMs reach guest memory in the
+initial reset — after every machine-init-done notifier — and no vCPU has executed
+by then. MRTD survives a reset, measuring an image a reset does not change; the
+RTMRs do not, being runtime measurements.
+
 Not modelled
 ------------
 
@@ -282,12 +306,21 @@ reset vector; AP bring-up via ``TDG.VP.ENTER``; ``TDG.VP.CPUIDVE.SET``;
 Testing
 -------
 
-``tests/tcg/x86_64/system/`` contains four freestanding tests, run with
+``tests/tcg/x86_64/system/`` contains five freestanding tests, run with
 ``make run-tcg-tests-x86_64-softmmu``:
 
 ``tdx``
   The interface surface: ``CPUID`` identification, ``TDG.VP.INFO``, the
   measurement calls, and the ``TDVMCALL`` service routines.
+
+``tdx-attest``
+  The attestation flow: that ``REPORTDATA`` comes back, that operand alignment is
+  enforced, that MRTD is not zero, that extending an RTMR changes that register
+  and no other and leaves MRTD alone, that the same data extended from the same
+  state gives the same result and different data does not, and that two reports
+  over identical inputs are identical. It also asserts what must *not* work: the
+  ``REPORTMACSTRUCT`` MAC is the fixed not-real marker and ``GetQuote`` is
+  refused.
 
 ``tdx-sept``
   Page state, in lazy mode. Builds its own page tables so the SHARED alias can

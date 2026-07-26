@@ -2572,6 +2572,7 @@ struct ArchCPU {
     bool sev_snp_relax_hlt;
     uint8_t sev_snp_cbitpos;
     uint8_t sev_snp_rmp;
+    uint64_t sev_snp_secrets_gpa;
     uint32_t sev_snp_vc_mask;
     uint8_t tdx_gpaw;
     uint8_t tdx_sept;

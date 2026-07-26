@@ -9,4 +9,5 @@ i386_system_ss.add(when: ['CONFIG_TCG', 'CONFIG_SYSTEM_ONLY'], if_true: files(
   'seg_helper.c',
   'tdx.c',
   'snp.c',
+  'snp-gcm.c',
 ))

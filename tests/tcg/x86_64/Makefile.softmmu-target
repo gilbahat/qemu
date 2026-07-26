@@ -65,6 +65,7 @@ sev-snp-rmp: CFLAGS+=-mgeneral-regs-only
 sev-snp-cbit: CFLAGS+=-mgeneral-regs-only
 sev-snp-strict: CFLAGS+=-mgeneral-regs-only
 sev-snp-dma: CFLAGS+=-mgeneral-regs-only
+sev-snp-attest: CFLAGS+=-mgeneral-regs-only
 tdx-sept: CFLAGS+=-mgeneral-regs-only
 tdx-attest: CFLAGS+=-mgeneral-regs-only
 tdx-strict: CFLAGS+=-mgeneral-regs-only
@@ -98,6 +99,12 @@ run-tdx-dma: QEMU_OPTS=-cpu $(TDX_SEPT_CPU) \
 run-tdx-strict: QEMU_OPTS=-cpu max,x-tdx-guest=on,x-tdx-sept=2 \
                 $(X64_SYSTEM_OPTS) -kernel
 run-sev-snp: QEMU_OPTS=-cpu max,x-sev-snp-guest=on $(X64_SYSTEM_OPTS) -kernel
+
+# Attestation: the guest seals its own request with AES-256-GCM under a VMPCK
+# from the secrets page, so the emulator has to interoperate with an independent
+# implementation of the same construction.
+SNP_ATTEST_CPU=max,x-sev-snp-guest=on,x-sev-snp-secrets-gpa=0x4000000
+run-sev-snp-attest: QEMU_OPTS=-cpu $(SNP_ATTEST_CPU) $(X64_SYSTEM_OPTS) -kernel
 # I/O is relaxed: a handler with no GHCB cannot service it, and both the test's
 # output and its exit are port I/O.  See the comment in sev-snp-vc.c.
 run-sev-snp-vc: QEMU_OPTS=-cpu max,x-sev-snp-guest=on,x-sev-snp-relax-io=on \

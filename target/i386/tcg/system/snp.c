@@ -27,7 +27,9 @@
 #include "crypto/hash.h"
 #include "hw/core/boards.h"
 #include "system/system.h"
+#include "system/reset.h"
 #include "snp.h"
+#include "snp-gcm.h"
 #include "hw/i386/snp-dma.h"
 
 #ifdef TARGET_X86_64
@@ -59,6 +61,7 @@ typedef struct SnpTcgState {
      * before the guest runs.
      */
     uint8_t measurement[SNP_MEASUREMENT_LEN];
+    bool measurement_valid;
 
     /* Flattened form of rmp, live only across a migration. */
     uint32_t rmp_count;
@@ -124,6 +127,7 @@ static const VMStateDescription vmstate_snp_tcg = {
     .fields = (const VMStateField[]) {
         VMSTATE_BOOL(vc_armed, SnpTcgState),
         VMSTATE_UINT8_ARRAY(measurement, SnpTcgState, SNP_MEASUREMENT_LEN),
+        VMSTATE_BOOL(measurement_valid, SnpTcgState),
         VMSTATE_UINT32(rmp_count, SnpTcgState),
         VMSTATE_VARRAY_UINT32_ALLOC(rmp_pfn, SnpTcgState, rmp_count, 0,
                                     vmstate_info_uint64, uint64_t),
@@ -134,6 +138,7 @@ static const VMStateDescription vmstate_snp_tcg = {
 };
 
 static SnpTcgState *snp_get_state(void);
+static void snp_write_secrets_page(void *opaque);
 
 /*
  * The launch measurement.
@@ -141,37 +146,57 @@ static SnpTcgState *snp_get_state(void);
  * On hardware the AMD-SP computes this over the SNP_LAUNCH_UPDATE sequence and
  * seals it at SNP_LAUNCH_FINISH.  There is no such sequence here -- a -kernel
  * boot places the payload with the ordinary loader -- so this hashes the launch
- * image as loaded: for every page of guest RAM belonging to a loaded image, the
- * GPA followed by the page contents, in address order.  The GPA makes it
- * position-sensitive, which is the property the hardware sequence has.
+ * image as loaded: for every page belonging to a loaded image, the GPA followed
+ * by the page contents, in address order.  The GPA makes it position-sensitive,
+ * which is the property the hardware sequence has.
  *
  * It is therefore **not** the measurement a real SNP guest would report for the
  * same payload and must not be compared against one.  What it gives a guest
  * is a root measurement stable across boots that changes when the payload
  * changes -- the part of an attestation flow that can actually be tested.
  *
- * Read through rom_ptr(), so the value is of the pristine image whatever the
- * guest has since written.  Deliberately the same construction as the emulated
- * TDX MRTD, so the two are comparable to anyone reading both.
+ * Deliberately the same construction as the emulated TDX MRTD, so the two are
+ * comparable to anyone reading both.
+ *
+ * Measured at the transition to running, not at machine-init-done: ROMs are
+ * copied into guest memory by the initial reset, which happens *after* every
+ * machine-init-done notifier, so at that point the image is not in memory yet.
+ * A plain reset handler is no good either -- rom_reset() is registered after
+ * those notifiers, so it would run second.  By the time the VM starts running
+ * the image is in place and no vCPU has executed, which is launch time.
+ *
+ * Membership is asked of rom_ptr(), but the bytes are read from guest memory.
+ * rom_ptr() bounds its answer by romsize while the buffer behind it is only
+ * datasize long -- a segment with a .bss tail has romsize > datasize -- so
+ * reading a whole page through it walks off the end of the allocation.
  */
-static void snp_compute_measurement(Notifier *n, void *unused)
+static void snp_measure_launch_image(void *opaque, bool running, RunState state)
 {
-    SnpTcgState *s = snp_get_state();
+    SnpTcgState *s = opaque;
     ram_addr_t ram_size = current_machine->ram_size;
     g_autoptr(GByteArray) buf = g_byte_array_new();
+    g_autofree uint8_t *page = g_malloc0(TARGET_PAGE_SIZE);
     hwaddr gpa;
     unsigned pages = 0;
 
+    if (!running || s->measurement_valid) {
+        return;
+    }
+
     for (gpa = 0; gpa < ram_size; gpa += TARGET_PAGE_SIZE) {
-        void *p = rom_ptr(gpa, TARGET_PAGE_SIZE);
         uint64_t le_gpa;
 
-        if (!p) {
+        if (!rom_ptr(gpa, 1)) {
+            continue;
+        }
+        if (address_space_read(&address_space_memory, gpa,
+                               MEMTXATTRS_UNSPECIFIED, page,
+                               TARGET_PAGE_SIZE) != MEMTX_OK) {
             continue;
         }
         le_gpa = cpu_to_le64(gpa);
         g_byte_array_append(buf, (const uint8_t *)&le_gpa, sizeof(le_gpa));
-        g_byte_array_append(buf, p, TARGET_PAGE_SIZE);
+        g_byte_array_append(buf, page, TARGET_PAGE_SIZE);
         pages++;
     }
 
@@ -192,12 +217,11 @@ static void snp_compute_measurement(Notifier *n, void *unused)
             return;
         }
     }
+    s->measurement_valid = true;
     qemu_log_mask(LOG_GUEST_ERROR,
                   "sev-snp: launch measurement computed over %u pages\n",
                   pages);
 }
-
-static Notifier snp_machine_done = { .notify = snp_compute_measurement };
 
 static SnpTcgState *snp_get_state(void)
 {
@@ -205,7 +229,14 @@ static SnpTcgState *snp_get_state(void)
         snp_state = g_new0(SnpTcgState, 1);
         qemu_mutex_init(&snp_state->lock);
         vmstate_register(NULL, 0, &vmstate_snp_tcg, snp_state);
-        qemu_add_machine_init_done_notifier(&snp_machine_done);
+        qemu_add_vm_change_state_handler(snp_measure_launch_image,
+                                        snp_state);
+        /*
+         * The secrets page is placed from a reset handler rather than at
+         * machine-init-done: a guest expects it present at every boot, and a
+         * reset must put it back, which is what firmware does on hardware.
+         */
+        qemu_register_reset(snp_write_secrets_page, snp_state);
     }
     return snp_state;
 }
@@ -922,6 +953,307 @@ static uint64_t ghcb_nae_msr(GhcbCtx *c)
 }
 
 /* Dispatch an NAE event through the registered GHCB page. */
+/* --- the guest-message protocol and the attestation report --------------- */
+
+/*
+ * The secrets page.  On hardware the AMD-SP fills this in and the hypervisor
+ * maps it into the guest; firmware then tells the guest where it is, through
+ * metadata a -kernel boot does not have.  So its address is a property here and
+ * the guest is told out-of-band -- which is what firmware would be doing
+ * anyway.
+ * The VMPCKs in it are fixed, published constants. That is deliberate and it
+ * is the whole point: they are not secret, cannot be, and a guest must never
+ * treat a key obtained this way as one. What a guest can do with them is
+ * real AEAD path rather than a bypass of it.
+ */
+typedef struct QEMU_PACKED SnpSecretsPage {
+    uint32_t version;
+    uint32_t imi_en_and_flags;
+    uint32_t fms;
+    uint32_t reserved1;
+    uint8_t gosvw[16];
+    uint8_t vmpck[SNP_VMPCK_COUNT][SNP_VMPCK_LEN];
+    uint8_t os_area[96];
+    uint8_t reserved2[3840];
+} SnpSecretsPage;
+QEMU_BUILD_BUG_ON(sizeof(SnpSecretsPage) != 4096);
+
+hwaddr snp_secrets_gpa(CPUX86State *env)
+{
+    return env_archcpu(env)->sev_snp_secrets_gpa;
+}
+
+static void snp_vmpck_fill(uint8_t *out, unsigned index)
+{
+    unsigned i;
+
+    /*
+     * Derived from the index so the four keys differ -- a guest that uses the
+     * wrong VMPCK must fail the tag rather than accidentally succeed.
+     */
+    for (i = 0; i < SNP_VMPCK_LEN; i++) {
+        out[i] = (uint8_t)(0xA0 + index * 0x11 + i);
+    }
+}
+
+static void snp_write_secrets_page(void *opaque)
+{
+    CPUX86State *env = &X86_CPU(first_cpu)->env;
+    hwaddr gpa = snp_secrets_gpa(env);
+    SnpSecretsPage page = { 0 };
+    unsigned i;
+
+    if (!gpa) {
+        return;
+    }
+
+    page.version = cpu_to_le32(3);
+    for (i = 0; i < SNP_VMPCK_COUNT; i++) {
+        snp_vmpck_fill(page.vmpck[i], i);
+    }
+
+    if (address_space_write(&address_space_memory, gpa,
+                            MEMTXATTRS_UNSPECIFIED, &page,
+                            sizeof(page)) != MEMTX_OK) {
+        warn_report("sev-snp: could not place the secrets page at GPA 0x%"
+                    HWADDR_PRIx, gpa);
+        return;
+    }
+    warn_report_once("sev-snp: secrets page placed with FIXED, PUBLISHED "
+                     "VMPCKs. They are not secret, cannot be, and a guest must "
+                     "never treat them as key material.");
+}
+
+
+/* struct snp_guest_msg_hdr, as the ABI and the Linux driver define it. */
+typedef struct QEMU_PACKED SnpMsgHdr {
+    uint8_t authtag[32];
+    uint64_t msg_seqno;
+    uint8_t rsvd1[8];
+    uint8_t algo;
+    uint8_t hdr_version;
+    uint16_t hdr_sz;
+    uint8_t msg_type;
+    uint8_t msg_version;
+    uint16_t msg_sz;
+    uint32_t rsvd2;
+    uint8_t msg_vmpck;
+    uint8_t rsvd3[35];
+} SnpMsgHdr;
+QEMU_BUILD_BUG_ON(sizeof(SnpMsgHdr) != SNP_MSG_HDR_LEN);
+QEMU_BUILD_BUG_ON(offsetof(SnpMsgHdr, algo) != SNP_MSG_AAD_OFF);
+
+/* MSG_REPORT_REQ. */
+typedef struct QEMU_PACKED SnpReportReq {
+    uint8_t report_data[SNP_REPORTDATA_LEN];
+    uint32_t vmpl;
+    uint8_t reserved[28];
+} SnpReportReq;
+QEMU_BUILD_BUG_ON(sizeof(SnpReportReq) != 96);
+
+/* ATTESTATION_REPORT. */
+typedef struct QEMU_PACKED SnpAttestationReport {
+    uint32_t version;
+    uint32_t guest_svn;
+    uint64_t policy;
+    uint8_t family_id[16];
+    uint8_t image_id[16];
+    uint32_t vmpl;
+    uint32_t signature_algo;
+    uint64_t platform_version;
+    uint64_t platform_info;
+    uint32_t flags;
+    uint32_t reserved0;
+    uint8_t report_data[SNP_REPORTDATA_LEN];
+    uint8_t measurement[SNP_MEASUREMENT_LEN];
+    uint8_t host_data[32];
+    uint8_t id_key_digest[SNP_MEASUREMENT_LEN];
+    uint8_t author_key_digest[SNP_MEASUREMENT_LEN];
+    uint8_t report_id[32];
+    uint8_t report_id_ma[32];
+    uint64_t reported_tcb;
+    uint8_t reserved1[24];
+    uint8_t chip_id[64];
+    uint64_t committed_tcb;
+    uint8_t current_build;
+    uint8_t current_minor;
+    uint8_t current_major;
+    uint8_t reserved2;
+    uint8_t committed_build;
+    uint8_t committed_minor;
+    uint8_t committed_major;
+    uint8_t reserved3;
+    uint64_t launch_tcb;
+    uint8_t reserved4[168];
+    uint8_t signature[512];
+} SnpAttestationReport;
+QEMU_BUILD_BUG_ON(sizeof(SnpAttestationReport) != SNP_REPORT_LEN);
+
+/* MSG_REPORT_RSP: a status, a length, then the report. */
+typedef struct QEMU_PACKED SnpReportRsp {
+    uint32_t status;
+    uint32_t report_size;
+    uint8_t reserved[24];
+    SnpAttestationReport report;
+} SnpReportRsp;
+
+/*
+ * The IV is the message sequence number, little-endian, zero-padded to 96 bits.
+ * Request and response therefore must not share a sequence number, or the same
+ * key and nonce would be used twice; the response uses seqno + 1 and the guest
+ * advances by two, which is what the Linux driver does.
+ */
+static void snp_msg_iv(uint8_t *iv, uint64_t seqno)
+{
+    uint64_t le = cpu_to_le64(seqno);
+
+    memset(iv, 0, SNP_GCM_IV_LEN);
+    memcpy(iv, &le, sizeof(le));
+}
+
+static void snp_fill_report(CPUX86State *env, SnpAttestationReport *r,
+                            const SnpReportReq *req)
+{
+    SnpTcgState *s = snp_get_state();
+    size_t i;
+
+    memset(r, 0, sizeof(*r));
+    r->version = cpu_to_le32(2);
+    r->vmpl = req->vmpl;
+    r->signature_algo = cpu_to_le32(1);        /* ECDSA P-384 with SHA-384 */
+    memcpy(r->report_data, req->report_data, SNP_REPORTDATA_LEN);
+
+    QEMU_LOCK_GUARD(&s->lock);
+    memcpy(r->measurement, s->measurement, SNP_MEASUREMENT_LEN);
+
+    /*
+     * Not a signature.  Filling this with the marker rather than with plausible
+     * random bytes is the point: a relying party, or a guest that forgets where
+     * its report came from, sees immediately what this is.
+     */
+    for (i = 0; i < sizeof(r->signature); i += sizeof(SNP_TCG_FAKE_SIG) - 1) {
+        size_t n = MIN(sizeof(SNP_TCG_FAKE_SIG) - 1, sizeof(r->signature) - i);
+
+        memcpy(r->signature + i, SNP_TCG_FAKE_SIG, n);
+    }
+
+    warn_report_once("sev-snp: produced a NON-GENUINE attestation report. The "
+                     "signature field is a fixed marker, not a signature. It "
+                     "has no attestation meaning and must never be sent to a "
+                     "relying party.");
+}
+
+/*
+ * SNP_GUEST_REQUEST: SW_EXITINFO1 is the request page GPA, SW_EXITINFO2 the
+ * response page GPA.  Both are shared pages; the message inside is sealed with
+ * the VMPCK, so the guest has to get the AEAD, the AAD and the sequence number
+ * right before it sees anything.
+ */
+static uint64_t ghcb_nae_guest_request(GhcbCtx *c, CPUX86State *env)
+{
+    hwaddr req_gpa, rsp_gpa;
+    SnpMsgHdr req_hdr, rsp_hdr;
+    SnpReportReq req = { 0 };
+    SnpReportRsp rsp = { 0 };
+    uint8_t vmpck[SNP_VMPCK_LEN];
+    uint8_t iv[SNP_GCM_IV_LEN];
+    uint8_t ct[sizeof(SnpReportReq)];
+    g_autofree uint8_t *rsp_ct = NULL;
+    uint16_t msg_sz;
+
+    if (!ghcb_is_valid(c, GHCB_OFF_SW_EXITINFO1) ||
+        !ghcb_is_valid(c, GHCB_OFF_SW_EXITINFO2)) {
+        return GHCB_EXITINFO2_INVALID;
+    }
+    req_gpa = ghcb_get(c, GHCB_OFF_SW_EXITINFO1);
+    rsp_gpa = ghcb_get(c, GHCB_OFF_SW_EXITINFO2);
+
+    if (address_space_read(&address_space_memory, req_gpa,
+                           MEMTXATTRS_UNSPECIFIED, &req_hdr,
+                           sizeof(req_hdr)) != MEMTX_OK) {
+        return GHCB_EXITINFO2_INVALID;
+    }
+
+    if (req_hdr.algo != SNP_AEAD_AES_256_GCM ||
+        req_hdr.hdr_version != SNP_MSG_HDR_VERSION ||
+        req_hdr.msg_vmpck >= SNP_VMPCK_COUNT) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "sev-snp: guest request with algo %u, hdr_version %u, "
+                      "vmpck %u\n", req_hdr.algo, req_hdr.hdr_version,
+                      req_hdr.msg_vmpck);
+        return GHCB_EXITINFO2_INVALID;
+    }
+    if (req_hdr.msg_type != SNP_MSG_REPORT_REQ) {
+        qemu_log_mask(LOG_UNIMP,
+                      "sev-snp: unimplemented guest message type %u\n",
+                      req_hdr.msg_type);
+        return GHCB_EXITINFO2_INVALID;
+    }
+
+    msg_sz = le16_to_cpu(req_hdr.msg_sz);
+    if (msg_sz != sizeof(SnpReportReq)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "sev-snp: MSG_REPORT_REQ is %u bytes, expected %zu\n",
+                      msg_sz, sizeof(SnpReportReq));
+        return GHCB_EXITINFO2_INVALID;
+    }
+
+    if (address_space_read(&address_space_memory, req_gpa + SNP_MSG_HDR_LEN,
+                           MEMTXATTRS_UNSPECIFIED, ct,
+                           sizeof(ct)) != MEMTX_OK) {
+        return GHCB_EXITINFO2_INVALID;
+    }
+
+    snp_vmpck_fill(vmpck, req_hdr.msg_vmpck);
+    snp_msg_iv(iv, le64_to_cpu(req_hdr.msg_seqno));
+
+    if (!snp_gcm_decrypt(vmpck, iv, SNP_GCM_IV_LEN,
+                         (const uint8_t *)&req_hdr + SNP_MSG_AAD_OFF,
+                         SNP_MSG_AAD_LEN, ct, (uint8_t *)&req,
+                         sizeof(req), req_hdr.authtag)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "sev-snp: guest request failed authentication; check the "
+                      "VMPCK, the sequence number and that the AAD is the "
+                      "header from offset 0x30\n");
+        return GHCB_EXITINFO2_INVALID;
+    }
+
+    /* Build the response. */
+    rsp.status = cpu_to_le32(SNP_GUEST_RSP_OK);
+    rsp.report_size = cpu_to_le32(sizeof(SnpAttestationReport));
+    snp_fill_report(env, &rsp.report, &req);
+
+    memset(&rsp_hdr, 0, sizeof(rsp_hdr));
+    rsp_hdr.algo = SNP_AEAD_AES_256_GCM;
+    rsp_hdr.hdr_version = SNP_MSG_HDR_VERSION;
+    rsp_hdr.hdr_sz = cpu_to_le16(SNP_MSG_HDR_LEN);
+    rsp_hdr.msg_type = SNP_MSG_REPORT_RSP;
+    rsp_hdr.msg_version = req_hdr.msg_version;
+    rsp_hdr.msg_sz = cpu_to_le16(sizeof(SnpReportRsp));
+    rsp_hdr.msg_vmpck = req_hdr.msg_vmpck;
+    rsp_hdr.msg_seqno = cpu_to_le64(le64_to_cpu(req_hdr.msg_seqno) + 1);
+
+    rsp_ct = g_malloc0(sizeof(SnpReportRsp));
+    snp_msg_iv(iv, le64_to_cpu(rsp_hdr.msg_seqno));
+    if (!snp_gcm_encrypt(vmpck, iv, SNP_GCM_IV_LEN,
+                         (const uint8_t *)&rsp_hdr + SNP_MSG_AAD_OFF,
+                         SNP_MSG_AAD_LEN, (const uint8_t *)&rsp, rsp_ct,
+                         sizeof(SnpReportRsp), rsp_hdr.authtag)) {
+        return GHCB_EXITINFO2_INVALID;
+    }
+
+    if (address_space_write(&address_space_memory, rsp_gpa,
+                            MEMTXATTRS_UNSPECIFIED, &rsp_hdr,
+                            sizeof(rsp_hdr)) != MEMTX_OK ||
+        address_space_write(&address_space_memory, rsp_gpa + SNP_MSG_HDR_LEN,
+                            MEMTXATTRS_UNSPECIFIED, rsp_ct,
+                            sizeof(SnpReportRsp)) != MEMTX_OK) {
+        return GHCB_EXITINFO2_INVALID;
+    }
+
+    return GHCB_EXITINFO2_OK;
+}
+
 static void snp_ghcb_page_protocol(CPUX86State *env, int next_eip_addend)
 {
     GhcbCtx c;
@@ -949,6 +1281,20 @@ static void snp_ghcb_page_protocol(CPUX86State *env, int next_eip_addend)
         break;
     case SVM_EXIT_MSR:
         status = ghcb_nae_msr(&c);
+        break;
+    case SVM_EXIT_SNP_GUEST_REQUEST:
+        status = ghcb_nae_guest_request(&c, env);
+        break;
+    case SVM_EXIT_SNP_EXT_GUEST_REQUEST:
+        /*
+         * Refused outright, like TDVMCALL<GetQuote>.  The extended request
+         * returns a certificate chain, and there is no chain here that is not a
+         * lie; a guest asking for one should find out now.
+         */
+        warn_report_once("sev-snp: refusing SNP_EXT_GUEST_REQUEST; there is no "
+                         "certificate chain and the emulation will not invent "
+                         "one");
+        status = GHCB_EXITINFO2_INVALID;
         break;
     case SVM_EXIT_HLT:
         ghcb_end(&c, GHCB_EXITINFO2_OK);

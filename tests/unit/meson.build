@@ -80,6 +80,10 @@ if have_block
     'test-crypto-hash': [crypto],
     'test-crypto-hmac': [crypto],
     'test-crypto-cipher': [crypto],
+    # snp-gcm.c is hand-written AES-256-GCM for the emulated SEV-SNP guest
+    # message protocol, which needs an AEAD mode the crypto API does not have.
+    # Compiled in directly: it lives in a target-specific library otherwise.
+    'test-snp-gcm': [files('../../target/i386/tcg/system/snp-gcm.c'), crypto],
     'test-crypto-akcipher': [crypto],
     'test-crypto-secret': [crypto, keyutils],
     'test-crypto-der': [crypto],

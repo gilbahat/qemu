@@ -189,19 +189,78 @@ buffers must be shared. This is what ``machine_run_board_init()`` does for a
 ``confidential-guest-support`` object, which the CPU-property route does not
 reach.
 
+Attestation
+-----------
+
+Not trustworthy, and it cannot be: there is no key. What is here is the *flow*,
+because that is what a guest has to get right and it is checkable without a key.
+
+``SNP_GUEST_REQUEST`` is implemented in full, including the AES-256-GCM sealing.
+The guest reads a VMPCK from the secrets page, seals a ``MSG_REPORT_REQ`` with
+the message header from offset 0x30 as additional authenticated data and the
+sequence number as the nonce, and gets back a sealed ``MSG_REPORT_RSP``
+containing an ``ATTESTATION_REPORT``. Get the key, the AAD, the sequence number
+or the tag wrong and the request is refused with nothing returned — as on
+hardware.
+
+Doing that honestly needed an AEAD, which QEMU's crypto API does not provide, so
+``target/i386/tcg/system/snp-gcm.c`` assembles AES-256-GCM from the AES block
+cipher it does provide. It is checked against independently generated vectors in
+``tests/unit/test-snp-gcm.c``. The alternative — accepting an unencrypted
+payload — was rejected: a guest developed against that would skip the crypto
+entirely and fail on hardware, which is the sort of false pass this emulation
+exists to remove.
+
+``x-sev-snp-secrets-gpa=N``
+  Where to place the secrets page; 0 (the default) leaves it absent. On hardware
+  the AMD-SP fills this page in and firmware tells the guest where it is, through
+  metadata a ``-kernel`` boot has no equivalent of, so the address is agreed
+  out-of-band here instead. It is rewritten on reset, as firmware would.
+
+  **The VMPCKs in it are fixed, published constants.** They are not secret,
+  cannot be, and a guest must never treat a key obtained this way as key
+  material. What they are for is letting a guest exercise the real sealing path.
+
+The report's ``MEASUREMENT`` is the launch measurement described below. Its
+``REPORT_DATA`` is whatever the guest supplied, so a guest can bind a nonce and
+check it came back.
+
+Nothing here may be mistaken for evidence. The report's signature field is a
+fixed marker rather than a signature, and ``SNP_EXT_GUEST_REQUEST`` — which
+returns a certificate chain — is refused outright, because there is no chain
+here that would not be a lie.
+
+The launch measurement
+----------------------
+
+Hardware derives this from the ``SNP_LAUNCH_UPDATE`` sequence and seals it at
+``SNP_LAUNCH_FINISH``. There is no such sequence here, so the emulation hashes
+the launch image as loaded: SHA-384 over every page belonging to a loaded image,
+each contributing its GPA followed by its contents, in address order. The GPA
+makes it position-sensitive, which is the property the hardware sequence has.
+
+It is therefore **not** the measurement real hardware would report for the same
+payload and must not be compared against one. What it is good for is that it is
+stable across boots and changes when the payload changes — so an attestation
+flow can be tested against it. The emulated TDX MRTD uses the same construction.
+
+It is computed at the transition to running: ROMs reach guest memory in the
+initial reset, which happens after every machine-init-done notifier, and no vCPU
+has executed yet — which is launch time.
+
 Not modelled
 ------------
 
 Memory encryption and isolation of any kind; RMP page sizes, so a 2 MiB
 ``PVALIDATE`` is refused with ``FAIL_SIZEMISMATCH``; ``RMPADJUST``,
 ``RMPQUERY``, ``PSMASH``; VMPLs and ``SNP_AP_CREATE``; MMIO reflection; string
-I/O over the GHCB shared buffer; and attestation — there is no secrets page, no
-VMPCK, and no ``SNP_GUEST_REQUEST``.
+I/O over the GHCB shared buffer; and any *trustworthy* attestation — there is no
+signing key and no certificate chain, so the report is evidence of nothing.
 
 Testing
 -------
 
-``tests/tcg/x86_64/system/`` contains eight freestanding tests, run with
+``tests/tcg/x86_64/system/`` contains nine freestanding tests, run with
 ``make run-tcg-tests-x86_64-softmmu``:
 
 ``sev-snp``
@@ -222,6 +281,13 @@ Testing
   armed with no relaxations, and a ``#VC`` handler that services I/O through the
   GHCB. Its own output and its ACPI poweroff travel over the NAE path, so it
   could neither report nor exit if that path were broken.
+
+``sev-snp-attest``
+  The attestation flow, and the only test that carries its own AES-256-GCM: it
+  seals its own request and opens the response, which is what makes it an
+  interoperability check rather than the emulator agreeing with itself. It also
+  asserts what must fail — a tampered tag, the wrong VMPCK, and the extended
+  request.
 
 ``sev-snp-dma``
   Device DMA, driven through the ``edu`` test device's DMA engine — which calls

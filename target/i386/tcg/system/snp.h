@@ -128,6 +128,44 @@
  * way TDX reuses the VMX exit reasons.
  */
 
+/*
+ * Guest-message protocol (SNP_GUEST_REQUEST).
+ *
+ * The NAE exit code, the message framing and the attestation report layout are
+ * from the SEV-SNP ABI.  The AAD for the AEAD is the message header from offset
+ * 0x30 to the end, which is everything after the tag, sequence number and the
+ * reserved field that follows them.
+ */
+#define SVM_EXIT_SNP_GUEST_REQUEST      0x80000011
+#define SVM_EXIT_SNP_EXT_GUEST_REQUEST  0x80000012
+
+#define SNP_MSG_HDR_LEN                 96
+#define SNP_MSG_PAYLOAD_LEN             4000
+#define SNP_MSG_AAD_OFF                 0x30
+#define SNP_MSG_AAD_LEN                 (SNP_MSG_HDR_LEN - SNP_MSG_AAD_OFF)
+
+#define SNP_AEAD_AES_256_GCM            1
+#define SNP_MSG_HDR_VERSION             1
+
+#define SNP_MSG_REPORT_REQ              5
+#define SNP_MSG_REPORT_RSP              6
+
+#define SNP_REPORT_LEN                  1184
+#define SNP_REPORTDATA_LEN              64
+#define SNP_VMPCK_COUNT                 4
+#define SNP_VMPCK_LEN                   32
+
+/* Message-level status codes returned in MSG_REPORT_RSP. */
+#define SNP_GUEST_RSP_OK                0
+#define SNP_GUEST_RSP_INVALID_PARAM     0x16
+
+/*
+ * Nothing produced here may be mistakable for evidence. The report signature
+ * is this marker repeated, not a signature, and the extended request -- which
+ * would imply a certificate chain -- is refused outright.
+ */
+#define SNP_TCG_FAKE_SIG  "QEMU-TCG-EMULATED-SEV-SNP-NOT-REAL!!\0\0\0\0"
+
 /* SHA-384, as the AMD-SP uses for the launch measurement. */
 #define SNP_MEASUREMENT_LEN             48
 

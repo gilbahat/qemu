@@ -25,6 +25,7 @@
 #include "qemu/lockable.h"
 #include "exec/cputlb.h"
 #include "system/system.h"
+#include "system/runstate.h"
 #include "system/reset.h"
 #include "tdx.h"
 
@@ -48,6 +49,7 @@ typedef struct TdxTcgState {
      * the guest under test.  See docs/system/i386/tdx-tcg.rst.
      */
     bool ve_armed;
+    bool mrtd_valid;
 
     /*
      * Secure-EPT-lite.  Only pages whose state differs from the mode default
@@ -129,6 +131,7 @@ static const VMStateDescription vmstate_tdx_tcg = {
         VMSTATE_UINT8_2DARRAY(rtmr, TdxTcgState, TDX_RTMR_COUNT,
                               TDX_MEASUREMENT_LEN),
         VMSTATE_BOOL(ve_armed, TdxTcgState),
+        VMSTATE_BOOL(mrtd_valid, TdxTcgState),
         VMSTATE_UINT32(sept_count, TdxTcgState),
         VMSTATE_VARRAY_UINT32_ALLOC(sept_pfn, TdxTcgState, sept_count, 0,
                                     vmstate_info_uint64, uint64_t),
@@ -153,48 +156,64 @@ static TdxTcgState *tdx_get_state(void);
  * Hardware builds this from the TDH.MEM.PAGE.ADD and TDH.MR.EXTEND sequence the
  * VMM performs, then seals it with TDH.MR.FINALIZE.  There is no such sequence
  * here -- a -kernel boot places the payload with the ordinary loader -- so this
- * hashes the launch image as loaded instead: for every page of guest RAM that
- * belongs to a loaded image, the GPA followed by the page contents, in address
- * order.  Including the GPA makes it position-sensitive, which is the property
+ * hashes the launch image as loaded instead: for every page belonging to a
+ * loaded image, the GPA followed by the page contents, in address order.
+ * Including the GPA makes it position-sensitive, which is the property
  * hardware's page-add sequence has and the reason it is worth having.
  *
  * It is therefore **not** the MRTD a real TD would report for the same payload,
  * and must not be compared against one.  What it does give a guest is a root
  * measurement that is stable across boots and changes when the payload changes,
  * which is what an attestation flow can actually be tested against.
- *
- * Read through rom_ptr() rather than from guest memory, so the value is of the
- * pristine image no matter what the guest has since written.
  */
-static void tdx_compute_mrtd(Notifier *n, void *unused)
+/*
+ * Measured at the transition to running, not at machine-init-done: ROMs are
+ * copied into guest memory by the initial reset, which happens *after* every
+ * machine-init-done notifier (see qemu_machine_creation_done()), so at that
+ * point the image is not in memory yet.  A plain reset handler is no good
+ * either -- rom_reset() is registered after those notifiers, so it would run
+ * second.  By the time the VM starts running the image is in place and no vCPU
+ * has executed, which is exactly launch time.
+ *
+ * Membership is asked of rom_ptr(), but the bytes are read from guest memory.
+ * rom_ptr() bounds its answer by romsize while the buffer behind it is only
+ * datasize long -- a segment with a .bss tail has romsize > datasize -- so
+ * reading a whole page through it walks off the end of the allocation.  Guest
+ * memory holds the data followed by the zero fill, which is what was launched.
+ */
+static void tdx_measure_launch_image(void *opaque, bool running, RunState state)
 {
-    TdxTcgState *td = tdx_get_state();
+    TdxTcgState *td = opaque;
     ram_addr_t ram_size = current_machine->ram_size;
     g_autoptr(GByteArray) buf = g_byte_array_new();
+    g_autofree uint8_t *page = g_malloc0(TARGET_PAGE_SIZE);
     struct iovec iov;
     hwaddr gpa;
     unsigned pages = 0;
 
+    if (!running || td->mrtd_valid) {
+        return;
+    }
+
     for (gpa = 0; gpa < ram_size; gpa += TARGET_PAGE_SIZE) {
-        void *p = rom_ptr(gpa, TARGET_PAGE_SIZE);
         uint64_t le_gpa;
 
-        if (!p) {
+        if (!rom_ptr(gpa, 1)) {
+            continue;
+        }
+        if (address_space_read(&address_space_memory, gpa,
+                               MEMTXATTRS_UNSPECIFIED, page,
+                               TARGET_PAGE_SIZE) != MEMTX_OK) {
             continue;
         }
         le_gpa = cpu_to_le64(gpa);
         g_byte_array_append(buf, (const uint8_t *)&le_gpa, sizeof(le_gpa));
-        g_byte_array_append(buf, p, TARGET_PAGE_SIZE);
+        g_byte_array_append(buf, page, TARGET_PAGE_SIZE);
         pages++;
     }
 
     QEMU_LOCK_GUARD(&td->lock);
     if (!pages) {
-        /*
-         * Nothing was loaded, so there is nothing to measure.  Leave MRTD zero
-         * and say so: a report over an empty launch image is not interesting,
-         * and silently reporting zeros as a measurement would be worse.
-         */
         warn_report("tdx: no launch image found to measure; MRTD stays zero");
         return;
     }
@@ -204,11 +223,10 @@ static void tdx_compute_mrtd(Notifier *n, void *unused)
         warn_report("tdx: failed to compute MRTD; it stays zero");
         return;
     }
+    td->mrtd_valid = true;
     qemu_log_mask(LOG_GUEST_ERROR,
                   "tdx: MRTD computed over %u launch pages\n", pages);
 }
-
-static Notifier tdx_machine_done = { .notify = tdx_compute_mrtd };
 
 static void tdx_reset(void *opaque)
 {
@@ -234,7 +252,8 @@ static TdxTcgState *tdx_get_state(void)
         qemu_mutex_init(&tdx_state->lock);
         vmstate_register(NULL, 0, &vmstate_tdx_tcg, tdx_state);
         qemu_register_reset(tdx_reset, tdx_state);
-        qemu_add_machine_init_done_notifier(&tdx_machine_done);
+        qemu_add_vm_change_state_handler(tdx_measure_launch_image,
+                                        tdx_state);
     }
     return tdx_state;
 }

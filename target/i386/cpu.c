@@ -11047,6 +11047,7 @@ static const Property x86_cpu_properties[] = {
     DEFINE_PROP_BOOL("x-sev-snp-guest", X86CPU, sev_snp_guest, false),
     DEFINE_PROP_UINT8("x-sev-snp-cbitpos", X86CPU, sev_snp_cbitpos, 51),
     DEFINE_PROP_UINT8("x-sev-snp-rmp", X86CPU, sev_snp_rmp, SNP_RMP_OFF),
+    DEFINE_PROP_UINT64("x-sev-snp-secrets-gpa", X86CPU, sev_snp_secrets_gpa, 0),
     DEFINE_PROP_BOOL("x-sev-snp-relax-io", X86CPU, sev_snp_relax_io, false),
     DEFINE_PROP_BOOL("x-sev-snp-relax-msr", X86CPU, sev_snp_relax_msr, false),
     DEFINE_PROP_BOOL("x-sev-snp-relax-cpuid", X86CPU, sev_snp_relax_cpuid,
