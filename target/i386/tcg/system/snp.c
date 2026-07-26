@@ -16,6 +16,7 @@
 #include "migration/vmstate.h"
 #include "qemu/error-report.h"
 #include "system/runstate.h"
+#include "system/memory.h"
 #include "svm.h"
 #include "tcg/helper-tcg.h"
 #include "snp.h"
@@ -352,11 +353,276 @@ static void snp_ghcb_msr_protocol(CPUX86State *env)
 }
 
 /*
- * VMGEXIT (F3 0F 01 D9).  With a request in the GHCB MSR this runs the MSR
- * protocol; otherwise it would dispatch an NAE event through the registered
- * GHCB page, which is not modelled yet.
+ * GHCB page access.  Narrow, typed accessors on top of address_space_read/write
+ * rather than a mapped struct: the GHCB is inherently read-modify-write (the
+ * guest writes a request, we write the reply), which address_space_map() is
+ * documented not to sanction.
  */
-void helper_vmgexit(CPUX86State *env)
+typedef struct GhcbCtx {
+    CPUX86State *env;
+    AddressSpace *as;
+    MemTxAttrs attrs;
+    hwaddr base;
+    uint64_t valid_in;      /* bitmap as the guest left it   */
+    uint64_t valid_out;     /* bits we set, written back once */
+    uint64_t valid_in_hi;
+    uint64_t valid_out_hi;
+    bool failed;
+} GhcbCtx;
+
+static bool ghcb_read(GhcbCtx *c, uint32_t off, void *buf, size_t len)
+{
+    if (address_space_read(c->as, c->base + off, c->attrs, buf, len)
+        != MEMTX_OK) {
+        c->failed = true;
+        return false;
+    }
+    return true;
+}
+
+static bool ghcb_write(GhcbCtx *c, uint32_t off, const void *buf, size_t len)
+{
+    if (address_space_write(c->as, c->base + off, c->attrs, buf, len)
+        != MEMTX_OK) {
+        c->failed = true;
+        return false;
+    }
+    return true;
+}
+
+static uint64_t ghcb_get(GhcbCtx *c, uint32_t off)
+{
+    uint64_t v = 0;
+
+    ghcb_read(c, off, &v, sizeof(v));
+    return v;
+}
+
+/* Every field written must have its valid bit set, or the guest ignores it. */
+static void ghcb_set(GhcbCtx *c, uint32_t off, uint64_t val)
+{
+    unsigned bit = GHCB_BIT(off);
+
+    ghcb_write(c, off, &val, sizeof(val));
+    if (bit < 64) {
+        c->valid_out |= 1ULL << bit;
+    } else {
+        c->valid_out_hi |= 1ULL << (bit - 64);
+    }
+}
+
+static bool ghcb_is_valid(GhcbCtx *c, uint32_t off)
+{
+    unsigned bit = GHCB_BIT(off);
+
+    return bit < 64 ? (c->valid_in & (1ULL << bit))
+                    : (c->valid_in_hi & (1ULL << (bit - 64)));
+}
+
+static bool ghcb_begin(GhcbCtx *c, CPUX86State *env)
+{
+    CPUState *cs = env_cpu(env);
+    uint32_t usage = 0;
+
+    c->env = env;
+    c->attrs = cpu_get_mem_attrs(env);
+    c->as = cpu_addressspace(cs, c->attrs);
+    c->base = env->snp_ghcb_gpa;
+    c->valid_out = c->valid_out_hi = 0;
+    c->failed = false;
+
+    c->valid_in = ghcb_get(c, GHCB_OFF_VALID_BITMAP);
+    c->valid_in_hi = ghcb_get(c, GHCB_OFF_VALID_BITMAP + 8);
+    if (c->failed) {
+        return false;
+    }
+
+    if (!ghcb_read(c, GHCB_OFF_USAGE, &usage, sizeof(usage))) {
+        return false;
+    }
+    if (usage != GHCB_USAGE_STANDARD) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "sev-snp: GHCB usage %u is not the standard protocol\n",
+                      usage);
+        return false;
+    }
+    return true;
+}
+
+static void ghcb_end(GhcbCtx *c, uint64_t exitinfo2)
+{
+    uint64_t lo = c->valid_in | c->valid_out;
+    uint64_t hi = c->valid_in_hi | c->valid_out_hi;
+
+    ghcb_write(c, GHCB_OFF_VALID_BITMAP, &lo, sizeof(lo));
+    ghcb_write(c, GHCB_OFF_VALID_BITMAP + 8, &hi, sizeof(hi));
+    /* SW_EXITINFO2 is the completion status, so write it last and unguarded. */
+    ghcb_write(c, GHCB_OFF_SW_EXITINFO2, &exitinfo2, sizeof(exitinfo2));
+}
+
+/* NAE: port I/O.  SW_EXITINFO1 is the SVM IOIO intercept encoding. */
+static uint64_t ghcb_nae_ioio(GhcbCtx *c)
+{
+    CPUX86State *env = c->env;
+    uint64_t info1 = ghcb_get(c, GHCB_OFF_SW_EXITINFO1);
+    uint32_t port = info1 >> GHCB_IOIO_PORT_SHIFT;
+    bool is_in = info1 & GHCB_IOIO_TYPE_IN;
+    unsigned size;
+
+    if (!ghcb_is_valid(c, GHCB_OFF_SW_EXITINFO1)) {
+        return GHCB_EXITINFO2_INVALID;
+    }
+    if (info1 & (GHCB_IOIO_STR | GHCB_IOIO_REP)) {
+        /* String I/O uses SW_SCRATCH and the shared buffer; not modelled. */
+        qemu_log_mask(LOG_UNIMP, "sev-snp: string I/O over the GHCB\n");
+        return GHCB_EXITINFO2_INVALID;
+    }
+
+    if (info1 & GHCB_IOIO_SIZE_8) {
+        size = 1;
+    } else if (info1 & GHCB_IOIO_SIZE_16) {
+        size = 2;
+    } else if (info1 & GHCB_IOIO_SIZE_32) {
+        size = 4;
+    } else {
+        return GHCB_EXITINFO2_INVALID;
+    }
+
+    if (is_in) {
+        uint64_t val = size == 1 ? helper_inb(env, port)
+                     : size == 2 ? helper_inw(env, port)
+                                 : helper_inl(env, port);
+        ghcb_set(c, GHCB_OFF_RAX, val);
+    } else {
+        uint32_t val;
+
+        if (!ghcb_is_valid(c, GHCB_OFF_RAX)) {
+            return GHCB_EXITINFO2_INVALID;
+        }
+        val = ghcb_get(c, GHCB_OFF_RAX);
+        if (size == 1) {
+            helper_outb(env, port, val);
+        } else if (size == 2) {
+            helper_outw(env, port, val);
+        } else {
+            helper_outl(env, port, val);
+        }
+    }
+    return GHCB_EXITINFO2_OK;
+}
+
+static uint64_t ghcb_nae_cpuid(GhcbCtx *c)
+{
+    uint32_t a, b, d, cx;
+
+    if (!ghcb_is_valid(c, GHCB_OFF_RAX)) {
+        return GHCB_EXITINFO2_INVALID;
+    }
+    cpu_x86_cpuid(c->env, (uint32_t)ghcb_get(c, GHCB_OFF_RAX),
+                  (uint32_t)ghcb_get(c, GHCB_OFF_RCX), &a, &b, &cx, &d);
+    ghcb_set(c, GHCB_OFF_RAX, a);
+    ghcb_set(c, GHCB_OFF_RBX, b);
+    ghcb_set(c, GHCB_OFF_RCX, cx);
+    ghcb_set(c, GHCB_OFF_RDX, d);
+    return GHCB_EXITINFO2_OK;
+}
+
+/*
+ * The underlying helpers work on the architectural registers, so save and
+ * restore the guest's RAX/RCX/RDX around the call: an NAE event passes its
+ * arguments in the GHCB and must not disturb registers the guest did not offer.
+ */
+static uint64_t ghcb_nae_msr(GhcbCtx *c)
+{
+    CPUX86State *env = c->env;
+    bool is_write = ghcb_get(c, GHCB_OFF_SW_EXITINFO1) & 1;
+    target_ulong save_rax = env->regs[R_EAX];
+    target_ulong save_rcx = env->regs[R_ECX];
+    target_ulong save_rdx = env->regs[R_EDX];
+    uint64_t status = GHCB_EXITINFO2_OK;
+
+    if (!ghcb_is_valid(c, GHCB_OFF_RCX)) {
+        return GHCB_EXITINFO2_INVALID;
+    }
+
+    env->regs[R_ECX] = (uint32_t)ghcb_get(c, GHCB_OFF_RCX);
+    if (is_write) {
+        env->regs[R_EAX] = (uint32_t)ghcb_get(c, GHCB_OFF_RAX);
+        env->regs[R_EDX] = (uint32_t)ghcb_get(c, GHCB_OFF_RDX);
+        helper_wrmsr(env);
+    } else {
+        helper_rdmsr(env);
+    }
+
+    if (!is_write) {
+        uint64_t lo = (uint32_t)env->regs[R_EAX];
+        uint64_t hi = (uint32_t)env->regs[R_EDX];
+
+        env->regs[R_EAX] = save_rax;
+        env->regs[R_EDX] = save_rdx;
+        env->regs[R_ECX] = save_rcx;
+        ghcb_set(c, GHCB_OFF_RAX, lo);
+        ghcb_set(c, GHCB_OFF_RDX, hi);
+        return status;
+    }
+
+    env->regs[R_EAX] = save_rax;
+    env->regs[R_ECX] = save_rcx;
+    env->regs[R_EDX] = save_rdx;
+    return status;
+}
+
+/* Dispatch an NAE event through the registered GHCB page. */
+static void snp_ghcb_page_protocol(CPUX86State *env, int next_eip_addend)
+{
+    GhcbCtx c;
+    uint64_t exit_code, status;
+
+    if (!ghcb_begin(&c, env)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "sev-snp: unusable GHCB at 0x%" PRIx64 "\n",
+                      env->snp_ghcb_gpa);
+        return;
+    }
+
+    exit_code = ghcb_get(&c, GHCB_OFF_SW_EXITCODE);
+    if (!ghcb_is_valid(&c, GHCB_OFF_SW_EXITCODE)) {
+        ghcb_end(&c, GHCB_EXITINFO2_INVALID);
+        return;
+    }
+
+    switch (exit_code) {
+    case SVM_EXIT_IOIO:
+        status = ghcb_nae_ioio(&c);
+        break;
+    case SVM_EXIT_CPUID:
+        status = ghcb_nae_cpuid(&c);
+        break;
+    case SVM_EXIT_MSR:
+        status = ghcb_nae_msr(&c);
+        break;
+    case SVM_EXIT_HLT:
+        ghcb_end(&c, GHCB_EXITINFO2_OK);
+        /* Halt on the guest's behalf, past the VMGEXIT. */
+        env->eip += next_eip_addend;
+        helper_hlt(env);
+        /* not reached */
+    default:
+        qemu_log_mask(LOG_UNIMP,
+                      "sev-snp: unimplemented NAE exit code 0x%" PRIx64 "\n",
+                      exit_code);
+        status = GHCB_EXITINFO2_INVALID;
+        break;
+    }
+
+    ghcb_end(&c, c.failed ? GHCB_EXITINFO2_INVALID : status);
+}
+
+/*
+ * VMGEXIT (F3 0F 01 D9).  A request in the GHCB MSR runs the MSR protocol;
+ * otherwise the event is dispatched through the registered GHCB page.
+ */
+void helper_vmgexit(CPUX86State *env, int next_eip_addend)
 {
     if (snp_msr_is_request(env->snp_ghcb_msr)) {
         snp_ghcb_msr_protocol(env);
@@ -370,10 +636,7 @@ void helper_vmgexit(CPUX86State *env)
         return;
     }
 
-    qemu_log_mask(LOG_UNIMP,
-                  "sev-snp: GHCB page protocol is not implemented; VMGEXIT "
-                  "against the registered GHCB at 0x%" PRIx64 " ignored\n",
-                  env->snp_ghcb_gpa);
+    snp_ghcb_page_protocol(env, next_eip_addend);
 }
 
 #endif /* TARGET_X86_64 */

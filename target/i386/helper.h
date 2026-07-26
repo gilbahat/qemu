@@ -101,7 +101,7 @@ DEF_HELPER_2(snp_vc_msr, void, env, i32)
 DEF_HELPER_1(snp_vc_cpuid, void, env)
 DEF_HELPER_1(snp_vc_hlt, void, env)
 DEF_HELPER_1(pvalidate, void, env)
-DEF_HELPER_1(vmgexit, void, env)
+DEF_HELPER_2(vmgexit, void, env, int)
 #endif
 DEF_HELPER_FLAGS_2(flush_page, TCG_CALL_NO_RWG, void, env, tl)
 DEF_HELPER_FLAGS_1(hlt, TCG_CALL_NO_WG, noreturn, env)

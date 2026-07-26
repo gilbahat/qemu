@@ -37,6 +37,7 @@ tdx: CFLAGS+=-mgeneral-regs-only
 sev-snp: CFLAGS+=-mgeneral-regs-only
 sev-snp-vc: CFLAGS+=-mgeneral-regs-only
 sev-snp-ghcb: CFLAGS+=-mgeneral-regs-only
+sev-snp-nae: CFLAGS+=-mgeneral-regs-only
 
 # Running
 X64_SYSTEM_OPTS=-device isa-debugcon,chardev=output \
@@ -54,6 +55,10 @@ run-sev-snp-vc: QEMU_OPTS=-cpu max,x-sev-snp-guest=on,x-sev-snp-relax-io=on \
 # Drives the GHCB MSR protocol without arming reflection, so its own output
 # still works; the protocol is what a guest needs before it can service #VC.
 run-sev-snp-ghcb: QEMU_OPTS=-cpu max,x-sev-snp-guest=on $(X64_SYSTEM_OPTS) -kernel
+
+# Full strict I/O: the guest services its own port access through the GHCB, so
+# the test's output is itself proof the NAE path works.
+run-sev-snp-nae: QEMU_OPTS=-cpu max,x-sev-snp-guest=on $(X64_SYSTEM_OPTS) -kernel
 
 ifeq ($(CONFIG_PLUGIN),y)
 run-plugin-patch-target-with-libpatch.so:		\

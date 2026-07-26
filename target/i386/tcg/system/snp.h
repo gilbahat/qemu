@@ -89,6 +89,40 @@
 #define PVALIDATE_FAIL_SIZEMISMATCH     6
 
 /*
+ * GHCB page layout.  Only the fields an NAE event needs are named; the valid
+ * bitmap at 0x3F0 covers everything below it, one bit per 8 bytes, so a field's
+ * bit index is simply its offset divided by 8.
+ */
+#define GHCB_OFF_RAX                    0x1f8
+#define GHCB_OFF_RCX                    0x308
+#define GHCB_OFF_RDX                    0x310
+#define GHCB_OFF_RBX                    0x318
+#define GHCB_OFF_SW_EXITCODE            0x390
+#define GHCB_OFF_SW_EXITINFO1           0x398
+#define GHCB_OFF_SW_EXITINFO2           0x3a0
+#define GHCB_OFF_SW_SCRATCH             0x3a8
+#define GHCB_OFF_VALID_BITMAP           0x3f0
+#define GHCB_OFF_PROTOCOL_VERSION       0xffa
+#define GHCB_OFF_USAGE                  0xffc
+#define GHCB_SIZE                       0x1000
+
+#define GHCB_BIT(off)                   ((off) / 8)
+#define GHCB_USAGE_STANDARD             0
+
+/* SW_EXITINFO1 encoding for SVM_EXIT_IOIO, as in the SVM intercept. */
+#define GHCB_IOIO_TYPE_IN               (1U << 0)
+#define GHCB_IOIO_STR                   (1U << 2)
+#define GHCB_IOIO_REP                   (1U << 3)
+#define GHCB_IOIO_SIZE_8                (1U << 4)
+#define GHCB_IOIO_SIZE_16               (1U << 5)
+#define GHCB_IOIO_SIZE_32               (1U << 6)
+#define GHCB_IOIO_PORT_SHIFT            16
+
+/* SW_EXITINFO2 is a completion status; nonzero means the request failed. */
+#define GHCB_EXITINFO2_OK               0
+#define GHCB_EXITINFO2_INVALID          1
+
+/*
  * The #VC error code is the GHCB SW_EXITCODE, which for non-automatic exits is
  * the SVM exit code -- so target/i386/svm.h supplies these directly, the same
  * way TDX reuses the VMX exit reasons.

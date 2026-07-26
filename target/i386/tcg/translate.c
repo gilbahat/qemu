@@ -261,7 +261,7 @@ STUB_HELPER(snp_vc_msr, TCGv_env env, TCGv_i32 is_write)
 STUB_HELPER(snp_vc_cpuid, TCGv_env env)
 STUB_HELPER(snp_vc_hlt, TCGv_env env)
 STUB_HELPER(pvalidate, TCGv_env env)
-STUB_HELPER(vmgexit, TCGv_env env)
+STUB_HELPER(vmgexit, TCGv_env env, TCGv_i32 pc_ofs)
 #endif
 STUB_HELPER(vmrun, TCGv_env env, TCGv_i32 aflag, TCGv_i32 pc_ofs)
 STUB_HELPER(vmsave, TCGv_env env, TCGv_i32 aflag)
@@ -3036,7 +3036,7 @@ static void gen_multi0F(DisasContext *s, X86DecodedInsn *decode)
                 }
                 gen_update_cc_op(s);
                 gen_update_eip_cur(s);
-                gen_helper_vmgexit(tcg_env);
+                gen_helper_vmgexit(tcg_env, cur_insn_len_i32(s));
                 /* May have done I/O or stopped the VM. */
                 s->base.is_jmp = DISAS_EOB_NEXT;
                 break;
