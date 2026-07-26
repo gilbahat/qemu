@@ -30,6 +30,7 @@ SECTIONS {
 	} :text
 
 	.bss : {
+		__bss_st = .;
 		*(.bss)
 		__bss_en = .;
 	}

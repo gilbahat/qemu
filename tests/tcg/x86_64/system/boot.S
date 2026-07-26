@@ -101,6 +101,54 @@ _start:
 	btsl $8, %eax
 	wrmsr
 
+#ifdef SNP_CBIT_BOOT
+	/*
+	 * Adopt the SEV-SNP C-bit before paging comes on, the way SNP firmware
+	 * does.  Guest RAM is private on an SNP machine, so a paged access with
+	 * the bit clear is an RMP violation -- this has to happen before the
+	 * first one.  Paging is still off here, so the tables can be patched in
+	 * place without tripping the very check being set up.
+	 *
+	 * Inert on anything that is not an SNP guest, which is why plain boot.S
+	 * can share this source: without the SNP bit nothing is written.
+	 */
+	mov $0x80000000, %eax
+	cpuid
+	cmp $0x8000001f, %eax
+	jb .Lno_cbit
+	mov $0x8000001f, %eax
+	xor %ecx, %ecx
+	cpuid
+	bt $4, %eax			/* EAX[4]: SEV-SNP */
+	jnc .Lno_cbit
+
+	/*
+	 * EBX[5:0] holds the C-bit position, which QEMU constrains to [32,51] --
+	 * so it always lands in the upper half of the entry and one 32-bit store
+	 * per entry is enough.
+	 */
+	and $0x3f, %ebx
+	sub $32, %ebx
+	mov %ebx, %ecx
+	mov $1, %esi
+	shl %cl, %esi
+
+	orl %esi, .Lpml4 + 4
+	mov $.Lpdp, %edi
+	mov $4, %ebx
+7:	orl %esi, 4(%edi)
+	add $8, %edi
+	dec %ebx
+	jnz 7b
+	mov $.Lpd, %edi
+	mov $(512 * 4), %ebx
+8:	orl %esi, 4(%edi)
+	add $8, %edi
+	dec %ebx
+	jnz 8b
+.Lno_cbit:
+#endif /* SNP_CBIT_BOOT */
+
 	/* Enable paging */
 	mov $.Lpml4, %ecx
 	mov %ecx, %cr3
@@ -117,6 +165,50 @@ _start:
         .section .text
 .Lenter64:
 
+
+#ifdef SNP_CBIT_BOOT
+	/*
+	 * .bss is not part of the launch image, so on an SNP machine it is
+	 * private but unvalidated -- touching it would raise #VC, and the stack
+	 * lives here.  Validate it first, which is what a guest's own
+	 * validation pass does.  No stack is used below, only PVALIDATE.
+	 *
+	 * PVALIDATE returns its status in RAX, so the cursor lives in RBX.
+	 */
+	mov $0x80000000, %eax
+	cpuid
+	cmp $0x8000001f, %eax
+	jb .Lno_validate
+	mov $0x8000001f, %eax
+	xor %ecx, %ecx
+	cpuid
+	bt $4, %eax
+	jnc .Lno_validate
+
+	/*
+	 * CR3 carries the C-bit too, and it could not be set earlier: CR3 was
+	 * loaded from a 32-bit register, which cannot reach bit 32 or above.
+	 */
+	and $0x3f, %ebx
+	mov %ebx, %ecx
+	movq $1, %rsi
+	shl %cl, %rsi
+	mov %cr3, %rax
+	or %rsi, %rax
+	mov %rax, %cr3
+
+	movq $__bss_st, %rbx
+	andq $~0xfff, %rbx
+9:	cmpq $__bss_en, %rbx
+	jae .Lno_validate
+	movq %rbx, %rax
+	xorl %ecx, %ecx			/* 4KiB */
+	movl $1, %edx			/* validate */
+	.byte 0xf2, 0x0f, 0x01, 0xff	/* pvalidate */
+	addq $0x1000, %rbx
+	jmp 9b
+.Lno_validate:
+#endif /* SNP_CBIT_BOOT */
 
 	// Setup stack ASAP
 	movq $stack_end,%rsp

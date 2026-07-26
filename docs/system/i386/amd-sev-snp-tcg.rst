@@ -169,7 +169,7 @@ VMPCK, and no ``SNP_GUEST_REQUEST``.
 Testing
 -------
 
-``tests/tcg/x86_64/system/`` contains five freestanding tests, run with
+``tests/tcg/x86_64/system/`` contains seven freestanding tests, run with
 ``make run-tcg-tests-x86_64-softmmu``:
 
 ``sev-snp``
@@ -200,7 +200,25 @@ Testing
   strict mode terminates it on its first paged access, naming the GPA — but
   terminating is a pass there, so it is not in the automated set.
 
-None of these build page tables with the C-bit set, so the two faults described
-above are exercised only from the shared side: the mismatch path by the strict
-run just mentioned, and the unvalidated path not at all. Covering it needs a
-payload that maps its own memory encrypted.
+``sev-snp-cbit``
+  The private side of the check. Builds its own page tables, maps two pages
+  encrypted, and confirms that a validated page is usable with the C-bit set
+  and that an unvalidated one raises ``#VC`` — which its handler resolves with
+  ``PVALIDATE``, letting the faulting access retry. That retry also shows
+  validation needs no TLB flush: if it did, and the flush were missing, the
+  access would fault forever.
+
+``sev-snp-strict``
+  The same faults with hardware's own defaults, and the answer to whether
+  anything can survive strict mode. It links the ``SNP_CBIT_BOOT`` variant of
+  ``boot.S``, which sets the C-bit in the page tables before enabling paging,
+  sets it in ``CR3`` once 64-bit mode makes bit 51 reachable, and validates
+  ``.bss`` before the stack is used — the three things SNP firmware must do.
+  Reaching ``main()`` is the result; it then validates RAM outside the launch
+  image on demand, through ``#VC``.
+
+  That bootstrap is a build-time variant rather than the default because
+  adopting the C-bit is wrong wherever guest RAM is not private, and a guest has
+  no way to tell which mode it is in — as on hardware, where the question does
+  not arise. Without ``-DSNP_CBIT_BOOT`` the object is byte-identical to the
+  one every other test links.

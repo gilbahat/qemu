@@ -25,9 +25,21 @@ EXTRA_RUNS+=$(MULTIARCH_RUNS)
 %.o: $(CRT_PATH)/%.S
 	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -Wa,--noexecstack -c $< -o $@
 
+# The same boot code with the SEV-SNP C-bit bootstrap compiled in.  Only the
+# strict-mode test wants it: adopting the C-bit is wrong in any configuration
+# where guest RAM is not private, and the guest has no way to tell.
+boot-snp.o: $(CRT_PATH)/boot.S
+	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -DSNP_CBIT_BOOT -Wa,--noexecstack -c $< -o $@
+.PRECIOUS: boot-snp.o
+
 # Build and link the tests
 %: %.c $(LINK_SCRIPT) $(CRT_OBJS) $(MINILIB_OBJS)
 	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) $< -o $@ $(LDFLAGS)
+
+sev-snp-strict: sev-snp-strict.c $(LINK_SCRIPT) boot-snp.o $(MINILIB_OBJS)
+	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) $< -o $@ \
+		-Wl,-T$(LINK_SCRIPT) -Wl,-melf_x86_64 -static -nostdlib \
+		boot-snp.o $(MINILIB_OBJS) -lgcc
 
 memory: CFLAGS+=-DCHECK_UNALIGNED=1
 
@@ -39,6 +51,8 @@ sev-snp-vc: CFLAGS+=-mgeneral-regs-only
 sev-snp-ghcb: CFLAGS+=-mgeneral-regs-only
 sev-snp-nae: CFLAGS+=-mgeneral-regs-only
 sev-snp-rmp: CFLAGS+=-mgeneral-regs-only
+sev-snp-cbit: CFLAGS+=-mgeneral-regs-only
+sev-snp-strict: CFLAGS+=-mgeneral-regs-only
 
 # Running
 X64_SYSTEM_OPTS=-device isa-debugcon,chardev=output \
@@ -67,6 +81,18 @@ run-sev-snp-nae: QEMU_OPTS=-cpu max,x-sev-snp-guest=on $(X64_SYSTEM_OPTS) -kerne
 # test installs no handler.
 SNP_RMP_CPU=max,x-sev-snp-guest=on,x-sev-snp-rmp=1,x-sev-snp-relax-io=on
 run-sev-snp-rmp: QEMU_OPTS=-cpu $(SNP_RMP_CPU) $(X64_SYSTEM_OPTS) -kernel
+
+# Same configuration, but this one builds its own C-bit page tables and so
+# reaches the private side of the page-state check.  HLT is relaxed as well:
+# boot.S halts on the way out, after main() has returned, and a #VC there would
+# be reported by a handler whose job here is page faults.
+SNP_CBIT_CPU=$(SNP_RMP_CPU),x-sev-snp-relax-hlt=on
+run-sev-snp-cbit: QEMU_OPTS=-cpu $(SNP_CBIT_CPU) $(X64_SYSTEM_OPTS) -kernel
+
+# Strict mode: guest RAM private, only the launch image validated.  Nothing
+# boots here without the C-bit bootstrap, which is the result being checked.
+SNP_STRICT_CPU=max,x-sev-snp-guest=on,x-sev-snp-rmp=2,x-sev-snp-relax-io=on,x-sev-snp-relax-hlt=on
+run-sev-snp-strict: QEMU_OPTS=-cpu $(SNP_STRICT_CPU) $(X64_SYSTEM_OPTS) -kernel
 
 ifeq ($(CONFIG_PLUGIN),y)
 run-plugin-patch-target-with-libpatch.so:		\
