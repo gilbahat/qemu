@@ -48,6 +48,39 @@
  * is how an in-flight request is distinguished from an idle register.
  */
 #define SNP_GHCB_MSR_INFO_MASK          0xfffULL
+#define SNP_GHCB_MSR_INFO(v)            ((v) & SNP_GHCB_MSR_INFO_MASK)
+#define SNP_GHCB_MSR_DATA(v)            ((v) & ~SNP_GHCB_MSR_INFO_MASK)
+
+/* GHCB MSR protocol info codes: even values request, odd values respond. */
+#define GHCB_MSR_SEV_INFO_RESP          0x001
+#define GHCB_MSR_SEV_INFO_REQ           0x002
+#define GHCB_MSR_CPUID_REQ              0x004
+#define GHCB_MSR_CPUID_RESP             0x005
+#define GHCB_MSR_PREF_GPA_REQ           0x010
+#define GHCB_MSR_PREF_GPA_RESP          0x011
+#define GHCB_MSR_REG_GPA_REQ            0x012
+#define GHCB_MSR_REG_GPA_RESP           0x013
+#define GHCB_MSR_PSC_REQ                0x014
+#define GHCB_MSR_PSC_RESP               0x015
+#define GHCB_MSR_HV_FT_REQ              0x080
+#define GHCB_MSR_HV_FT_RESP             0x081
+#define GHCB_MSR_TERM_REQ               0x100
+
+/* "No preference" for the preferred-GHCB-GPA request. */
+#define GHCB_MSR_PREF_GPA_NONE          0xfffffffffffffULL
+
+/* Protocol versions we speak, reported in the SEV information response. */
+#define GHCB_PROTOCOL_MIN               1
+#define GHCB_PROTOCOL_MAX               2
+
+/* Page-state-change operations, in bits [63:56] of a PSC request. */
+#define GHCB_MSR_PSC_OP_PRIVATE         1
+#define GHCB_MSR_PSC_OP_SHARED          2
+#define GHCB_MSR_PSC_OP_PSMASH          3
+#define GHCB_MSR_PSC_OP_UNSMASH         4
+
+/* Hypervisor features; bit 0 says SNP itself is supported. */
+#define GHCB_HV_FT_SNP                  (1ULL << 0)
 
 /* PVALIDATE / RMPADJUST status codes returned in EAX. */
 #define PVALIDATE_SUCCESS               0

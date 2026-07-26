@@ -2238,6 +2238,7 @@ typedef struct CPUArchState {
 
     /* Emulated SEV-SNP: the GHCB MSR protocol register.  Cleared on reset. */
     uint64_t snp_ghcb_msr;
+    uint64_t snp_ghcb_gpa;   /* registered GHCB page, 0 = none */
 
     /* Fields up to this point are cleared by a CPU reset */
     struct {} end_reset_fields;

@@ -36,6 +36,7 @@ memory: CFLAGS+=-DCHECK_UNALIGNED=1
 tdx: CFLAGS+=-mgeneral-regs-only
 sev-snp: CFLAGS+=-mgeneral-regs-only
 sev-snp-vc: CFLAGS+=-mgeneral-regs-only
+sev-snp-ghcb: CFLAGS+=-mgeneral-regs-only
 
 # Running
 X64_SYSTEM_OPTS=-device isa-debugcon,chardev=output \
@@ -49,6 +50,10 @@ run-sev-snp: QEMU_OPTS=-cpu max,x-sev-snp-guest=on $(X64_SYSTEM_OPTS) -kernel
 # output and its exit are port I/O.  See the comment in sev-snp-vc.c.
 run-sev-snp-vc: QEMU_OPTS=-cpu max,x-sev-snp-guest=on,x-sev-snp-relax-io=on \
                 $(X64_SYSTEM_OPTS) -kernel
+
+# Drives the GHCB MSR protocol without arming reflection, so its own output
+# still works; the protocol is what a guest needs before it can service #VC.
+run-sev-snp-ghcb: QEMU_OPTS=-cpu max,x-sev-snp-guest=on $(X64_SYSTEM_OPTS) -kernel
 
 ifeq ($(CONFIG_PLUGIN),y)
 run-plugin-patch-target-with-libpatch.so:		\

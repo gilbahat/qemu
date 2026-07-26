@@ -24,6 +24,9 @@
 #define SVM_EXIT_HLT    0x078
 #define SVM_EXIT_MSR    0x07c
 
+#define MSR_AMD64_SEV_ES_GHCB   0xc0010130
+#define GHCB_MSR_SEV_INFO_REQ   0x002
+
 static int failures;
 
 static void check(int ok, const char *what)
@@ -106,6 +109,40 @@ __asm__(".globl vc_entry\n"
         "  add $8, %rsp\n"
         "  iretq\n");
 
+extern void df_entry(void);
+
+static volatile unsigned long df_count;
+
+/*
+ * A #VC raised while the GHCB MSR still holds an unconsumed request escalates
+ * to #DF, because servicing it would clobber the request.  Clear the stale
+ * request and step over the faulting instruction so the test can carry on --
+ * resuming from #DF is not architecturally sound, but this is an emulator and
+ * it keeps the test's exit path ordinary.
+ */
+void df_handle(unsigned long *frame);
+void df_handle(unsigned long *frame)
+{
+    df_count++;
+    __asm__ __volatile__("wrmsr"
+                         : : "c"(MSR_AMD64_SEV_ES_GHCB), "a"(0), "d"(0));
+    frame[1] += insn_len((const unsigned char *)frame[1]);
+}
+
+__asm__(".globl df_entry\n"
+        "df_entry:\n"
+        "  push %rax\n  push %rcx\n  push %rdx\n  push %rsi\n"
+        "  push %rdi\n  push %r8\n   push %r9\n   push %r10\n"
+        "  push %r11\n  sub $8, %rsp\n"
+        "  lea 80(%rsp), %rdi\n"
+        "  call df_handle\n"
+        "  add $8, %rsp\n"
+        "  pop %r11\n  pop %r10\n  pop %r9\n   pop %r8\n"
+        "  pop %rdi\n  pop %rsi\n  pop %rdx\n  pop %rcx\n"
+        "  pop %rax\n"
+        "  add $8, %rsp\n"
+        "  iretq\n");
+
 static void set_gate(int vec, void (*handler)(void))
 {
     unsigned long addr = (unsigned long)handler;
@@ -127,6 +164,7 @@ static void idt_init(void)
                            .base = (unsigned long)idt };
 
     set_gate(29, vc_entry);
+    set_gate(8, df_entry);
     __asm__ __volatile__("lidt %0" : : "m"(ptr));
 }
 
@@ -141,6 +179,13 @@ static unsigned int pvalidate(unsigned long gva, unsigned int page_size,
                          : "a"(gva), "c"(page_size), "d"(validate)
                          : "cc", "memory");
     return status;
+}
+
+static void wrmsr(unsigned int idx, unsigned long val)
+{
+    __asm__ __volatile__("wrmsr"
+                         : : "c"(idx), "a"((unsigned int)val),
+                             "d"((unsigned int)(val >> 32)));
 }
 
 static unsigned long expect_vc(unsigned long before)
@@ -205,12 +250,21 @@ int main(void)
     check(expect_vc(n) == 1, "HLT did not reflect");
     check(vc_error_code == SVM_EXIT_HLT, "HLT #VC error code");
 
+    /*
+     * Leave a request in the GHCB MSR unconsumed, then provoke a #VC.  It must
+     * escalate to #DF; df_handle() reports the overall result and exits, so
+     * reaching the line after this means the rule did not fire.
+     */
+    wrmsr(MSR_AMD64_SEV_ES_GHCB, GHCB_MSR_SEV_INFO_REQ);
+    __asm__ __volatile__("cpuid" : : "a"(1) : "rbx", "rcx", "rdx");
+    check(df_count == 1, "#VC with a request in flight did not escalate to #DF");
+
     if (failures) {
         ml_printf("%d failure(s)\n", failures);
         return 1;
     }
 
-    ml_printf("All SEV-SNP #VC checks passed (%d exceptions)\n",
-              (int)vc_count);
+    ml_printf("All SEV-SNP #VC checks passed (%d exceptions, %d escalated)\n",
+              (int)vc_count, (int)df_count);
     return 0;
 }

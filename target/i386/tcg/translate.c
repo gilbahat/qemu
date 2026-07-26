@@ -261,6 +261,7 @@ STUB_HELPER(snp_vc_msr, TCGv_env env, TCGv_i32 is_write)
 STUB_HELPER(snp_vc_cpuid, TCGv_env env)
 STUB_HELPER(snp_vc_hlt, TCGv_env env)
 STUB_HELPER(pvalidate, TCGv_env env)
+STUB_HELPER(vmgexit, TCGv_env env)
 #endif
 STUB_HELPER(vmrun, TCGv_env env, TCGv_i32 aflag, TCGv_i32 pc_ofs)
 STUB_HELPER(vmsave, TCGv_env env, TCGv_i32 aflag)
@@ -3020,7 +3021,27 @@ static void gen_multi0F(DisasContext *s, X86DecodedInsn *decode)
             s->base.is_jmp = DISAS_NORETURN;
             break;
 
-        case 0xd9: /* VMMCALL */
+        case 0xd9: /* VMMCALL; VMGEXIT with an F3 prefix */
+#ifdef TARGET_X86_64
+            if (s->prefix & PREFIX_REPZ) {
+                /*
+                 * VMGEXIT is F3 0F 01 D9, i.e. a REP-prefixed VMMCALL.  It is
+                 * not CPL-0-restricted on hardware -- a #VC can be taken at
+                 * CPL 3 -- and the GHCB is guest memory, so nothing is exposed
+                 * by allowing it.
+                 */
+                if (!SNP(s) || !CODE64(s)
+                    || (s->prefix & (PREFIX_REPNZ | PREFIX_DATA))) {
+                    goto illegal_op;
+                }
+                gen_update_cc_op(s);
+                gen_update_eip_cur(s);
+                gen_helper_vmgexit(tcg_env);
+                /* May have done I/O or stopped the VM. */
+                s->base.is_jmp = DISAS_EOB_NEXT;
+                break;
+            }
+#endif
             if (!SVME(s)) {
                 goto illegal_op;
             }

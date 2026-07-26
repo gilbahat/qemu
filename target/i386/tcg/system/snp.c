@@ -14,6 +14,8 @@
 #include "cpu.h"
 #include "exec/helper-proto.h"
 #include "migration/vmstate.h"
+#include "qemu/error-report.h"
+#include "system/runstate.h"
 #include "svm.h"
 #include "tcg/helper-tcg.h"
 #include "snp.h"
@@ -67,6 +69,27 @@ static bool snp_vc_enabled(CPUX86State *env, uint32_t class)
 }
 
 /*
+ * Only a *request* counts as in flight.  After VMGEXIT services one the
+ * register holds a response, which is nonzero in its info field but is the
+ * guest's to read at leisure.
+ */
+static bool snp_msr_is_request(uint64_t val)
+{
+    switch (SNP_GHCB_MSR_INFO(val)) {
+    case GHCB_MSR_SEV_INFO_REQ:
+    case GHCB_MSR_CPUID_REQ:
+    case GHCB_MSR_PREF_GPA_REQ:
+    case GHCB_MSR_REG_GPA_REQ:
+    case GHCB_MSR_PSC_REQ:
+    case GHCB_MSR_HV_FT_REQ:
+    case GHCB_MSR_TERM_REQ:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/*
  * Raise #VC with the GHCB SW_EXITCODE as the error code.  Unlike TDX's #VE
  * there is no information latch: #VC delivers everything it has in the pushed
  * error code, and the guest derives the rest by decoding the faulting
@@ -82,7 +105,7 @@ static G_NORETURN void snp_raise_vc(CPUX86State *env, uint64_t exit_code,
      * backup -- but silently corrupting the request is the worst possible
      * outcome for a development tool, so make it loud instead.
      */
-    if (env->snp_ghcb_msr & SNP_GHCB_MSR_INFO_MASK) {
+    if (snp_msr_is_request(env->snp_ghcb_msr)) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "sev-snp: #VC (exit code 0x%" PRIx64 ") while the GHCB "
                       "MSR holds an in-flight request; injecting #DF\n",
@@ -218,6 +241,139 @@ void helper_pvalidate(CPUX86State *env)
      */
     env->regs[R_EAX] = PVALIDATE_SUCCESS;
     env->eflags &= ~CC_C;
+}
+
+/*
+ * The GHCB MSR protocol.  This is the only channel a guest has before it owns
+ * a GHCB page: it writes a request into MSR_AMD64_SEV_ES_GHCB, executes
+ * VMGEXIT, and reads the response back out of the same register.
+ */
+static void snp_ghcb_msr_protocol(CPUX86State *env)
+{
+    X86CPU *cpu = env_archcpu(env);
+    uint64_t val = env->snp_ghcb_msr;
+    uint64_t data = SNP_GHCB_MSR_DATA(val);
+
+    switch (SNP_GHCB_MSR_INFO(val)) {
+    case GHCB_MSR_SEV_INFO_REQ:
+        /*
+         * Carries the C-bit position in bits [31:24], which is how a guest
+         * learns it before it can run CPUID -- a second, independent consumer
+         * of x-sev-snp-cbitpos.
+         */
+        env->snp_ghcb_msr = GHCB_MSR_SEV_INFO_RESP
+                          | ((uint64_t)GHCB_PROTOCOL_MAX << 48)
+                          | ((uint64_t)GHCB_PROTOCOL_MIN << 32)
+                          | ((uint64_t)cpu->sev_snp_cbitpos << 24);
+        break;
+
+    case GHCB_MSR_CPUID_REQ: {
+        uint32_t fn = val >> 32;
+        uint32_t reg = (val >> 30) & 3;
+        uint32_t regs[4];
+
+        cpu_x86_cpuid(env, fn, 0, &regs[0], &regs[1], &regs[2], &regs[3]);
+        env->snp_ghcb_msr = GHCB_MSR_CPUID_RESP
+                          | ((uint64_t)regs[reg] << 32)
+                          | ((uint64_t)reg << 30);
+        break;
+    }
+
+    case GHCB_MSR_PREF_GPA_REQ:
+        /* No preference: the guest may register whatever page it likes. */
+        env->snp_ghcb_msr = GHCB_MSR_PREF_GPA_RESP |
+                            (GHCB_MSR_PREF_GPA_NONE << 12);
+        break;
+
+    case GHCB_MSR_REG_GPA_REQ: {
+        uint64_t gpa = data;
+
+        /*
+         * A real hypervisor cannot read a private GHCB, so registering one is
+         * refused.  Page-state tracking does not exist yet, so for now only
+         * the address itself is checked; the shared-state check joins this
+         * when the RMP-lite map lands.
+         */
+        if (gpa == 0 || (gpa & ~SNP_GHCB_MSR_INFO_MASK) != gpa) {
+            env->snp_ghcb_msr = GHCB_MSR_REG_GPA_RESP |
+                                (GHCB_MSR_PREF_GPA_NONE << 12);
+            break;
+        }
+        env->snp_ghcb_gpa = gpa;
+        env->snp_ghcb_msr = GHCB_MSR_REG_GPA_RESP | gpa;
+        break;
+    }
+
+    case GHCB_MSR_PSC_REQ: {
+        uint64_t op = val >> 56;
+
+        /*
+         * No page-state map yet, so every transition succeeds.  Reject an
+         * operation the architecture does not define, though -- a guest that
+         * sends one has a bug worth surfacing.
+         */
+        if (op < GHCB_MSR_PSC_OP_PRIVATE || op > GHCB_MSR_PSC_OP_UNSMASH) {
+            env->snp_ghcb_msr = GHCB_MSR_PSC_RESP | (1ULL << 32);
+            break;
+        }
+        env->snp_ghcb_msr = GHCB_MSR_PSC_RESP;
+        break;
+    }
+
+    case GHCB_MSR_HV_FT_REQ:
+        env->snp_ghcb_msr = GHCB_MSR_HV_FT_RESP | (GHCB_HV_FT_SNP << 12);
+        break;
+
+    case GHCB_MSR_TERM_REQ: {
+        unsigned reason_set = (val >> 12) & 0xf;
+        unsigned reason_code = (val >> 16) & 0xff;
+
+        /*
+         * The guest has given up.  Stopping with the reason reported is far
+         * more useful during bring-up than letting it reset into a loop.
+         */
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "sev-snp: guest requested termination, reason set %u "
+                      "code %u\n", reason_set, reason_code);
+        warn_report("sev-snp: guest requested termination (reason set %u, "
+                    "code %u)", reason_set, reason_code);
+        qemu_system_guest_panicked(NULL);
+        break;
+    }
+
+    default:
+        qemu_log_mask(LOG_UNIMP,
+                      "sev-snp: unimplemented GHCB MSR info code 0x%03x\n",
+                      (unsigned)SNP_GHCB_MSR_INFO(val));
+        /* Terminate is the only defined way to say "I cannot do that". */
+        env->snp_ghcb_msr = GHCB_MSR_TERM_REQ;
+        break;
+    }
+}
+
+/*
+ * VMGEXIT (F3 0F 01 D9).  With a request in the GHCB MSR this runs the MSR
+ * protocol; otherwise it would dispatch an NAE event through the registered
+ * GHCB page, which is not modelled yet.
+ */
+void helper_vmgexit(CPUX86State *env)
+{
+    if (snp_msr_is_request(env->snp_ghcb_msr)) {
+        snp_ghcb_msr_protocol(env);
+        return;
+    }
+
+    if (!env->snp_ghcb_gpa) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "sev-snp: VMGEXIT with neither a GHCB MSR request nor a "
+                      "registered GHCB page\n");
+        return;
+    }
+
+    qemu_log_mask(LOG_UNIMP,
+                  "sev-snp: GHCB page protocol is not implemented; VMGEXIT "
+                  "against the registered GHCB at 0x%" PRIx64 " ignored\n",
+                  env->snp_ghcb_gpa);
 }
 
 #endif /* TARGET_X86_64 */
