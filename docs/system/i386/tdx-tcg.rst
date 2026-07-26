@@ -43,10 +43,11 @@ Implemented TDCALL leaves
   ``Instruction.RDMSR`` (31), ``Instruction.WRMSR`` (32) and
   ``Instruction.HLT`` (12) service routines are implemented, so a guest can
   handle a ``#VE`` by passing the exit reason it just read from
-  ``TDG.VP.VEINFO.GET`` straight back as the sub-function. ``MapGPA``
-  succeeds as a validated no-op, since private and shared memory are the same
-  RAM here. ``GetQuote`` is refused; every other sub-function returns
-  ``INVALID_OPERAND``.
+  ``TDG.VP.VEINFO.GET`` straight back as the sub-function. ``MapGPA`` converts
+  a page between private and shared when ``x-tdx-sept`` is on, and validates its
+  operands otherwise; a multi-page range converts its first page and returns
+  ``RETRY`` with the next GPA. ``GetQuote`` is refused; every other sub-function
+  returns ``INVALID_OPERAND``.
 
   ``#VE.RequestMMIO`` (48) is also implemented, and is the counterpart of the
   ``#VE`` a TD takes on MMIO: R12 size, R13 direction, R14 GPA, R15 data for a
@@ -72,7 +73,11 @@ Implemented TDCALL leaves
   Produces a structurally valid, deliberately unauthenticated ``TDREPORT``.
 
 ``TDG.MEM.PAGE.ACCEPT`` (6)
-  Validated no-op; only 4KiB pages are modelled.
+  Moves a page from private-pending to private-accepted when ``x-tdx-sept`` is
+  on, reporting ``ALREADY_ACCEPTED`` for one that is, and refusing a shared page
+  with ``PAGE_ATTR_CONFLICT``. Only 4KiB pages are modelled, so a 2MiB request
+  is refused with ``PAGE_SIZE_MISMATCH``. Acceptance is per GPA and independent
+  of how the page is mapped.
 
 An unrecognised leaf returns ``TDX_OPERAND_INVALID``. It does **not** raise
 ``#UD``: that is what the TDX module does, and it matters because a guest may
@@ -90,9 +95,10 @@ The hashes over ``TEE_TCB_INFO`` and ``TD_INFO`` are computed honestly so that
 guest-side parsers can be developed, but nothing here carries trust, and there
 is no quoting path at all.
 
-``MRTD`` is left zero: nothing was measured at launch. The payload is loaded
-into ordinary RAM by the normal QEMU loader with no integrity domain, so a
-plausible-looking MRTD would be actively misleading.
+``MRTD`` *is* a real measurement of the launch image -- see `The launch
+measurement`_ -- but it is not the digest hardware would produce for the same
+payload, so it is useful for checking a flow and useless for comparing against a
+real TD.
 
 Device I/O
 ----------
@@ -125,11 +131,23 @@ the 64-bit ``queue_desc``/``queue_driver``/``queue_device`` registers reached
 through the PCI capability structures, with ``VIRTIO_F_VERSION_1`` and
 ``VIRTIO_F_ACCESS_PLATFORM`` negotiated.
 
-In practice a guest being ported will meet these in order: its virtio probe
-stops recognising the device (legacy is gone), then once it speaks modern virtio
-its ring DMA is refused until the ring pages are shared and programmed at the
-shared alias, then its payload buffers need to be bounced through shared memory
-because the heap stays private.
+The order a guest meets these in is not the order they are listed. Device work
+comes last, not first: a modern virtio device is configured through MMIO, and
+MMIO is shared to a TD, so a BAR has to be mapped through the SHARED alias before
+a driver can read a single register. Anything that touches a device is therefore
+behind the memory work, not ahead of it.
+
+The dependency order is: accept memory before using it, so the payload can run at
+all; be able to set the alias bit on a mapping at runtime, so shared memory can
+be reached; convert a region and allocate from it; and only then bring up a
+device and bounce payloads through that region.
+
+That does not require fine-grained page tables. Acceptance is per 4KiB GPA and is
+independent of how the page is mapped -- 4KiB accepts under 2MiB mappings are
+what ``tdx-strict`` does. And a 2MiB mapping can carry the alias bit for the
+whole region, provided every 4KiB page within it has been converted, so a
+2MiB-granular shared pool works with huge pages left in place. Only sharing at
+4KiB granularity needs 4KiB tables.
 
 Strict mode: reflecting #VE
 ---------------------------
