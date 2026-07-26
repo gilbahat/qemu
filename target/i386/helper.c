@@ -20,6 +20,7 @@
 #include "qemu/osdep.h"
 #include "qapi/qapi-events-run-state.h"
 #include "cpu.h"
+#include "tcg/system/snp.h"
 #include "exec/cputlb.h"
 #include "exec/translation-block.h"
 #include "exec/target_page.h"
@@ -263,6 +264,13 @@ bool x86_cpu_translate_for_debug(CPUState *cs, vaddr addr,
     int32_t a20_mask;
     uint32_t page_offset;
     int page_size;
+    /*
+     * Strip the emulated SEV-SNP C-bit here too.  This walk backs x/, gdb and
+     * cpu_memory_rw_debug(), so without it every debugging tool would follow
+     * C-bit-poisoned table pointers into unassigned memory.
+     */
+    const uint64_t amask = PG_ADDRESS_MASK & ~snp_cbit_mask(env);
+    const uint64_t cr3 = env->cr[3] & ~snp_cbit_mask(env);
 
     a20_mask = x86_get_a20_mask(env);
     if (!(env->cr[0] & CR0_PG_MASK)) {
@@ -286,23 +294,23 @@ bool x86_cpu_translate_for_debug(CPUState *cs, vaddr addr,
             }
 
             if (la57) {
-                pml5e_addr = ((env->cr[3] & ~0xfff) +
+                pml5e_addr = ((cr3 & ~0xfff) +
                         (((addr >> 48) & 0x1ff) << 3)) & a20_mask;
                 pml5e = x86_ldq_phys(cs, pml5e_addr);
                 if (!(pml5e & PG_PRESENT_MASK)) {
                     return false;
                 }
             } else {
-                pml5e = env->cr[3];
+                pml5e = cr3;
             }
 
-            pml4e_addr = ((pml5e & PG_ADDRESS_MASK) +
+            pml4e_addr = ((pml5e & amask) +
                     (((addr >> 39) & 0x1ff) << 3)) & a20_mask;
             pml4e = x86_ldq_phys(cs, pml4e_addr);
             if (!(pml4e & PG_PRESENT_MASK)) {
                 return false;
             }
-            pdpe_addr = ((pml4e & PG_ADDRESS_MASK) +
+            pdpe_addr = ((pml4e & amask) +
                          (((addr >> 30) & 0x1ff) << 3)) & a20_mask;
             pdpe = x86_ldq_phys(cs, pdpe_addr);
             if (!(pdpe & PG_PRESENT_MASK)) {
@@ -317,14 +325,14 @@ bool x86_cpu_translate_for_debug(CPUState *cs, vaddr addr,
         } else
 #endif
         {
-            pdpe_addr = ((env->cr[3] & ~0x1f) + ((addr >> 27) & 0x18)) &
+            pdpe_addr = ((cr3 & ~0x1f) + ((addr >> 27) & 0x18)) &
                 a20_mask;
             pdpe = x86_ldq_phys(cs, pdpe_addr);
             if (!(pdpe & PG_PRESENT_MASK))
                 return false;
         }
 
-        pde_addr = ((pdpe & PG_ADDRESS_MASK) +
+        pde_addr = ((pdpe & amask) +
                     (((addr >> 21) & 0x1ff) << 3)) & a20_mask;
         pde = x86_ldq_phys(cs, pde_addr);
         if (!(pde & PG_PRESENT_MASK)) {
@@ -336,7 +344,7 @@ bool x86_cpu_translate_for_debug(CPUState *cs, vaddr addr,
             pte = pde;
         } else {
             /* 4 KB page */
-            pte_addr = ((pde & PG_ADDRESS_MASK) +
+            pte_addr = ((pde & amask) +
                         (((addr >> 12) & 0x1ff) << 3)) & a20_mask;
             page_size = 4096;
             pte = x86_ldq_phys(cs, pte_addr);
@@ -348,7 +356,7 @@ bool x86_cpu_translate_for_debug(CPUState *cs, vaddr addr,
         uint32_t pde;
 
         /* page directory entry */
-        pde_addr = ((env->cr[3] & ~0xfff) + ((addr >> 20) & 0xffc)) & a20_mask;
+        pde_addr = ((cr3 & ~0xfff) + ((addr >> 20) & 0xffc)) & a20_mask;
         pde = x86_ldl_phys(cs, pde_addr);
         if (!(pde & PG_PRESENT_MASK))
             return false;
@@ -370,7 +378,7 @@ bool x86_cpu_translate_for_debug(CPUState *cs, vaddr addr,
 #ifdef TARGET_X86_64
 out:
 #endif
-    pte &= PG_ADDRESS_MASK & ~(page_size - 1);
+    pte &= amask & ~(page_size - 1);
     page_offset = addr & (page_size - 1);
 
     result->attrs = cpu_get_mem_attrs(env);

@@ -128,4 +128,75 @@
  * way TDX reuses the VMX exit reasons.
  */
 
+/*
+ * RMP-lite modes, selected by x-sev-snp-rmp.
+ *
+ * LAZY exists because enforcement is all-or-nothing otherwise: guest RAM is
+ * private on hardware, so under STRICT a guest that does not yet set the C-bit
+ * faults on its first instruction fetch.  That is the truth, and it is what a
+ * conformance run wants -- but it leaves no way to adopt the C-bit gradually.
+ * Under LAZY a page is shared until the guest asks for it, so polarity is
+ * enforced only where the guest has claimed to have done the work.
+ */
+#define SNP_RMP_OFF                     0
+#define SNP_RMP_LAZY                    1
+#define SNP_RMP_STRICT                  2
+
+/* Per-page state.  Private-but-unvalidated is the state PVALIDATE clears. */
+typedef enum {
+    SNP_PAGE_SHARED = 0,
+    SNP_PAGE_PRIVATE_UNVALIDATED,
+    SNP_PAGE_PRIVATE_VALIDATED,
+} SnpPageState;
+
+typedef enum {
+    SNP_RMP_OK = 0,
+    SNP_RMP_NOT_VALIDATED,   /* private access to an unvalidated page */
+    SNP_RMP_MISMATCH,        /* C-bit disagrees with the page's state */
+} SnpRmpResult;
+
+/*
+ * A private access to a page the guest has not validated is the one RMP
+ * failure the architecture routes back to the guest, because only the guest
+ * can fix it.  Reported as a nested-page-fault NAE with the page-not-validated
+ * sub-case.
+ *
+ * Note: this constant comes from the GHCB specification's #VC error codes and
+ * is the one value here not cross-checked against another source in tree.
+ */
+#define SNP_EXIT_PAGE_NOT_VALIDATED     (SVM_EXIT_NPF | 0x4)
+
+/*
+ * The C-bit mask, or 0 when the emulated SNP guest is off.  Callers strip it
+ * from any address taken out of a page-table entry or CR3: the
+ * phys_bits == cbitpos + 1 invariant keeps it out of the walker's reserved-bit
+ * mask, but it is still inside PG_ADDRESS_MASK and would otherwise be folded
+ * into the physical address.
+ *
+ * Inline, because target/i386/helper.c needs it and is built even when
+ * snp.c is not -- a --disable-tcg build would otherwise fail to link.
+ */
+static inline uint64_t snp_cbit_mask(CPUX86State *env)
+{
+    X86CPU *cpu = env_archcpu(env);
+
+    return cpu->sev_snp_guest ? (1ULL << cpu->sev_snp_cbitpos) : 0;
+}
+
+/* Is page-state enforcement on?  False unless x-sev-snp-rmp says otherwise. */
+bool snp_rmp_enabled(CPUX86State *env);
+
+/* Check an access against the page's state; @priv is the PTE's C-bit. */
+SnpRmpResult snp_rmp_check(CPUX86State *env, hwaddr gpa, bool priv);
+
+/* Report an RMP failure: #VC for the guest, or terminate for a mismatch. */
+void snp_rmp_fault(CPUX86State *env, SnpRmpResult res, hwaddr gpa, bool priv,
+                   uintptr_t ra);
+
+/*
+ * Create the VM-scoped singleton and register its VMState section.  Called at
+ * TCG realize so the section exists before an incoming migration needs it.
+ */
+void snp_tcg_init(void);
+
 #endif /* I386_TCG_SYSTEM_SNP_H */

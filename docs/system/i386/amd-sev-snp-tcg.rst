@@ -110,21 +110,66 @@ Properties
   case. It does mean an SNP guest sees a different ``CPUID.0x80000008`` width
   than the same ``-cpu`` model without the property.
 
+``x-sev-snp-rmp=0|1|2``
+  Page-state tracking: off, lazy or strict. See `Page state and the C-bit`_.
+
+Page state and the C-bit
+------------------------
+
+``x-sev-snp-rmp`` turns on an RMP-lite: a per-page state of *shared*,
+*private-unvalidated* or *private-validated*, moved by page-state changes and
+``PVALIDATE``, and checked on every page-table walk.
+
+``x-sev-snp-rmp=0`` (default)
+  No tracking. ``PVALIDATE`` validates its operands and reports success, and
+  page-state changes are accepted without effect. The C-bit is still stripped
+  from page-table entries, so a guest that sets it runs, but nothing is checked.
+
+``x-sev-snp-rmp=1`` (lazy)
+  Pages start shared, so a guest that has not adopted the C-bit runs unchanged,
+  and enforcement applies only to the pages it explicitly claims.
+
+``x-sev-snp-rmp=2`` (strict)
+  Guest RAM starts private, as it is on hardware after ``SNP_LAUNCH_UPDATE``,
+  with only the launch image validated. A ``-kernel`` payload's ``.bss`` is not
+  part of that image and so starts unvalidated, exactly as on hardware.
+
+Lazy exists because enforcement is otherwise all-or-nothing: under strict, a
+guest whose page tables carry no C-bit faults on its first instruction fetch.
+That is the truth and it is what a conformance run wants, but it leaves no way
+to adopt the C-bit a page at a time.
+
+Two faults can arise, and they differ in where they go — as they do on hardware:
+
+* Touching a **private-unvalidated** page raises ``#VC`` with ``SW_EXITCODE``
+  ``0x404``, which is what tells a guest to ``PVALIDATE`` it. This is the case a
+  guest is expected to handle.
+* A **polarity mismatch** — the C-bit disagreeing with the page's state —
+  terminates the guest with a log naming the GPA and both states. On hardware
+  this is an ``#NPF`` to the hypervisor, which kills the VM; it is not
+  guest-visible, so there is nothing to reflect.
+
+Page-state changes flush the TLB only when they *remove* access. An unvalidated
+page can have no cached entry, because the fill that would have created it
+faulted, so ``PVALIDATE``-to-validated needs no flush — which matters, as a
+guest validating 4 GiB of RAM performs a million of them.
+
+The C-bit is stripped in both page-table walkers, the TLB-fill one and the debug
+one behind ``x``, gdb and ``cpu_memory_rw_debug()``.
+
 Not modelled
 ------------
 
-Memory encryption and isolation of any kind; the RMP, so ``PVALIDATE`` validates
-its operands and reports success without tracking page state, and page-state
-changes are accepted without effect; the C-bit in page tables, which is accepted
-as an address bit but carries no meaning; ``RMPADJUST``, ``RMPQUERY``,
-``PSMASH``; VMPLs and ``SNP_AP_CREATE``; MMIO reflection; string I/O over the
-GHCB shared buffer; and attestation — there is no secrets page, no VMPCK, and
-no ``SNP_GUEST_REQUEST``.
+Memory encryption and isolation of any kind; RMP page sizes, so a 2 MiB
+``PVALIDATE`` is refused with ``FAIL_SIZEMISMATCH``; ``RMPADJUST``,
+``RMPQUERY``, ``PSMASH``; VMPLs and ``SNP_AP_CREATE``; MMIO reflection; string
+I/O over the GHCB shared buffer; and attestation — there is no secrets page, no
+VMPCK, and no ``SNP_GUEST_REQUEST``.
 
 Testing
 -------
 
-``tests/tcg/x86_64/system/`` contains four freestanding tests, run with
+``tests/tcg/x86_64/system/`` contains five freestanding tests, run with
 ``make run-tcg-tests-x86_64-softmmu``:
 
 ``sev-snp``
@@ -145,3 +190,17 @@ Testing
   armed with no relaxations, and a ``#VC`` handler that services I/O through the
   GHCB. Its own output and its ACPI poweroff travel over the NAE path, so it
   could neither report nor exit if that path were broken.
+
+``sev-snp-rmp``
+  Page-state tracking in lazy mode: that a shared page cannot be validated, that
+  a claimed one can, that ``PVALIDATE`` reports no-change through CF, and that
+  bad size and alignment are refused.
+
+  Running that same binary with ``x-sev-snp-rmp=2`` checks the other half —
+  strict mode terminates it on its first paged access, naming the GPA — but
+  terminating is a pass there, so it is not in the automated set.
+
+None of these build page tables with the C-bit set, so the two faults described
+above are exercised only from the shared side: the mismatch path by the strict
+run just mentioned, and the unvalidated path not at all. Covering it needs a
+payload that maps its own memory encrypted.

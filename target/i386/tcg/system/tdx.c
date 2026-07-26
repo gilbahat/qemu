@@ -76,6 +76,11 @@ static TdxTcgState *tdx_get_state(void)
     return tdx_state;
 }
 
+void tdx_tcg_init(void)
+{
+    tdx_get_state();
+}
+
 /*
  * Strip the emulated SHARED bit (GPA bit GPAW-1) from a guest-supplied
  * address.  TCG pins phys_bits to TCG_PHYS_ADDR_BITS (40) while the reported

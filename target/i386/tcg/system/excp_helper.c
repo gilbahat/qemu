@@ -27,6 +27,7 @@
 #include "exec/tlb-flags.h"
 #include "tcg/helper-tcg.h"
 #include "tdx.h"
+#include "snp.h"
 
 typedef struct TranslateParams {
     target_ulong addr;
@@ -159,6 +160,15 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
     int page_size;
     int error_code;
     int prot;
+    /*
+     * The emulated SEV-SNP C-bit.  Zero unless x-sev-snp-guest is on, in which
+     * case phys_bits == cbitpos + 1 keeps it out of rsvd_mask below -- but it
+     * is still inside PG_ADDRESS_MASK, so it has to come off every address
+     * taken from an entry.  leaf_c remembers the C-bit of whichever entry
+     * terminates the walk, which is the one that governs the data page.
+     */
+    const uint64_t cbit = snp_cbit_mask(env);
+    bool leaf_c = false;
 
  restart_all:
     rsvd_mask = ~MAKE_64BIT_MASK(0, env_archcpu(env)->phys_bits);
@@ -174,12 +184,15 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
                 /*
                  * Page table level 5
                  */
-                pte_addr = (in->cr3 & ~0xfff) + (((addr >> 48) & 0x1ff) << 3);
+                pte_addr = ((in->cr3 & ~cbit) & ~0xfff) +
+                    (((addr >> 48) & 0x1ff) << 3);
                 if (!ptw_translate(&pte_trans, pte_addr)) {
                     return false;
                 }
             restart_5:
                 pte = ptw_ldq(&pte_trans, ra);
+                leaf_c = !!(pte & cbit);
+                pte &= ~cbit;
                 if (!(pte & PG_PRESENT_MASK)) {
                     goto do_fault;
                 }
@@ -191,7 +204,7 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
                 }
                 ptep = pte ^ PG_NX_MASK;
             } else {
-                pte = in->cr3;
+                pte = in->cr3 & ~cbit;
                 ptep = PG_NX_MASK | PG_USER_MASK | PG_RW_MASK;
             }
 
@@ -204,6 +217,8 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
             }
         restart_4:
             pte = ptw_ldq(&pte_trans, ra);
+            leaf_c = !!(pte & cbit);
+            pte &= ~cbit;
             if (!(pte & PG_PRESENT_MASK)) {
                 goto do_fault;
             }
@@ -224,6 +239,8 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
             }
         restart_3_lma:
             pte = ptw_ldq(&pte_trans, ra);
+            leaf_c = !!(pte & cbit);
+            pte &= ~cbit;
             if (!(pte & PG_PRESENT_MASK)) {
                 goto do_fault;
             }
@@ -245,13 +262,16 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
             /*
              * Page table level 3
              */
-            pte_addr = (in->cr3 & 0xffffffe0ULL) + ((addr >> 27) & 0x18);
+            pte_addr = ((in->cr3 & ~cbit) & 0xffffffe0ULL) +
+                ((addr >> 27) & 0x18);
             if (!ptw_translate(&pte_trans, pte_addr)) {
                 return false;
             }
             rsvd_mask |= PG_HI_USER_MASK;
         restart_3_nolma:
             pte = ptw_ldq(&pte_trans, ra);
+            leaf_c = !!(pte & cbit);
+            pte &= ~cbit;
             if (!(pte & PG_PRESENT_MASK)) {
                 goto do_fault;
             }
@@ -273,6 +293,8 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
         }
     restart_2_pae:
         pte = ptw_ldq(&pte_trans, ra);
+        leaf_c = !!(pte & cbit);
+        pte &= ~cbit;
         if (!(pte & PG_PRESENT_MASK)) {
             goto do_fault;
         }
@@ -298,6 +320,8 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
             return false;
         }
         pte = ptw_ldq(&pte_trans, ra);
+        leaf_c = !!(pte & cbit);
+        pte &= ~cbit;
         if (!(pte & PG_PRESENT_MASK)) {
             goto do_fault;
         }
@@ -311,7 +335,8 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
         /*
          * Page table level 2
          */
-        pte_addr = (in->cr3 & 0xfffff000ULL) + ((addr >> 20) & 0xffc);
+        pte_addr = ((in->cr3 & ~cbit) & 0xfffff000ULL) +
+            ((addr >> 20) & 0xffc);
         if (!ptw_translate(&pte_trans, pte_addr)) {
             return false;
         }
@@ -438,6 +463,20 @@ do_check_protect_pse36:
 
     /* merge offset within page */
     paddr = (pte & PG_ADDRESS_MASK & ~(page_size - 1)) | (addr & (page_size - 1));
+
+    if (unlikely(cbit) && snp_rmp_enabled(env)) {
+        /*
+         * Check the page actually being accessed rather than the whole large
+         * page: hardware does the RMP check per 4KiB sub-page, which is why
+         * PSMASH exists.
+         */
+        hwaddr page = paddr & TARGET_PAGE_MASK;
+        SnpRmpResult rmp = snp_rmp_check(env, page, leaf_c);
+
+        if (unlikely(rmp != SNP_RMP_OK)) {
+            snp_rmp_fault(env, rmp, page, leaf_c, ra);
+        }
+    }
  stage2:
 
     /*

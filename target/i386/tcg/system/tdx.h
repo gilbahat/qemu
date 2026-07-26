@@ -121,4 +121,10 @@
 void tdx_mmio_check(CPUX86State *env, hwaddr paddr, MMUAccessType access_type,
                     uintptr_t ra);
 
+/*
+ * Create the VM-scoped singleton and register its VMState section.  Called at
+ * TCG realize so the section exists before an incoming migration needs it.
+ */
+void tdx_tcg_init(void);
+
 #endif /* I386_TCG_SYSTEM_TDX_H */

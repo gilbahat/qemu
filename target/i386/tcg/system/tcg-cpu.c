@@ -27,6 +27,8 @@
 #include "system/memory.h"
 
 #include "tcg/tcg-cpu.h"
+#include "tdx.h"
+#include "snp.h"
 
 static void tcg_cpu_machine_done(Notifier *n, void *unused)
 {
@@ -79,5 +81,18 @@ bool tcg_cpu_realizefn(CPUState *cs, Error **errp)
     /* ... SMRAM with higher priority, linked from /machine/smram.  */
     cpu->machine_done.notify = tcg_cpu_machine_done;
     qemu_add_machine_init_done_notifier(&cpu->machine_done);
+
+    /*
+     * Create the confidential-guest singletons now rather than on first use.
+     * They register a VMState section, and an incoming migration arrives before
+     * the guest has executed anything -- so a lazily created one would not yet
+     * exist and the destination would reject the stream.
+     */
+    if (cpu->tdx_guest) {
+        tdx_tcg_init();
+    }
+    if (cpu->sev_snp_guest) {
+        snp_tcg_init();
+    }
     return true;
 }

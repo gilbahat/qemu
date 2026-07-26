@@ -10,6 +10,7 @@
 #include "qemu/osdep.h"
 #include "qemu/units.h"
 #include "qemu/log.h"
+#include "qemu/lockable.h"
 #include "qemu/thread.h"
 #include "cpu.h"
 #include "exec/helper-proto.h"
@@ -17,16 +18,17 @@
 #include "qemu/error-report.h"
 #include "system/runstate.h"
 #include "system/memory.h"
+#include "hw/core/loader.h"
+#include "exec/cputlb.h"
+#include "exec/cpu-common.h"
+#include "exec/target_page.h"
 #include "svm.h"
 #include "tcg/helper-tcg.h"
 #include "snp.h"
 
 #ifdef TARGET_X86_64
 
-/*
- * VM-scoped state.  Only the arming flag for now; the RMP-lite page-state map
- * will live here too.
- */
+/* VM-scoped state: the arming flag and the RMP-lite page-state map. */
 typedef struct SnpTcgState {
     QemuMutex lock;
     /*
@@ -38,16 +40,83 @@ typedef struct SnpTcgState {
      * otherwise take #VC on its own port I/O long before the payload runs.
      */
     bool vc_armed;
+
+    /*
+     * RMP-lite.  Only pages whose state differs from the mode default are
+     * stored, so there is nothing to size against RAM, nothing to grow on
+     * hotplug, and the launch image can be identified lazily.  Keys are page
+     * frame numbers.
+     */
+    GHashTable *rmp;
+
+    /* Flattened form of rmp, live only across a migration. */
+    uint32_t rmp_count;
+    uint64_t *rmp_pfn;
+    uint8_t *rmp_st;
 } SnpTcgState;
 
 static SnpTcgState *snp_state;
+
+/*
+ * Page state has to migrate.  A guest that has validated its memory and is then
+ * migrated would, without this, find every page back at the mode default: under
+ * strict that is unvalidated, so it would take a #VC on its own next
+ * instruction.  The map is flattened into parallel arrays because a GHashTable
+ * has no VMSTATE representation.
+ */
+static int snp_pre_save(void *opaque)
+{
+    SnpTcgState *s = opaque;
+    GHashTableIter it;
+    gpointer k, v;
+    uint32_t i = 0;
+
+    s->rmp_count = s->rmp ? g_hash_table_size(s->rmp) : 0;
+    g_free(s->rmp_pfn);
+    g_free(s->rmp_st);
+    s->rmp_pfn = g_new0(uint64_t, s->rmp_count);
+    s->rmp_st = g_new0(uint8_t, s->rmp_count);
+
+    if (s->rmp) {
+        g_hash_table_iter_init(&it, s->rmp);
+        while (g_hash_table_iter_next(&it, &k, &v)) {
+            s->rmp_pfn[i] = GPOINTER_TO_SIZE(k);
+            s->rmp_st[i] = GPOINTER_TO_SIZE(v);
+            i++;
+        }
+    }
+    return 0;
+}
+
+static int snp_post_load(void *opaque, int version_id)
+{
+    SnpTcgState *s = opaque;
+    uint32_t i;
+
+    if (!s->rmp) {
+        s->rmp = g_hash_table_new(g_direct_hash, g_direct_equal);
+    }
+    g_hash_table_remove_all(s->rmp);
+    for (i = 0; i < s->rmp_count; i++) {
+        g_hash_table_insert(s->rmp, GSIZE_TO_POINTER(s->rmp_pfn[i]),
+                            GSIZE_TO_POINTER(s->rmp_st[i]));
+    }
+    return 0;
+}
 
 static const VMStateDescription vmstate_snp_tcg = {
     .name = "sev-snp-tcg",
     .version_id = 1,
     .minimum_version_id = 1,
+    .pre_save = snp_pre_save,
+    .post_load = snp_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_BOOL(vc_armed, SnpTcgState),
+        VMSTATE_UINT32(rmp_count, SnpTcgState),
+        VMSTATE_VARRAY_UINT32_ALLOC(rmp_pfn, SnpTcgState, rmp_count, 0,
+                                    vmstate_info_uint64, uint64_t),
+        VMSTATE_VARRAY_UINT32_ALLOC(rmp_st, SnpTcgState, rmp_count, 0,
+                                    vmstate_info_uint8, uint8_t),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -60,6 +129,11 @@ static SnpTcgState *snp_get_state(void)
         vmstate_register(NULL, 0, &vmstate_snp_tcg, snp_state);
     }
     return snp_state;
+}
+
+void snp_tcg_init(void)
+{
+    snp_get_state();
 }
 
 /* Is this #VC class enabled, and has the SNP-aware payload taken over yet? */
@@ -199,21 +273,178 @@ void helper_snp_vc_hlt(CPUX86State *env)
     snp_raise_vc(env, SVM_EXIT_HLT, GETPC());
 }
 
+static bool snp_gpa_is_ram(CPUX86State *env, hwaddr gpa)
+{
+    CPUState *cs = env_cpu(env);
+    MemTxAttrs attrs = cpu_get_mem_attrs(env);
+    hwaddr xlat, len = 1;
+    MemoryRegion *mr;
+
+    mr = address_space_translate(cpu_addressspace(cs, attrs), gpa, &xlat, &len,
+                                 false, attrs);
+    return memory_region_is_ram(mr) || memory_region_is_romd(mr);
+}
+
+/*
+ * The state a page has before the guest touches it.
+ *
+ * Under LAZY everything is shared, so a guest that has not adopted the C-bit
+ * runs unchanged and only the pages it explicitly claims are enforced.  Under
+ * STRICT guest RAM is private as it is on hardware, and only the launch-
+ * measured image is validated -- which is what SNP_LAUNCH_UPDATE produces.
+ * rom_ptr() is the oracle for that: every blob the x86 boot path places in
+ * guest RAM is registered there, and notably a -kernel ELF's .bss is not, so
+ * it starts unvalidated exactly as it would on hardware.
+ */
+static SnpPageState snp_rmp_default(CPUX86State *env, hwaddr gpa)
+{
+    X86CPU *cpu = env_archcpu(env);
+
+    if (!snp_gpa_is_ram(env, gpa)) {
+        return SNP_PAGE_SHARED;      /* MMIO is never guest-private */
+    }
+    if (cpu->sev_snp_rmp == SNP_RMP_LAZY) {
+        return SNP_PAGE_SHARED;
+    }
+    return rom_ptr(gpa & TARGET_PAGE_MASK, 1) ? SNP_PAGE_PRIVATE_VALIDATED
+                                              : SNP_PAGE_PRIVATE_UNVALIDATED;
+}
+
+/*
+ * Keys are GSIZE, not GUINT: with phys_bits at cbitpos + 1 a page frame number
+ * needs up to 40 bits, and GUINT_TO_POINTER would truncate it -- aliasing two
+ * distant pages onto one entry.
+ */
+static gpointer snp_rmp_key(hwaddr gpa)
+{
+    return GSIZE_TO_POINTER(gpa >> TARGET_PAGE_BITS);
+}
+
+static SnpPageState snp_rmp_get(CPUX86State *env, hwaddr gpa)
+{
+    SnpTcgState *s = snp_get_state();
+    gpointer v;
+    bool found;
+
+    QEMU_LOCK_GUARD(&s->lock);
+    found = s->rmp &&
+            g_hash_table_lookup_extended(s->rmp, snp_rmp_key(gpa), NULL, &v);
+    return found ? GPOINTER_TO_SIZE(v) : snp_rmp_default(env, gpa);
+}
+
+static void snp_rmp_set(CPUX86State *env, hwaddr gpa, SnpPageState st)
+{
+    SnpTcgState *s = snp_get_state();
+
+    QEMU_LOCK_GUARD(&s->lock);
+    if (!s->rmp) {
+        s->rmp = g_hash_table_new(g_direct_hash, g_direct_equal);
+    }
+    g_hash_table_insert(s->rmp, snp_rmp_key(gpa), GSIZE_TO_POINTER(st));
+}
+
+bool snp_rmp_enabled(CPUX86State *env)
+{
+    return env_archcpu(env)->sev_snp_guest &&
+           env_archcpu(env)->sev_snp_rmp != SNP_RMP_OFF;
+}
+
+SnpRmpResult snp_rmp_check(CPUX86State *env, hwaddr gpa, bool priv)
+{
+    SnpPageState st = snp_rmp_get(env, gpa);
+
+    if (priv) {
+        if (st == SNP_PAGE_PRIVATE_VALIDATED) {
+            return SNP_RMP_OK;
+        }
+        /* Assigned but unvalidated is the guest's to fix, with PVALIDATE. */
+        return st == SNP_PAGE_PRIVATE_UNVALIDATED ? SNP_RMP_NOT_VALIDATED
+                                                  : SNP_RMP_MISMATCH;
+    }
+    return st == SNP_PAGE_SHARED ? SNP_RMP_OK : SNP_RMP_MISMATCH;
+}
+
+void snp_rmp_fault(CPUX86State *env, SnpRmpResult res, hwaddr gpa, bool priv,
+                   uintptr_t ra)
+{
+    if (res == SNP_RMP_NOT_VALIDATED) {
+        snp_raise_vc(env, SNP_EXIT_PAGE_NOT_VALIDATED, ra);
+    }
+
+    /*
+     * A C-bit that disagrees with the page's state is not visible to the guest
+     * on hardware: the RMP check fails during the nested walk and the
+     * hypervisor sees an unresolvable fault.  Say so precisely and stop, rather
+     * than inventing a #PF that would send someone hunting for a page-table bug
+     * when the bug is in their page *state*.
+     */
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "sev-snp: RMP violation: %s access to GPA 0x%" HWADDR_PRIx
+                  " whose state is %s\n",
+                  priv ? "private (C=1)" : "shared (C=0)", gpa,
+                  snp_rmp_get(env, gpa) == SNP_PAGE_SHARED ? "shared"
+                      : "guest-private");
+    warn_report("sev-snp: RMP violation at GPA 0x%" HWADDR_PRIx
+                ": %s access to %s memory. A real hypervisor would terminate "
+                "the guest here.", gpa, priv ? "private (C=1)" : "shared (C=0)",
+                snp_rmp_get(env, gpa) == SNP_PAGE_SHARED ? "shared"
+                    : "guest-private");
+    qemu_system_guest_panicked(NULL);
+}
+
+/*
+ * Page-state change, from the GHCB MSR protocol.  Moving a page to private
+ * clears its validated bit: the guest must PVALIDATE it before use, which is
+ * the ordering this teaches.
+ */
+static bool snp_rmp_psc(CPUX86State *env, hwaddr gpa, uint64_t op)
+{
+    CPUState *cs = env_cpu(env);
+
+    if (!snp_rmp_enabled(env)) {
+        return true;
+    }
+
+    switch (op) {
+    case GHCB_MSR_PSC_OP_PRIVATE:
+        snp_rmp_set(env, gpa, SNP_PAGE_PRIVATE_UNVALIDATED);
+        break;
+    case GHCB_MSR_PSC_OP_SHARED:
+        snp_rmp_set(env, gpa, SNP_PAGE_SHARED);
+        break;
+    default:
+        /* PSMASH/UNSMASH are page-size operations; only 4KiB is modelled. */
+        return true;
+    }
+
+    /*
+     * Both directions remove an access that may already be cached, so the TLB
+     * has to be dropped.  Validation is the one transition that only *adds*
+     * access, and an unvalidated page cannot have a cached entry -- the fill
+     * that would have created it faulted.
+     */
+    tlb_flush(cs);
+    return true;
+}
+
 /*
  * PVALIDATE (F2 0F 01 FF): RAX linear address, ECX page size, EDX validate
  * flag.  EAX returns a status and CF is set when the RMP entry was already in
  * the requested state.
  *
- * With no RMP-lite page-state map yet this validates its operands and reports
- * success, but it does arm #VC reflection -- which is the point of landing it
- * this early, since without it nothing could ever be reflected.
+ * It also arms #VC reflection, on the first execution: see SnpTcgState.
  */
 void helper_pvalidate(CPUX86State *env)
 {
     SnpTcgState *st = snp_get_state();
+    CPUState *cs = env_cpu(env);
     uint64_t gva = env->regs[R_EAX];
     uint32_t page_size = (uint32_t)env->regs[R_ECX];
-    uint64_t align;
+    bool validate = env->regs[R_EDX] & 1;
+    uint64_t align = page_size ? (2 * MiB) : (4 * KiB);
+    TranslateForDebugResult dbg;
+    hwaddr gpa;
+    SnpPageState cur;
 
     if (!st->vc_armed) {
         qemu_mutex_lock(&st->lock);
@@ -223,25 +454,55 @@ void helper_pvalidate(CPUX86State *env)
                       "sev-snp: first PVALIDATE; #VC reflection is now live\n");
     }
 
-    if (page_size > 1) {
+    env->eflags &= ~CC_C;
+
+    if (page_size > 1 || (gva & (align - 1))) {
         env->regs[R_EAX] = PVALIDATE_FAIL_INPUT;
-        env->eflags &= ~CC_C;
+        return;
+    }
+    if (page_size) {
+        /* RMP page size is not modelled, so only the 4KiB form is accepted. */
+        env->regs[R_EAX] = PVALIDATE_FAIL_SIZEMISMATCH;
         return;
     }
 
-    align = page_size ? (2 * MiB) : (4 * KiB);
-    if (gva & (align - 1)) {
-        env->regs[R_EAX] = PVALIDATE_FAIL_INPUT;
-        env->eflags &= ~CC_C;
+    if (!snp_rmp_enabled(env)) {
+        env->regs[R_EAX] = PVALIDATE_SUCCESS;
         return;
     }
 
     /*
-     * No page-state tracking yet, so nothing can already be in the requested
-     * state: report a successful change with CF clear.
+     * PVALIDATE takes a linear address.  Translating it through the walker
+     * would re-enter the RMP check on the very page being validated, so use
+     * the debug walk, which does not consult page state.
      */
+    if (!x86_cpu_translate_for_debug(cs, gva & TARGET_PAGE_MASK, &dbg)) {
+        env->regs[R_EAX] = PVALIDATE_FAIL_INPUT;
+        return;
+    }
+    gpa = dbg.physaddr & ~snp_cbit_mask(env);
+
+    cur = snp_rmp_get(env, gpa);
+    if (cur == SNP_PAGE_SHARED) {
+        /* The guest must move the page to private first, via a PSC. */
+        env->regs[R_EAX] = PVALIDATE_FAIL_PERMISSION;
+        return;
+    }
+
+    if ((cur == SNP_PAGE_PRIVATE_VALIDATED) == validate) {
+        /* Already in the requested state: CF set, no change, no flush. */
+        env->eflags |= CC_C;
+        env->regs[R_EAX] = PVALIDATE_SUCCESS;
+        return;
+    }
+
+    snp_rmp_set(env, gpa, validate ? SNP_PAGE_PRIVATE_VALIDATED
+                                   : SNP_PAGE_PRIVATE_UNVALIDATED);
+    if (!validate) {
+        /* Rescinding removes access, so a cached translation must go. */
+        tlb_flush(cs);
+    }
     env->regs[R_EAX] = PVALIDATE_SUCCESS;
-    env->eflags &= ~CC_C;
 }
 
 /*
@@ -307,16 +568,18 @@ static void snp_ghcb_msr_protocol(CPUX86State *env)
 
     case GHCB_MSR_PSC_REQ: {
         uint64_t op = val >> 56;
+        /* The GPA is bits 51:12; the operation rides in 63:56 and must go. */
+        hwaddr gpa = val & MAKE_64BIT_MASK(12, 40);
 
         /*
-         * No page-state map yet, so every transition succeeds.  Reject an
-         * operation the architecture does not define, though -- a guest that
+         * Reject an operation the architecture does not define -- a guest that
          * sends one has a bug worth surfacing.
          */
         if (op < GHCB_MSR_PSC_OP_PRIVATE || op > GHCB_MSR_PSC_OP_UNSMASH) {
             env->snp_ghcb_msr = GHCB_MSR_PSC_RESP | (1ULL << 32);
             break;
         }
+        snp_rmp_psc(env, gpa, op);
         env->snp_ghcb_msr = GHCB_MSR_PSC_RESP;
         break;
     }

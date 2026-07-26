@@ -38,6 +38,7 @@ sev-snp: CFLAGS+=-mgeneral-regs-only
 sev-snp-vc: CFLAGS+=-mgeneral-regs-only
 sev-snp-ghcb: CFLAGS+=-mgeneral-regs-only
 sev-snp-nae: CFLAGS+=-mgeneral-regs-only
+sev-snp-rmp: CFLAGS+=-mgeneral-regs-only
 
 # Running
 X64_SYSTEM_OPTS=-device isa-debugcon,chardev=output \
@@ -59,6 +60,13 @@ run-sev-snp-ghcb: QEMU_OPTS=-cpu max,x-sev-snp-guest=on $(X64_SYSTEM_OPTS) -kern
 # Full strict I/O: the guest services its own port access through the GHCB, so
 # the test's output is itself proof the NAE path works.
 run-sev-snp-nae: QEMU_OPTS=-cpu max,x-sev-snp-guest=on $(X64_SYSTEM_OPTS) -kernel
+
+# RMP-lite in lazy mode: pages are shared until claimed, so the test's own code
+# and stack keep working while the page it claims is tracked for real.  I/O is
+# relaxed for the same reason as sev-snp-vc: PVALIDATE arms reflection, and this
+# test installs no handler.
+SNP_RMP_CPU=max,x-sev-snp-guest=on,x-sev-snp-rmp=1,x-sev-snp-relax-io=on
+run-sev-snp-rmp: QEMU_OPTS=-cpu $(SNP_RMP_CPU) $(X64_SYSTEM_OPTS) -kernel
 
 ifeq ($(CONFIG_PLUGIN),y)
 run-plugin-patch-target-with-libpatch.so:		\

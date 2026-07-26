@@ -10218,6 +10218,12 @@ static void x86_cpu_realizefn(DeviceState *dev, Error **errp)
             return;
         }
 
+        if (cpu->sev_snp_rmp > SNP_RMP_STRICT) {
+            error_setg(errp, "x-sev-snp-rmp must be 0 (off), 1 (lazy) "
+                       "or 2 (strict)");
+            return;
+        }
+
         cpu->sev_snp_vc_mask = SNP_VC_ALL
                              & ~(cpu->sev_snp_relax_io ? SNP_VC_IO : 0)
                              & ~(cpu->sev_snp_relax_msr ? SNP_VC_MSR : 0)
@@ -11020,6 +11026,7 @@ static const Property x86_cpu_properties[] = {
      */
     DEFINE_PROP_BOOL("x-sev-snp-guest", X86CPU, sev_snp_guest, false),
     DEFINE_PROP_UINT8("x-sev-snp-cbitpos", X86CPU, sev_snp_cbitpos, 51),
+    DEFINE_PROP_UINT8("x-sev-snp-rmp", X86CPU, sev_snp_rmp, SNP_RMP_OFF),
     DEFINE_PROP_BOOL("x-sev-snp-relax-io", X86CPU, sev_snp_relax_io, false),
     DEFINE_PROP_BOOL("x-sev-snp-relax-msr", X86CPU, sev_snp_relax_msr, false),
     DEFINE_PROP_BOOL("x-sev-snp-relax-cpuid", X86CPU, sev_snp_relax_cpuid,
