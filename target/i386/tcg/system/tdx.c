@@ -18,6 +18,7 @@
 #include "hw/core/qdev.h"
 #include "system/memory.h"
 #include "migration/vmstate.h"
+#include "hw/i386/tdx-dma.h"
 #include "tcg/helper-tcg.h"
 #include "tdx.h"
 
@@ -770,6 +771,7 @@ void helper_tdcall(CPUX86State *env, int next_eip_addend)
         qemu_mutex_lock(&td->lock);
         td->ve_armed = true;
         qemu_mutex_unlock(&td->lock);
+        tdx_dma_arm();
     }
 
     switch (leaf) {

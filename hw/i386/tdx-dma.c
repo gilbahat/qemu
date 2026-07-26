@@ -40,6 +40,19 @@ typedef struct TdxDmaState {
 static TdxDmaState *tdx_dma_state;
 
 /*
+ * Armed by the guest's first TDCALL, for the same reason #VE reflection is: a
+ * direct -kernel boot runs TDX-unaware firmware as a loader shim, and that
+ * firmware does DMA of its own long before the TD payload runs.  Denying it
+ * would break the boot and bury the interesting failures in noise.
+ */
+static bool tdx_dma_armed;
+
+void tdx_dma_arm(void)
+{
+    tdx_dma_armed = true;
+}
+
+/*
  * Report the first denial in full and then stay quiet: a guest that has not
  * shared its rings generates one of these per descriptor fetch, and burying the
  * useful message under thousands of duplicates helps nobody.
@@ -71,7 +84,12 @@ static IOMMUTLBEntry tdx_dma_translate(IOMMUMemoryRegion *iommu_mr, hwaddr addr,
         .perm = IOMMU_NONE,
     };
 
-    if (addr & s->shared_mask) {
+    if (!tdx_dma_armed) {
+        /* Firmware, before the TD payload has taken over: pass through. */
+        ret.translated_addr = (addr & ~s->shared_mask) &
+                              ~(hwaddr)TARGET_PAGE_MASK_TDX;
+        ret.perm = IOMMU_RW;
+    } else if (addr & s->shared_mask) {
         /*
          * Shared: strip the alias bit and let the access through to system
          * memory.  There is no encryption to undo -- the alias is the whole of

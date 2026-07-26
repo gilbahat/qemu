@@ -22,4 +22,12 @@
  */
 void tdx_dma_setup(PCIBus *bus);
 
+/**
+ * tdx_dma_arm: begin enforcing the shared-memory restriction on device DMA.
+ *
+ * Called from the TDCALL helper the first time the guest issues one, so that
+ * TDX-unaware firmware on a -kernel boot is not caught by it.
+ */
+void tdx_dma_arm(void);
+
 #endif /* HW_I386_TDX_DMA_H */

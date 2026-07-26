@@ -31,8 +31,17 @@ EXTRA_RUNS+=$(MULTIARCH_RUNS)
 
 memory: CFLAGS+=-DCHECK_UNALIGNED=1
 
+# boot.S leaves SSE disabled (CR4.OSFXSR clear), so anything the compiler
+# vectorises -- a struct initialiser is enough -- would #UD.
+tdx: CFLAGS+=-mgeneral-regs-only
+
 # Running
-QEMU_OPTS+=-device isa-debugcon,chardev=output -device isa-debug-exit,iobase=0xf4,iosize=0x4 -kernel
+X64_SYSTEM_OPTS=-device isa-debugcon,chardev=output \
+                -device isa-debug-exit,iobase=0xf4,iosize=0x4
+QEMU_OPTS+=$(X64_SYSTEM_OPTS) -kernel
+
+# The emulated TDX guest interface is off unless asked for.
+run-tdx: QEMU_OPTS=-cpu max,x-tdx-guest=on $(X64_SYSTEM_OPTS) -kernel
 
 ifeq ($(CONFIG_PLUGIN),y)
 run-plugin-patch-target-with-libpatch.so:		\
