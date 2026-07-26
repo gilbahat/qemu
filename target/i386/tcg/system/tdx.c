@@ -17,6 +17,7 @@
 #include "hw/core/boards.h"
 #include "hw/core/qdev.h"
 #include "system/memory.h"
+#include "migration/vmstate.h"
 #include "tcg/helper-tcg.h"
 #include "tdx.h"
 
@@ -44,11 +45,32 @@ typedef struct TdxTcgState {
 
 static TdxTcgState *tdx_state;
 
+/*
+ * TD-scoped state has to survive migration.  The RTMRs especially: a
+ * measurement register that silently resets across a snapshot would change the
+ * attestation report of a running TD, which is the one thing it must never do.
+ * ve_armed matters for a different reason -- losing it turns #VE reflection off
+ * and the TD stops conforming with no indication that anything happened.
+ */
+static const VMStateDescription vmstate_tdx_tcg = {
+    .name = "tdx-tcg",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT8_ARRAY(mrtd, TdxTcgState, TDX_MEASUREMENT_LEN),
+        VMSTATE_UINT8_2DARRAY(rtmr, TdxTcgState, TDX_RTMR_COUNT,
+                              TDX_MEASUREMENT_LEN),
+        VMSTATE_BOOL(ve_armed, TdxTcgState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static TdxTcgState *tdx_get_state(void)
 {
     if (!tdx_state) {
         tdx_state = g_new0(TdxTcgState, 1);
         qemu_mutex_init(&tdx_state->lock);
+        vmstate_register(NULL, 0, &vmstate_tdx_tcg, tdx_state);
     }
     return tdx_state;
 }
