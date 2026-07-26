@@ -43,6 +43,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/i386/x86.h"
 #include "hw/i386/pc.h"
+#include "hw/i386/tdx-dma.h"
 #include "hw/i386/amd_iommu.h"
 #include "hw/i386/intel_iommu.h"
 #include "hw/vfio/types.h"
@@ -230,6 +231,13 @@ static void pc_q35_init(MachineState *machine)
 
     /* pci */
     pcms->pcibus = PCI_BUS(qdev_get_child_bus(DEVICE(phb), "pcie.0"));
+
+    /*
+     * Restrict device DMA to guest-shared memory for an emulated TD.  Must run
+     * before any device is created, since a device captures its DMA address
+     * space when realized.
+     */
+    tdx_dma_setup(pcms->pcibus);
 
     /* irq lines */
     gsi_state = pc_gsi_create(&x86ms->gsi, true);

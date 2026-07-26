@@ -90,6 +90,35 @@ is no quoting path at all.
 into ordinary RAM by the normal QEMU loader with no integrity domain, so a
 plausible-looking MRTD would be actively misleading.
 
+Device I/O
+----------
+
+A TD's private memory is not reachable by the host, so a device may only DMA to
+memory the guest has explicitly shared — which a TD addresses through the SHARED
+alias, i.e. with GPA bit ``GPAW-1`` set. With ``x-tdx-guest`` off this is
+moot, but with an emulated TD it is enforced: PCI devices are given an address
+space that maps the shared alias and nothing else, and a DMA to any other
+address is refused and logged under ``-d guest_errors``.
+
+Without that enforcement the emulation would certify nothing. Private and shared
+are the same RAM under TCG, so a guest that never shares its virtio rings works
+here and fails on hardware — the failure mode this whole model exists to catch.
+
+**Legacy virtio is disabled** for an emulated TD, matching what QEMU already
+does for a real confidential guest. The legacy transport publishes a queue
+address as a 32-bit page frame number, so it tops out at 2\ :sup:`44` and cannot
+express a SHARED alias address at all, and it has no way to negotiate
+``VIRTIO_F_ACCESS_PLATFORM``. A TD guest must therefore use modern virtio 1.0:
+the 64-bit ``queue_desc``/``queue_driver``/``queue_device`` registers reached
+through the PCI capability structures, with ``VIRTIO_F_VERSION_1`` and
+``VIRTIO_F_ACCESS_PLATFORM`` negotiated.
+
+In practice a guest being ported will meet these in order: its virtio probe
+stops recognising the device (legacy is gone), then once it speaks modern virtio
+its ring DMA is refused until the ring pages are shared and programmed at the
+shared alias, then its payload buffers need to be bounced through shared memory
+because the heap stays private.
+
 Strict mode: reflecting #VE
 ---------------------------
 
