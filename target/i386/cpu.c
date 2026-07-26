@@ -10142,11 +10142,13 @@ static void x86_cpu_realizefn(DeviceState *dev, Error **errp)
             cpu->tdx_ve_msr = true;
             cpu->tdx_ve_cpuid = true;
             cpu->tdx_ve_hlt = true;
+            cpu->tdx_ve_mmio = true;
         }
         cpu->tdx_ve_mask = (cpu->tdx_ve_io ? TDX_VE_IO : 0)
                          | (cpu->tdx_ve_msr ? TDX_VE_MSR : 0)
                          | (cpu->tdx_ve_cpuid ? TDX_VE_CPUID : 0)
-                         | (cpu->tdx_ve_hlt ? TDX_VE_HLT : 0);
+                         | (cpu->tdx_ve_hlt ? TDX_VE_HLT : 0)
+                         | (cpu->tdx_ve_mmio ? TDX_VE_MMIO : 0);
         /*
          * Note: cpu->phys_bits is not assigned until later in realize, so the
          * GPAW-vs-phys_bits relationship cannot be checked here.  TCG pins
@@ -10940,6 +10942,7 @@ static const Property x86_cpu_properties[] = {
     DEFINE_PROP_BOOL("x-tdx-ve-msr", X86CPU, tdx_ve_msr, false),
     DEFINE_PROP_BOOL("x-tdx-ve-cpuid", X86CPU, tdx_ve_cpuid, false),
     DEFINE_PROP_BOOL("x-tdx-ve-hlt", X86CPU, tdx_ve_hlt, false),
+    DEFINE_PROP_BOOL("x-tdx-ve-mmio", X86CPU, tdx_ve_mmio, false),
 };
 
 #ifndef CONFIG_USER_ONLY

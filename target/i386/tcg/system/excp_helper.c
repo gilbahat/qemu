@@ -26,6 +26,7 @@
 #include "exec/target_page.h"
 #include "exec/tlb-flags.h"
 #include "tcg/helper-tcg.h"
+#include "tdx.h"
 
 typedef struct TranslateParams {
     target_ulong addr;
@@ -625,6 +626,12 @@ bool x86_cpu_tlb_fill(CPUState *cs, vaddr addr, int size,
          * avoid filling it too fast.
          */
         assert(out.prot & (1 << access_type));
+#ifdef TARGET_X86_64
+        if (!probe) {
+            /* A TD takes #VE on MMIO; must not fire on a speculative probe. */
+            tdx_mmio_check(env, out.paddr, access_type, retaddr);
+        }
+#endif
         tlb_set_page_with_attrs(cs, addr & TARGET_PAGE_MASK,
                                 out.paddr & TARGET_PAGE_MASK,
                                 cpu_get_mem_attrs(env),

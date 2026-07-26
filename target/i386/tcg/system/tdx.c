@@ -207,6 +207,48 @@ static uint64_t tdx_vmcall_io(CPUX86State *env)
     return TDVMCALL_SUCCESS;
 }
 
+/*
+ * TDVMCALL<#VE.RequestMMIO>: R12 size, R13 direction (0 write, 1 read),
+ * R14 GPA, R15 data for a write.  A read returns the value in R11.  This is
+ * the counterpart of the #VE raised by tdx_mmio_check(): the guest cannot
+ * touch device memory directly, so it asks the VMM to do it.
+ */
+static uint64_t tdx_vmcall_mmio(CPUX86State *env)
+{
+    X86CPU *cpu = env_archcpu(env);
+    CPUState *cs = env_cpu(env);
+    MemTxAttrs attrs = cpu_get_mem_attrs(env);
+    uint64_t size = env->regs[R_R12];
+    uint64_t is_read = env->regs[R_R13];
+    uint64_t gpa = tdx_strip_shared(cpu, env->regs[R_R14]);
+    uint64_t data = env->regs[R_R15];
+    uint8_t buf[8];
+
+    if (size != 1 && size != 2 && size != 4 && size != 8) {
+        return TDVMCALL_INVALID_OPERAND;
+    }
+    if (is_read > 1) {
+        return TDVMCALL_INVALID_OPERAND;
+    }
+
+    if (is_read) {
+        if (address_space_read(cpu_addressspace(cs, attrs), gpa, attrs, buf,
+                               size) != MEMTX_OK) {
+            return TDVMCALL_INVALID_OPERAND;
+        }
+        data = 0;
+        memcpy(&data, buf, size);
+        env->regs[R_R11] = data;
+    } else {
+        memcpy(buf, &data, size);
+        if (address_space_write(cpu_addressspace(cs, attrs), gpa, attrs, buf,
+                                size) != MEMTX_OK) {
+            return TDVMCALL_INVALID_OPERAND;
+        }
+    }
+    return TDVMCALL_SUCCESS;
+}
+
 /* TDVMCALL<Instruction.CPUID>: R12 leaf, R13 subleaf -> R11..R14 = EAX..EDX. */
 static uint64_t tdx_vmcall_cpuid(CPUX86State *env)
 {
@@ -283,6 +325,11 @@ static void tdx_vp_vmcall(CPUX86State *env, int next_eip_addend)
     case TDVMCALL_INSTR_CPUID:
         env->regs[R_EAX] = TDX_SUCCESS;
         env->regs[R_R10] = tdx_vmcall_cpuid(env);
+        return;
+
+    case TDVMCALL_REQUEST_MMIO:
+        env->regs[R_EAX] = TDX_SUCCESS;
+        env->regs[R_R10] = tdx_vmcall_mmio(env);
         return;
 
     case TDVMCALL_INSTR_RDMSR:
@@ -596,6 +643,49 @@ void helper_tdx_ve_hlt(CPUX86State *env, uint32_t instr_len)
     }
     tdx_raise_ve(env, TDX_EXIT_REASON_HLT,
                  (env->eflags & IF_MASK) ? 1 : 0, 0, 0, instr_len, 0, GETPC());
+}
+
+/*
+ * MMIO reflection.  A TD maps device memory as shared, and an access to it
+ * exits to the VMM; the guest sees an EPT violation reported as #VE and
+ * services it with TDVMCALL<#VE.RequestMMIO>.  Reflecting here rather than at
+ * the instruction is what makes the model faithful: the guest cannot tell
+ * which instruction touched MMIO, only that a physical address did, which is
+ * exactly the information hardware gives it.
+ */
+void tdx_mmio_check(CPUX86State *env, hwaddr paddr, MMUAccessType access_type,
+                    uintptr_t ra)
+{
+    CPUState *cs = env_cpu(env);
+    MemTxAttrs attrs = cpu_get_mem_attrs(env);
+    hwaddr xlat, len = 1;
+    MemoryRegion *mr;
+    uint64_t qual;
+
+    if (!tdx_ve_enabled(env, TDX_VE_MMIO)) {
+        return;
+    }
+
+    mr = address_space_translate(cpu_addressspace(cs, attrs), paddr, &xlat,
+                                 &len, access_type == MMU_DATA_STORE, attrs);
+    if (memory_region_is_ram(mr) || memory_region_is_romd(mr)) {
+        return;
+    }
+
+    /* EPT violation qualification: bit 0 read, bit 1 write, bit 2 fetch. */
+    switch (access_type) {
+    case MMU_DATA_STORE:
+        qual = 1 << 1;
+        break;
+    case MMU_INST_FETCH:
+        qual = 1 << 2;
+        break;
+    default:
+        qual = 1 << 0;
+        break;
+    }
+
+    tdx_raise_ve(env, TDX_EXIT_REASON_EPT_VIOLATION, qual, 0, paddr, 0, 0, ra);
 }
 
 /*

@@ -2548,6 +2548,7 @@ struct ArchCPU {
     bool tdx_ve_msr;
     bool tdx_ve_cpuid;
     bool tdx_ve_hlt;
+    bool tdx_ve_mmio;
     uint8_t tdx_gpaw;
     uint64_t tdx_attributes;
     /* Derived from the x-tdx-ve-* properties at realize; see TDX_VE_*. */

@@ -48,6 +48,10 @@ Implemented TDCALL leaves
   RAM here. ``GetQuote`` is refused; every other sub-function returns
   ``INVALID_OPERAND``.
 
+  ``#VE.RequestMMIO`` (48) is also implemented, and is the counterpart of the
+  ``#VE`` a TD takes on MMIO: R12 size, R13 direction, R14 GPA, R15 data for a
+  write, with a read returning the value in R11.
+
   ``Instruction.HLT`` advances the guest RIP past the ``TDCALL`` before
   halting, as ``MWAIT`` does; without that the halt would resume by
   re-executing the instruction that caused it.
@@ -131,8 +135,16 @@ takes ``#VE`` on all of those and must service them through
 Enabling reflection turns this into a conformance tool. Each class is
 selectable so a port can be fixed one at a time:
 
-``x-tdx-ve-io``, ``x-tdx-ve-msr``, ``x-tdx-ve-cpuid``, ``x-tdx-ve-hlt``
-  Reflect that class. ``x-tdx-strict=on`` enables all four.
+``x-tdx-ve-io``, ``x-tdx-ve-msr``, ``x-tdx-ve-cpuid``, ``x-tdx-ve-hlt``, ``x-tdx-ve-mmio``
+  Reflect that class. ``x-tdx-strict=on`` enables all five.
+
+``x-tdx-ve-mmio`` matters for device work: modern virtio is driven entirely
+through memory BARs, so once a guest moves off legacy virtio every config
+access is MMIO. A TD maps device memory as shared and takes ``#VE`` on it,
+reported as an EPT violation, and services it with ``TDVMCALL<#VE.RequestMMIO>``.
+Reflection happens when a translation is installed rather than per instruction,
+which is what hardware does: the guest learns that a physical address faulted,
+not which instruction touched it.
 
 Two carve-outs keep strict mode a useful signal rather than a brick wall, and
 both match real TDX behaviour:

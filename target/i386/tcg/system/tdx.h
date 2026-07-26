@@ -57,6 +57,7 @@
 #define TDVMCALL_INSTR_IO               30ULL
 #define TDVMCALL_INSTR_RDMSR            31ULL
 #define TDVMCALL_INSTR_WRMSR            32ULL
+#define TDVMCALL_REQUEST_MMIO           48ULL
 #define TDVMCALL_MAP_GPA                0x10001ULL
 #define TDVMCALL_GET_QUOTE              0x10002ULL
 #define TDVMCALL_SUCCESS                0x0000000000000000ULL
@@ -77,6 +78,7 @@
 #define TDX_VE_MSR                      (1U << 1)
 #define TDX_VE_CPUID                    (1U << 2)
 #define TDX_VE_HLT                      (1U << 3)
+#define TDX_VE_MMIO                     (1U << 4)
 
 /* #VE exit reasons; TDX reuses the VMX basic exit-reason numbering. */
 #define TDX_EXIT_REASON_CPUID           10
@@ -110,5 +112,13 @@
 #define TDX_CPUID_SIG_EBX               0x65746E49U /* "Inte" */
 #define TDX_CPUID_SIG_EDX               0x5844546CU /* "lTDX" */
 #define TDX_CPUID_SIG_ECX               0x20202020U /* "    " */
+
+/*
+ * Reflect a TD's MMIO access as #VE, as an EPT violation on shared memory.
+ * A no-op unless the MMIO class is enabled and reflection is armed.  Called
+ * from x86_cpu_tlb_fill() once a translation has succeeded.
+ */
+void tdx_mmio_check(CPUX86State *env, hwaddr paddr, MMUAccessType access_type,
+                    uintptr_t ra);
 
 #endif /* I386_TCG_SYSTEM_TDX_H */
