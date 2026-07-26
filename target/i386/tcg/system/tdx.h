@@ -46,7 +46,17 @@
 #define TDX_OPERAND_ID_RDX              0x00000002U
 #define TDX_OPERAND_ID_R8               0x00000008U
 
-/* TDG.VP.VMCALL sub-function numbers and completion status. */
+/*
+ * TDG.VP.VMCALL sub-function numbers and completion status.  The
+ * "Instruction.*" service routines reuse the VMX exit-reason numbering, which
+ * is what lets a guest handle a #VE by passing the exit reason it just read
+ * from TDG.VP.VEINFO.GET straight back as the sub-function.
+ */
+#define TDVMCALL_INSTR_CPUID            10ULL
+#define TDVMCALL_INSTR_HLT              12ULL
+#define TDVMCALL_INSTR_IO               30ULL
+#define TDVMCALL_INSTR_RDMSR            31ULL
+#define TDVMCALL_INSTR_WRMSR            32ULL
 #define TDVMCALL_MAP_GPA                0x10001ULL
 #define TDVMCALL_GET_QUOTE              0x10002ULL
 #define TDVMCALL_SUCCESS                0x0000000000000000ULL

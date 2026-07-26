@@ -248,7 +248,7 @@ STUB_HELPER(svm_check_intercept, TCGv_env env, TCGv_i32 type)
 STUB_HELPER(vmload, TCGv_env env, TCGv_i32 aflag)
 STUB_HELPER(vmmcall, TCGv_env env)
 #ifdef TARGET_X86_64
-STUB_HELPER(tdcall, TCGv_env env)
+STUB_HELPER(tdcall, TCGv_env env, TCGv_i32 pc_ofs)
 STUB_HELPER(tdx_ve_hlt, TCGv_env env, TCGv_i32 len)
 STUB_HELPER(tdx_ve_io, TCGv_env env, TCGv_i32 port, TCGv_i32 qual,
             TCGv_i32 len)
@@ -2925,7 +2925,7 @@ static void gen_multi0F(DisasContext *s, X86DecodedInsn *decode)
             }
             gen_update_cc_op(s);
             gen_update_eip_cur(s);
-            gen_helper_tdcall(tcg_env);
+            gen_helper_tdcall(tcg_env, cur_insn_len_i32(s));
             s->base.is_jmp = DISAS_EOB_NEXT;
             break;
 #endif

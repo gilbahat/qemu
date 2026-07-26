@@ -137,11 +137,109 @@ static void tdx_mem_page_accept(CPUX86State *env)
 }
 
 /*
+ * TDVMCALL<Instruction.IO>: R12 access size, R13 direction (0 write, 1 read),
+ * R14 port, R15 data for a write.  A read returns the value in R11.
+ */
+static uint64_t tdx_vmcall_io(CPUX86State *env)
+{
+    uint64_t size = env->regs[R_R12];
+    uint64_t is_read = env->regs[R_R13];
+    uint32_t port = (uint32_t)env->regs[R_R14];
+    uint32_t data = (uint32_t)env->regs[R_R15];
+
+    if (size != 1 && size != 2 && size != 4) {
+        return TDVMCALL_INVALID_OPERAND;
+    }
+    if (is_read > 1) {
+        return TDVMCALL_INVALID_OPERAND;
+    }
+
+    if (is_read) {
+        uint64_t val;
+
+        switch (size) {
+        case 1:
+            val = helper_inb(env, port);
+            break;
+        case 2:
+            val = helper_inw(env, port);
+            break;
+        default:
+            val = helper_inl(env, port);
+            break;
+        }
+        env->regs[R_R11] = val;
+    } else {
+        switch (size) {
+        case 1:
+            helper_outb(env, port, data);
+            break;
+        case 2:
+            helper_outw(env, port, data);
+            break;
+        default:
+            helper_outl(env, port, data);
+            break;
+        }
+    }
+    return TDVMCALL_SUCCESS;
+}
+
+/* TDVMCALL<Instruction.CPUID>: R12 leaf, R13 subleaf -> R11..R14 = EAX..EDX. */
+static uint64_t tdx_vmcall_cpuid(CPUX86State *env)
+{
+    uint32_t eax, ebx, ecx, edx;
+
+    cpu_x86_cpuid(env, (uint32_t)env->regs[R_R12], (uint32_t)env->regs[R_R13],
+                  &eax, &ebx, &ecx, &edx);
+    env->regs[R_R11] = eax;
+    env->regs[R_R12] = ebx;
+    env->regs[R_R13] = ecx;
+    env->regs[R_R14] = edx;
+    return TDVMCALL_SUCCESS;
+}
+
+/*
+ * TDVMCALL<Instruction.RDMSR/WRMSR>.  The underlying helpers work on the
+ * architectural registers, so the guest's RAX/RCX/RDX are saved and restored
+ * around the call: a TDVMCALL passes its arguments in R12/R13 and must not
+ * clobber the general-purpose registers the guest did not offer.
+ */
+static uint64_t tdx_vmcall_msr(CPUX86State *env, bool write)
+{
+    target_ulong save_rax = env->regs[R_EAX];
+    target_ulong save_rcx = env->regs[R_ECX];
+    target_ulong save_rdx = env->regs[R_EDX];
+    uint64_t val;
+
+    env->regs[R_ECX] = (uint32_t)env->regs[R_R12];
+    if (write) {
+        val = env->regs[R_R13];
+        env->regs[R_EAX] = (uint32_t)val;
+        env->regs[R_EDX] = (uint32_t)(val >> 32);
+        helper_wrmsr(env);
+    } else {
+        helper_rdmsr(env);
+        val = ((uint64_t)(uint32_t)env->regs[R_EDX] << 32) |
+              (uint32_t)env->regs[R_EAX];
+    }
+
+    env->regs[R_EAX] = save_rax;
+    env->regs[R_ECX] = save_rcx;
+    env->regs[R_EDX] = save_rdx;
+
+    if (!write) {
+        env->regs[R_R11] = val;
+    }
+    return TDVMCALL_SUCCESS;
+}
+
+/*
  * TDG.VP.VMCALL (leaf 0).  The guest selects a sub-function in R11 and the
  * completion status is returned in R10, with RAX reporting only whether the
  * TDCALL itself was well-formed.
  */
-static void tdx_vp_vmcall(CPUX86State *env)
+static void tdx_vp_vmcall(CPUX86State *env, int next_eip_addend)
 {
     X86CPU *cpu = env_archcpu(env);
     uint64_t subfn = env->regs[R_R11];
@@ -152,6 +250,43 @@ static void tdx_vp_vmcall(CPUX86State *env)
         env->regs[R_EAX] = TDX_SUCCESS;
         env->regs[R_R10] = TDVMCALL_INVALID_OPERAND;
         return;
+    }
+
+    switch (subfn) {
+    case TDVMCALL_INSTR_IO:
+        env->regs[R_EAX] = TDX_SUCCESS;
+        env->regs[R_R10] = tdx_vmcall_io(env);
+        return;
+
+    case TDVMCALL_INSTR_CPUID:
+        env->regs[R_EAX] = TDX_SUCCESS;
+        env->regs[R_R10] = tdx_vmcall_cpuid(env);
+        return;
+
+    case TDVMCALL_INSTR_RDMSR:
+        env->regs[R_EAX] = TDX_SUCCESS;
+        env->regs[R_R10] = tdx_vmcall_msr(env, false);
+        return;
+
+    case TDVMCALL_INSTR_WRMSR:
+        env->regs[R_EAX] = TDX_SUCCESS;
+        env->regs[R_R10] = tdx_vmcall_msr(env, true);
+        return;
+
+    case TDVMCALL_INSTR_HLT:
+        /*
+         * Halt on the guest's behalf.  EIP must be advanced past the TDCALL
+         * first, exactly as helper_mwait() does, or the halt would resume by
+         * re-executing this instruction forever.
+         */
+        env->regs[R_EAX] = TDX_SUCCESS;
+        env->regs[R_R10] = TDVMCALL_SUCCESS;
+        env->eip += next_eip_addend;
+        helper_hlt(env);
+        /* not reached */
+
+    default:
+        break;
     }
 
     switch (subfn) {
@@ -513,7 +648,7 @@ void helper_tdx_ve_cpuid(CPUX86State *env, uint32_t instr_len)
     tdx_raise_ve(env, TDX_EXIT_REASON_CPUID, leaf, 0, 0, instr_len, 0, GETPC());
 }
 
-void helper_tdcall(CPUX86State *env)
+void helper_tdcall(CPUX86State *env, int next_eip_addend)
 {
     uint64_t leaf = env->regs[R_EAX];
     TdxTcgState *td = tdx_get_state();
@@ -527,7 +662,7 @@ void helper_tdcall(CPUX86State *env)
 
     switch (leaf) {
     case TDG_VP_VMCALL:
-        tdx_vp_vmcall(env);
+        tdx_vp_vmcall(env, next_eip_addend);
         break;
     case TDG_VP_INFO:
         tdx_vp_info(env);

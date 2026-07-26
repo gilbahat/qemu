@@ -39,9 +39,18 @@ Implemented TDCALL leaves
 -------------------------
 
 ``TDG.VP.VMCALL`` (0)
-  Only the ``MapGPA`` sub-function succeeds. Private and shared memory are the
-  same RAM here, so the transition is a validated no-op. ``GetQuote`` is
-  refused; every other sub-function returns ``INVALID_OPERAND``.
+  The ``Instruction.IO`` (30), ``Instruction.CPUID`` (10),
+  ``Instruction.RDMSR`` (31), ``Instruction.WRMSR`` (32) and
+  ``Instruction.HLT`` (12) service routines are implemented, so a guest can
+  handle a ``#VE`` by passing the exit reason it just read from
+  ``TDG.VP.VEINFO.GET`` straight back as the sub-function. ``MapGPA``
+  succeeds as a validated no-op, since private and shared memory are the same
+  RAM here. ``GetQuote`` is refused; every other sub-function returns
+  ``INVALID_OPERAND``.
+
+  ``Instruction.HLT`` advances the guest RIP past the ``TDCALL`` before
+  halting, as ``MWAIT`` does; without that the halt would resume by
+  re-executing the instruction that caused it.
 
 ``TDG.VP.INFO`` (1)
   Reports GPAW from ``x-tdx-gpaw`` (default 48; real TDX uses 48 or 52),
@@ -150,4 +159,4 @@ Memory encryption and host/guest isolation of any kind; SEPT and private-memory
 attributes (``guest_memfd`` requires KVM, so the TD uses plain RAM); TDVF and
 the TD reset vector; AP bring-up via ``TDG.VP.ENTER``; MMIO reflection
 (``EPT_VIOLATION``); ``TDG.VP.CPUIDVE.SET``; ``TDG.SYS.*``; ``TDG.SERVTD.*``;
-``TDVMCALL<Instruction.*>`` service routines; and quoting.
+and quoting.
