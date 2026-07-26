@@ -177,6 +177,7 @@ typedef struct DisasContext {
 #define SVME(S)   false
 #define GUEST(S)  false
 #define TDX(S)    false
+#define SNP(S)    false
 #else
 #define PE(S)     (((S)->flags & HF_PE_MASK) != 0)
 #define CPL(S)    ((S)->cpl)
@@ -184,6 +185,7 @@ typedef struct DisasContext {
 #define SVME(S)   (((S)->flags & HF_SVME_MASK) != 0)
 #define GUEST(S)  (((S)->flags & HF_GUEST_MASK) != 0)
 #define TDX(S)    (((S)->flags & HF_TDX_MASK) != 0)
+#define SNP(S)    (((S)->flags & HF_SNP_MASK) != 0)
 #endif
 #if defined(CONFIG_USER_ONLY) && defined(TARGET_X86_64)
 #define VM86(S)   false
@@ -3521,6 +3523,7 @@ static void i386_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)
     g_assert(SVME(dc) == ((flags & HF_SVME_MASK) != 0));
     g_assert(GUEST(dc) == ((flags & HF_GUEST_MASK) != 0));
     g_assert(TDX(dc) == ((flags & HF_TDX_MASK) != 0));
+    g_assert(SNP(dc) == ((flags & HF_SNP_MASK) != 0));
 
     dc->cc_op = CC_OP_DYNAMIC;
     dc->cc_op_dirty = false;

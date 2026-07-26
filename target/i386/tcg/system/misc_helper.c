@@ -27,6 +27,7 @@
 #include "system/memory.h"
 #include "exec/cputlb.h"
 #include "tcg/helper-tcg.h"
+#include "snp.h"
 #include "hw/i386/apic.h"
 
 void helper_outb(CPUX86State *env, uint32_t port, uint32_t data)
@@ -203,6 +204,20 @@ void helper_wrmsr(CPUX86State *env)
         env->pkrs = val;
         tlb_flush(cs);
         break;
+    case MSR_AMD64_SEV:
+        /*
+         * SEV_STATUS is read-only.  Faulting is more useful than silently
+         * accepting a write a real CPU would reject.
+         */
+        if (env_archcpu(env)->sev_snp_guest) {
+            goto error;
+        }
+        break;
+    case MSR_AMD64_SEV_ES_GHCB:
+        if (env_archcpu(env)->sev_snp_guest) {
+            env->snp_ghcb_msr = val;
+        }
+        break;
     case MSR_VM_HSAVE_PA:
         if (val & (0xfff | ((~0ULL) << env_archcpu(env)->phys_bits))) {
             goto error;
@@ -358,6 +373,16 @@ void helper_rdmsr(CPUX86State *env)
         break;
     case MSR_IA32_PKRS:
         val = env->pkrs;
+        break;
+    case MSR_AMD64_SEV:
+        /* SEV | SEV-ES | SEV-SNP.  Zero for a non-SNP guest, as before. */
+        val = env_archcpu(env)->sev_snp_guest
+              ? (MSR_AMD64_SEV_ENABLED | MSR_AMD64_SEV_ES_ENABLED |
+                 MSR_AMD64_SEV_SNP_ENABLED)
+              : 0;
+        break;
+    case MSR_AMD64_SEV_ES_GHCB:
+        val = env_archcpu(env)->sev_snp_guest ? env->snp_ghcb_msr : 0;
         break;
     case MSR_VM_HSAVE_PA:
         val = env->vm_hsave;

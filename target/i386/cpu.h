@@ -187,6 +187,8 @@ typedef enum X86Seg {
 #define HF_UMIP_SHIFT       27 /* CR4.UMIP */
 #define HF_AVX_EN_SHIFT     28 /* AVX Enabled (CR4+XCR0) */
 #define HF_TDX_SHIFT        29 /* emulated TDX guest (TCG only, x-tdx-guest) */
+#define HF_SNP_SHIFT        30 /* emulated SEV-SNP guest (TCG, x-sev-snp-guest) */
+/* Bit 30 is the last usable one: the HF_*_MASK family uses a signed 1 << N. */
 
 #define HF_CPL_MASK          (3 << HF_CPL_SHIFT)
 #define HF_INHIBIT_IRQ_MASK  (1 << HF_INHIBIT_IRQ_SHIFT)
@@ -215,6 +217,7 @@ typedef enum X86Seg {
 #define HF_UMIP_MASK         (1 << HF_UMIP_SHIFT)
 #define HF_AVX_EN_MASK       (1 << HF_AVX_EN_SHIFT)
 #define HF_TDX_MASK          (1 << HF_TDX_SHIFT)
+#define HF_SNP_MASK          (1 << HF_SNP_SHIFT)
 
 /* hflags2 */
 
@@ -1508,6 +1511,7 @@ uint64_t x86_cpu_get_supported_feature_word(X86CPU *cpu, FeatureWord w);
 #define EXCP13_XMERR    19
 #define EXCP14_VE       20 /* virtualization exception (emulated TDX guest) */
 #define EXCP15_CP       21
+#define EXCP1D_VC       29 /* VMM communication (emulated SEV-SNP) */
 
 #define EXCP_VMEXIT     0x100 /* only for system emulation */
 #define EXCP_SYSCALL    0x101 /* only for user emulation */
@@ -2232,6 +2236,9 @@ typedef struct CPUArchState {
     uint32_t tdx_ve_instr_info;
     bool tdx_ve_valid;
 
+    /* Emulated SEV-SNP: the GHCB MSR protocol register.  Cleared on reset. */
+    uint64_t snp_ghcb_msr;
+
     /* Fields up to this point are cleared by a CPU reset */
     struct {} end_reset_fields;
 
@@ -2549,6 +2556,21 @@ struct ArchCPU {
     bool tdx_ve_cpuid;
     bool tdx_ve_hlt;
     bool tdx_ve_mmio;
+
+    /*
+     * Experimental TCG-only emulation of the AMD SEV-SNP *guest* ABI.  As with
+     * the TDX side this is not SEV-SNP: no memory encryption, no RMP enforced
+     * by hardware, no attestation.  Unlike TDX the #VC classes are enabled by
+     * default and switched off individually, because a real SNP guest takes
+     * #VC on all of them and there is no working baseline to preserve.
+     */
+    bool sev_snp_guest;
+    bool sev_snp_relax_io;
+    bool sev_snp_relax_msr;
+    bool sev_snp_relax_cpuid;
+    bool sev_snp_relax_hlt;
+    uint8_t sev_snp_cbitpos;
+    uint32_t sev_snp_vc_mask;
     uint8_t tdx_gpaw;
     uint64_t tdx_attributes;
     /* Derived from the x-tdx-ve-* properties at realize; see TDX_VE_*. */

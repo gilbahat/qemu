@@ -26,6 +26,7 @@
 #include "tcg/helper-tcg.h"
 /* Emulated TDX guest (TCG); unrelated to kvm/tdx.h, which drives real TDX. */
 #include "tcg/system/tdx.h"
+#include "tcg/system/snp.h"
 #include "exec/translation-block.h"
 #include "system/hvf.h"
 #include "system/mshv.h"
@@ -9310,6 +9311,15 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
             *eax |= sev_snp_enabled() ? 0x10 : 0;
             *ebx = sev_get_cbit_position() & 0x3f; /* EBX[5:0] */
             *ebx |= (sev_get_reduced_phys_bits() & 0x3f) << 6; /* EBX[11:6] */
+        } else if (cpu->sev_snp_guest) {
+            /*
+             * The emulated SNP guest.  The branch above is dead under TCG:
+             * sev_enabled() is a literal 0 when CONFIG_SEV is off, which it
+             * always is without KVM.
+             */
+            *eax = SNP_CPUID_SEV | SNP_CPUID_SEV_ES | SNP_CPUID_SEV_SNP;
+            *ebx = cpu->sev_snp_cbitpos & 0x3f;   /* EBX[5:0]  C-bit position */
+            *ebx |= 1U << 6;                      /* EBX[11:6] one bit lost   */
         }
         break;
     case 0x80000021:
@@ -9422,6 +9432,9 @@ static void x86_cpu_reset_hold(Object *obj, ResetType type)
      */
     if (cpu->tdx_guest) {
         env->hflags |= HF_TDX_MASK;
+    }
+    if (cpu->sev_snp_guest) {
+        env->hflags |= HF_SNP_MASK;
     }
 #endif
 
@@ -9886,7 +9899,7 @@ void x86_cpu_expand_features(X86CPU *cpu, Error **errp)
     }
 
     /* SEV requires CPUID[0x8000001F] */
-    if (sev_enabled()) {
+    if (sev_enabled() || cpu->sev_snp_guest) {
         x86_cpu_adjust_level(cpu, &env->cpuid_min_xlevel, 0x8000001F);
     }
 
@@ -10158,6 +10171,62 @@ static void x86_cpu_realizefn(DeviceState *dev, Error **errp)
         warn_report("x-tdx-guest is an EXPERIMENTAL TCG emulation of the "
                     "Intel TDX *guest* ABI. There is no memory encryption, "
                     "no measured launch and NO GENUINE ATTESTATION. Do not "
+                    "rely on it for any security property.");
+#endif
+    }
+
+    if (cpu->sev_snp_guest) {
+#ifndef TARGET_X86_64
+        error_setg(errp, "x-sev-snp-guest requires a 64-bit x86 target");
+        return;
+#else
+        if (!tcg_enabled()) {
+            error_setg(errp, "x-sev-snp-guest emulates the SEV-SNP guest ABI "
+                       "in TCG and is only supported with -accel tcg; for real "
+                       "SEV-SNP use -object sev-snp-guest with KVM");
+            return;
+        }
+        if (cpu->tdx_guest) {
+            error_setg(errp, "x-sev-snp-guest and x-tdx-guest are mutually "
+                       "exclusive");
+            return;
+        }
+        /*
+         * The C-bit must stay inside PG_ADDRESS_MASK (bits 12..51), or it
+         * would collide with PG_HI_USER_MASK/PG_PKRU_MASK rather than being a
+         * page-table address bit.  Real hardware uses 47 or 51.
+         */
+        if (cpu->sev_snp_cbitpos < 32 || cpu->sev_snp_cbitpos > 51) {
+            error_setg(errp, "x-sev-snp-cbitpos must be in [32,51] "
+                       "(real hardware uses 47 or 51)");
+            return;
+        }
+        /*
+         * Keep phys_bits == cbitpos + 1 so the C-bit is the topmost address
+         * bit.  The page-table walker computes its reserved-bit mask as
+         * ~MAKE_64BIT_MASK(0, phys_bits) & PG_ADDRESS_MASK, so this invariant
+         * keeps the C-bit out of that mask for any cbitpos, and the walker's
+         * mask computation needs no change at all.  Must happen before the
+         * phys_bits default below.
+         */
+        if (cpu->phys_bits == 0) {
+            cpu->phys_bits = cpu->sev_snp_cbitpos + 1;
+        } else if (cpu->phys_bits <= cpu->sev_snp_cbitpos) {
+            error_setg(errp, "phys-bits (%u) must exceed x-sev-snp-cbitpos "
+                       "(%u), otherwise the C-bit aliases a real address bit",
+                       cpu->phys_bits, cpu->sev_snp_cbitpos);
+            return;
+        }
+
+        cpu->sev_snp_vc_mask = SNP_VC_ALL
+                             & ~(cpu->sev_snp_relax_io ? SNP_VC_IO : 0)
+                             & ~(cpu->sev_snp_relax_msr ? SNP_VC_MSR : 0)
+                             & ~(cpu->sev_snp_relax_cpuid ? SNP_VC_CPUID : 0)
+                             & ~(cpu->sev_snp_relax_hlt ? SNP_VC_HLT : 0);
+
+        warn_report("x-sev-snp-guest is an EXPERIMENTAL TCG emulation of the "
+                    "AMD SEV-SNP *guest* ABI. There is no memory encryption, "
+                    "no RMP enforced by hardware and NO ATTESTATION. Do not "
                     "rely on it for any security property.");
 #endif
     }
@@ -10943,6 +11012,19 @@ static const Property x86_cpu_properties[] = {
     DEFINE_PROP_BOOL("x-tdx-ve-cpuid", X86CPU, tdx_ve_cpuid, false),
     DEFINE_PROP_BOOL("x-tdx-ve-hlt", X86CPU, tdx_ve_hlt, false),
     DEFINE_PROP_BOOL("x-tdx-ve-mmio", X86CPU, tdx_ve_mmio, false),
+
+    /*
+     * Experimental TCG-only emulation of the AMD SEV-SNP guest ABI.  The #VC
+     * classes are on by default and relaxed individually -- the inverse of the
+     * TDX knobs, because a real SNP guest takes #VC on all of them.
+     */
+    DEFINE_PROP_BOOL("x-sev-snp-guest", X86CPU, sev_snp_guest, false),
+    DEFINE_PROP_UINT8("x-sev-snp-cbitpos", X86CPU, sev_snp_cbitpos, 51),
+    DEFINE_PROP_BOOL("x-sev-snp-relax-io", X86CPU, sev_snp_relax_io, false),
+    DEFINE_PROP_BOOL("x-sev-snp-relax-msr", X86CPU, sev_snp_relax_msr, false),
+    DEFINE_PROP_BOOL("x-sev-snp-relax-cpuid", X86CPU, sev_snp_relax_cpuid,
+                     false),
+    DEFINE_PROP_BOOL("x-sev-snp-relax-hlt", X86CPU, sev_snp_relax_hlt, false),
 };
 
 #ifndef CONFIG_USER_ONLY
