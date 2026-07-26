@@ -128,6 +128,9 @@
  * way TDX reuses the VMX exit reasons.
  */
 
+/* SHA-384, as the AMD-SP uses for the launch measurement. */
+#define SNP_MEASUREMENT_LEN             48
+
 /*
  * RMP-lite modes, selected by x-sev-snp-rmp.
  *

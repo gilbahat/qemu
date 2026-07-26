@@ -66,6 +66,7 @@ sev-snp-cbit: CFLAGS+=-mgeneral-regs-only
 sev-snp-strict: CFLAGS+=-mgeneral-regs-only
 sev-snp-dma: CFLAGS+=-mgeneral-regs-only
 tdx-sept: CFLAGS+=-mgeneral-regs-only
+tdx-attest: CFLAGS+=-mgeneral-regs-only
 tdx-strict: CFLAGS+=-mgeneral-regs-only
 tdx-dma: CFLAGS+=-mgeneral-regs-only
 
@@ -76,6 +77,7 @@ QEMU_OPTS+=$(X64_SYSTEM_OPTS) -kernel
 
 # The emulated TDX guest interface is off unless asked for.
 run-tdx: QEMU_OPTS=-cpu max,x-tdx-guest=on $(X64_SYSTEM_OPTS) -kernel
+run-tdx-attest: QEMU_OPTS=-cpu max,x-tdx-guest=on $(X64_SYSTEM_OPTS) -kernel
 
 # Page state in lazy mode: pages start accepted, so the test's own memory keeps
 # working while the pages under test are converted.  I/O is relaxed because the

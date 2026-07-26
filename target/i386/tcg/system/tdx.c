@@ -24,6 +24,7 @@
 #include "exec/target_page.h"
 #include "qemu/lockable.h"
 #include "exec/cputlb.h"
+#include "system/system.h"
 #include "system/reset.h"
 #include "tdx.h"
 
@@ -143,6 +144,72 @@ static const VMStateDescription vmstate_tdx_tcg = {
  * would make a reset loop report nonsense, so drop it here.  The measurement
  * registers go too, for the same reason.
  */
+static bool tdx_sha384(const struct iovec *iov, size_t niov, uint8_t *out);
+static TdxTcgState *tdx_get_state(void);
+
+/*
+ * MRTD: the measurement of the launch image.
+ *
+ * Hardware builds this from the TDH.MEM.PAGE.ADD and TDH.MR.EXTEND sequence the
+ * VMM performs, then seals it with TDH.MR.FINALIZE.  There is no such sequence
+ * here -- a -kernel boot places the payload with the ordinary loader -- so this
+ * hashes the launch image as loaded instead: for every page of guest RAM that
+ * belongs to a loaded image, the GPA followed by the page contents, in address
+ * order.  Including the GPA makes it position-sensitive, which is the property
+ * hardware's page-add sequence has and the reason it is worth having.
+ *
+ * It is therefore **not** the MRTD a real TD would report for the same payload,
+ * and must not be compared against one.  What it does give a guest is a root
+ * measurement that is stable across boots and changes when the payload changes,
+ * which is what an attestation flow can actually be tested against.
+ *
+ * Read through rom_ptr() rather than from guest memory, so the value is of the
+ * pristine image no matter what the guest has since written.
+ */
+static void tdx_compute_mrtd(Notifier *n, void *unused)
+{
+    TdxTcgState *td = tdx_get_state();
+    ram_addr_t ram_size = current_machine->ram_size;
+    g_autoptr(GByteArray) buf = g_byte_array_new();
+    struct iovec iov;
+    hwaddr gpa;
+    unsigned pages = 0;
+
+    for (gpa = 0; gpa < ram_size; gpa += TARGET_PAGE_SIZE) {
+        void *p = rom_ptr(gpa, TARGET_PAGE_SIZE);
+        uint64_t le_gpa;
+
+        if (!p) {
+            continue;
+        }
+        le_gpa = cpu_to_le64(gpa);
+        g_byte_array_append(buf, (const uint8_t *)&le_gpa, sizeof(le_gpa));
+        g_byte_array_append(buf, p, TARGET_PAGE_SIZE);
+        pages++;
+    }
+
+    QEMU_LOCK_GUARD(&td->lock);
+    if (!pages) {
+        /*
+         * Nothing was loaded, so there is nothing to measure.  Leave MRTD zero
+         * and say so: a report over an empty launch image is not interesting,
+         * and silently reporting zeros as a measurement would be worse.
+         */
+        warn_report("tdx: no launch image found to measure; MRTD stays zero");
+        return;
+    }
+    iov.iov_base = buf->data;
+    iov.iov_len = buf->len;
+    if (!tdx_sha384(&iov, 1, td->mrtd)) {
+        warn_report("tdx: failed to compute MRTD; it stays zero");
+        return;
+    }
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "tdx: MRTD computed over %u launch pages\n", pages);
+}
+
+static Notifier tdx_machine_done = { .notify = tdx_compute_mrtd };
+
 static void tdx_reset(void *opaque)
 {
     TdxTcgState *s = opaque;
@@ -151,7 +218,11 @@ static void tdx_reset(void *opaque)
     if (s->sept) {
         g_hash_table_remove_all(s->sept);
     }
-    memset(s->mrtd, 0, sizeof(s->mrtd));
+    /*
+     * MRTD is kept: it measures the launch image, which a reset does not
+     * change, and the machine-init-done notifier that computes it runs only
+     * once.  The RTMRs are runtime measurements and do go.
+     */
     memset(s->rtmr, 0, sizeof(s->rtmr));
     s->ve_armed = false;
 }
@@ -163,6 +234,7 @@ static TdxTcgState *tdx_get_state(void)
         qemu_mutex_init(&tdx_state->lock);
         vmstate_register(NULL, 0, &vmstate_tdx_tcg, tdx_state);
         qemu_register_reset(tdx_reset, tdx_state);
+        qemu_add_machine_init_done_notifier(&tdx_machine_done);
     }
     return tdx_state;
 }

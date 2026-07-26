@@ -24,6 +24,9 @@
 #include "exec/target_page.h"
 #include "svm.h"
 #include "tcg/helper-tcg.h"
+#include "crypto/hash.h"
+#include "hw/core/boards.h"
+#include "system/system.h"
 #include "snp.h"
 #include "hw/i386/snp-dma.h"
 
@@ -49,6 +52,13 @@ typedef struct SnpTcgState {
      * frame numbers.
      */
     GHashTable *rmp;
+
+    /*
+     * The launch measurement -- the SNP analogue of MRTD, and what an
+     * ATTESTATION_REPORT's MEASUREMENT field carries.  Computed once,
+     * before the guest runs.
+     */
+    uint8_t measurement[SNP_MEASUREMENT_LEN];
 
     /* Flattened form of rmp, live only across a migration. */
     uint32_t rmp_count;
@@ -107,12 +117,13 @@ static int snp_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_snp_tcg = {
     .name = "sev-snp-tcg",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .pre_save = snp_pre_save,
     .post_load = snp_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_BOOL(vc_armed, SnpTcgState),
+        VMSTATE_UINT8_ARRAY(measurement, SnpTcgState, SNP_MEASUREMENT_LEN),
         VMSTATE_UINT32(rmp_count, SnpTcgState),
         VMSTATE_VARRAY_UINT32_ALLOC(rmp_pfn, SnpTcgState, rmp_count, 0,
                                     vmstate_info_uint64, uint64_t),
@@ -122,12 +133,79 @@ static const VMStateDescription vmstate_snp_tcg = {
     }
 };
 
+static SnpTcgState *snp_get_state(void);
+
+/*
+ * The launch measurement.
+ *
+ * On hardware the AMD-SP computes this over the SNP_LAUNCH_UPDATE sequence and
+ * seals it at SNP_LAUNCH_FINISH.  There is no such sequence here -- a -kernel
+ * boot places the payload with the ordinary loader -- so this hashes the launch
+ * image as loaded: for every page of guest RAM belonging to a loaded image, the
+ * GPA followed by the page contents, in address order.  The GPA makes it
+ * position-sensitive, which is the property the hardware sequence has.
+ *
+ * It is therefore **not** the measurement a real SNP guest would report for the
+ * same payload and must not be compared against one.  What it gives a guest
+ * is a root measurement stable across boots that changes when the payload
+ * changes -- the part of an attestation flow that can actually be tested.
+ *
+ * Read through rom_ptr(), so the value is of the pristine image whatever the
+ * guest has since written.  Deliberately the same construction as the emulated
+ * TDX MRTD, so the two are comparable to anyone reading both.
+ */
+static void snp_compute_measurement(Notifier *n, void *unused)
+{
+    SnpTcgState *s = snp_get_state();
+    ram_addr_t ram_size = current_machine->ram_size;
+    g_autoptr(GByteArray) buf = g_byte_array_new();
+    hwaddr gpa;
+    unsigned pages = 0;
+
+    for (gpa = 0; gpa < ram_size; gpa += TARGET_PAGE_SIZE) {
+        void *p = rom_ptr(gpa, TARGET_PAGE_SIZE);
+        uint64_t le_gpa;
+
+        if (!p) {
+            continue;
+        }
+        le_gpa = cpu_to_le64(gpa);
+        g_byte_array_append(buf, (const uint8_t *)&le_gpa, sizeof(le_gpa));
+        g_byte_array_append(buf, p, TARGET_PAGE_SIZE);
+        pages++;
+    }
+
+    QEMU_LOCK_GUARD(&s->lock);
+    if (!pages) {
+        warn_report("sev-snp: no launch image found to measure; the launch "
+                    "measurement stays zero");
+        return;
+    }
+    {
+        struct iovec iov = { .iov_base = buf->data, .iov_len = buf->len };
+        uint8_t *out = s->measurement;
+        size_t outlen = sizeof(s->measurement);
+
+        if (qcrypto_hash_bytesv(QCRYPTO_HASH_ALGO_SHA384, &iov, 1, &out,
+                                &outlen, NULL) < 0) {
+            warn_report("sev-snp: failed to compute the launch measurement");
+            return;
+        }
+    }
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "sev-snp: launch measurement computed over %u pages\n",
+                  pages);
+}
+
+static Notifier snp_machine_done = { .notify = snp_compute_measurement };
+
 static SnpTcgState *snp_get_state(void)
 {
     if (!snp_state) {
         snp_state = g_new0(SnpTcgState, 1);
         qemu_mutex_init(&snp_state->lock);
         vmstate_register(NULL, 0, &vmstate_snp_tcg, snp_state);
+        qemu_add_machine_init_done_notifier(&snp_machine_done);
     }
     return snp_state;
 }
