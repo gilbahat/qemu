@@ -31,6 +31,7 @@ Architectural features
    i386/kvm-pv
    i386/sgx
    i386/amd-memory-encryption
+   i386/amd-sev-snp-tcg
    i386/tdx
    i386/tdx-tcg
 

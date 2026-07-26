@@ -27,6 +27,12 @@ support for notifying a guest's operating system when certain types of VMEXITs
 are about to occur. This allows the guest to selectively share information with
 the hypervisor to satisfy the requested function.
 
+This document describes real SEV, which requires KVM and SEV-capable hardware.
+QEMU also has a separate, experimental, TCG-only *emulation* of the
+guest-visible SEV-SNP interface, enabled with ``-cpu ...,x-sev-snp-guest=on``;
+it is unrelated to anything below, enforces no security properties whatsoever,
+and is documented in :doc:`amd-sev-snp-tcg`.
+
 Launching (SEV and SEV-ES)
 --------------------------
 

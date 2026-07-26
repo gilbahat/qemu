@@ -1,0 +1,147 @@
+Emulated AMD SEV-SNP guest (TCG)
+================================
+
+.. warning::
+   This is **not** AMD SEV-SNP. It is an emulation of the guest-visible SEV-SNP
+   interface under TCG, intended for developing and testing SNP guest software
+   without SEV hardware. It provides **no memory encryption**, no RMP enforced
+   by hardware, no isolation from the host or from QEMU, no measured launch, and
+   **no attestation**. Do not rely on it for any security property.
+
+For real SEV-SNP, which requires KVM and SEV-capable hardware, see
+:doc:`amd-memory-encryption` and the ``sev-snp-guest`` object. The two are
+unrelated: that one is a launch mechanism driven through the AMD-SP, this one is
+a CPU property that models what the guest sees and enforces nothing.
+
+The status of this support is experimental. It is enabled by the CPU property
+``x-sev-snp-guest``, with the ``x-`` prefix present as a reminder of the
+experimental status, and defaults off. The way it is enabled, and the properties
+described here, may change or be removed in a future QEMU release without notice
+or backward compatibility.
+
+Usage
+-----
+
+.. parsed-literal::
+
+  |qemu_system_x86| -accel tcg -cpu max,x-sev-snp-guest=on \\
+                    -kernel snp-payload.elf
+
+The guest then sees ``CPUID.0x8000001F`` reporting SEV, SEV-ES and SEV-SNP with
+the C-bit position in EBX[5:0]; ``MSR_AMD64_SEV`` (SEV_STATUS), read-only;
+``MSR_AMD64_SEV_ES_GHCB`` for the GHCB MSR protocol; ``VMGEXIT``; ``PVALIDATE``;
+and ``#VC`` on the instruction classes hardware intercepts.
+
+Reflection is faithful by default
+---------------------------------
+
+Unlike the TDX emulation, whose ``#VE`` classes are off until asked for, the
+``#VC`` classes here are **on by default** and switched off individually:
+
+``x-sev-snp-relax-io``, ``x-sev-snp-relax-msr``, ``x-sev-snp-relax-cpuid``, ``x-sev-snp-relax-hlt``
+  Stop reflecting that class.
+
+The polarity is deliberate. A real SNP guest takes ``#VC`` on all of them, and
+unlike TDX there is no working baseline to preserve — a guest that has never run
+under SNP is not going to boot regardless, so the default should describe
+hardware rather than flatter the guest.
+
+Two carve-outs keep this a usable signal rather than a brick wall, and both
+match hardware. MSRs used for ordinary long-mode and TLS setup are handled
+natively, as are the two SEV MSRs — reflecting the GHCB MSR would make the MSR
+protocol recurse forever. ``CPUID`` leaves 0, ``0x80000000`` and ``0x8000001F``
+always answer natively, or a guest could never discover it is an SNP guest, nor
+read the C-bit it needs before it can map a GHCB.
+
+When reflection starts
+~~~~~~~~~~~~~~~~~~~~~~
+
+Reflection is armed by the guest's first ``PVALIDATE``.
+
+A direct ``-kernel`` boot runs ordinary, SNP-unaware firmware as a loader shim,
+and that firmware performs port I/O and ``CPUID`` of its own long before the
+payload runs — so reflecting from reset would fault inside the firmware and
+never reach the guest under test. ``PVALIDATE`` is the natural trigger: it is an
+SNP-only instruction, ``#UD`` everywhere else, needs no GHCB or handler to
+execute, and is what a real SNP guest does first anyway. A guest that never
+executes one never sees ``#VC``.
+
+A ``#VC`` raised while the GHCB MSR still holds an unconsumed request escalates
+to ``#DF``. That is not architectural — hardware relies on an IST stack and a
+per-CPU GHCB backup — but servicing the second exception would clobber the
+first's request, and silent corruption is the worst outcome for a development
+tool. Every injection is logged under ``-d guest_errors``.
+
+The GHCB
+--------
+
+Both protocols are implemented.
+
+The **MSR protocol** on ``MSR_AMD64_SEV_ES_GHCB`` is the only channel before a
+GHCB page exists: write a request, execute ``VMGEXIT``, read the response from
+the same register. SEV information, CPUID, preferred GHCB GPA, register GHCB
+GPA, page-state change, hypervisor features and termination are handled. The SEV
+information response carries the C-bit position in bits [31:24], which is how a
+guest learns it before it can run ``CPUID``. Termination stops the VM with the
+guest's reason reported, rather than letting it reset into a loop.
+
+The **page protocol** dispatches the NAE event named by ``SW_EXITCODE`` in a
+registered GHCB: ``SVM_EXIT_IOIO``, ``SVM_EXIT_CPUID``, ``SVM_EXIT_MSR`` and
+``SVM_EXIT_HLT``. Validity is enforced in both directions — an event whose
+required inputs are not marked valid in the bitmap at offset 0x3F0 is refused,
+and every field written has its valid bit set.
+
+Properties
+----------
+
+``x-sev-snp-guest=on|off``
+  Enable the emulated SNP guest environment. TCG and 64-bit only, and mutually
+  exclusive with ``x-tdx-guest``.
+
+``x-sev-snp-cbitpos=N``
+  C-bit position, in [32,51]; default 51. Real hardware uses 47 or 51. Above 51
+  the bit would leave ``PG_ADDRESS_MASK`` and collide with other page-table
+  fields.
+
+  Enabling the property also sets ``phys_bits`` to ``cbitpos + 1`` unless the
+  user set it explicitly, in which case it must exceed the C-bit position. That
+  invariant makes the C-bit the topmost physical address bit, so the page-table
+  walker's reserved-bit mask never covers it and the walker needs no special
+  case. It does mean an SNP guest sees a different ``CPUID.0x80000008`` width
+  than the same ``-cpu`` model without the property.
+
+Not modelled
+------------
+
+Memory encryption and isolation of any kind; the RMP, so ``PVALIDATE`` validates
+its operands and reports success without tracking page state, and page-state
+changes are accepted without effect; the C-bit in page tables, which is accepted
+as an address bit but carries no meaning; ``RMPADJUST``, ``RMPQUERY``,
+``PSMASH``; VMPLs and ``SNP_AP_CREATE``; MMIO reflection; string I/O over the
+GHCB shared buffer; and attestation — there is no secrets page, no VMPCK, and
+no ``SNP_GUEST_REQUEST``.
+
+Testing
+-------
+
+``tests/tcg/x86_64/system/`` contains four freestanding tests, run with
+``make run-tcg-tests-x86_64-softmmu``:
+
+``sev-snp``
+  Detection: the CPUID leaf, the reported C-bit and reduction, both MSRs, and
+  the ``phys_bits`` invariant read back from inside the guest.
+
+``sev-snp-vc``
+  ``#VC`` reflection, with an IDT and a handler: that nothing reflects before
+  arming, that each class arrives with the right ``SW_EXITCODE``, that the
+  carve-outs stay native, and that a nested request escalates to ``#DF``.
+
+``sev-snp-ghcb``
+  The MSR protocol, cross-checking the C-bit against ``CPUID.0x8000001F`` and
+  each CPUID register against the native instruction.
+
+``sev-snp-nae``
+  The page protocol, in the configuration a real guest runs in: reflection
+  armed with no relaxations, and a ``#VC`` handler that services I/O through the
+  GHCB. Its own output and its ACPI poweroff travel over the NAE path, so it
+  could neither report nor exit if that path were broken.
