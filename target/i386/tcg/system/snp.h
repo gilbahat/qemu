@@ -43,6 +43,19 @@
                                          SNP_VC_CPUID | SNP_VC_HLT)
 
 /*
+ * GHCB MSR protocol: the low 12 bits are the info code.  A page-aligned value
+ * with a zero info field is a registered GHCB GPA rather than a request, which
+ * is how an in-flight request is distinguished from an idle register.
+ */
+#define SNP_GHCB_MSR_INFO_MASK          0xfffULL
+
+/* PVALIDATE / RMPADJUST status codes returned in EAX. */
+#define PVALIDATE_SUCCESS               0
+#define PVALIDATE_FAIL_INPUT            1
+#define PVALIDATE_FAIL_PERMISSION       2
+#define PVALIDATE_FAIL_SIZEMISMATCH     6
+
+/*
  * The #VC error code is the GHCB SW_EXITCODE, which for non-automatic exits is
  * the SVM exit code -- so target/i386/svm.h supplies these directly, the same
  * way TDX reuses the VMX exit reasons.

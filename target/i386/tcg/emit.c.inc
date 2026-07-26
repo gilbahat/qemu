@@ -1911,6 +1911,9 @@ static void gen_CPUID(DisasContext *s, X86DecodedInsn *decode)
     if (TDX(s)) {
         gen_helper_tdx_ve_cpuid(tcg_env, cur_insn_len_i32(s));
     }
+    if (SNP(s)) {
+        gen_helper_snp_vc_cpuid(tcg_env);
+    }
 #endif
     gen_helper_cpuid(tcg_env);
 }
@@ -2067,6 +2070,10 @@ static void gen_HLT(DisasContext *s, X86DecodedInsn *decode)
     if (TDX(s)) {
         gen_update_eip_cur(s);
         gen_helper_tdx_ve_hlt(tcg_env, cur_insn_len_i32(s));
+    }
+    if (SNP(s)) {
+        gen_update_eip_cur(s);
+        gen_helper_snp_vc_hlt(tcg_env);
     }
 #endif
     gen_update_eip_next(s);
@@ -3583,6 +3590,9 @@ static void gen_RDMSR(DisasContext *s, X86DecodedInsn *decode)
         gen_helper_tdx_ve_msr(tcg_env, tcg_constant_i32(0),
                               cur_insn_len_i32(s));
     }
+    if (SNP(s)) {
+        gen_helper_snp_vc_msr(tcg_env, tcg_constant_i32(0));
+    }
 #endif
     gen_helper_rdmsr(tcg_env);
 }
@@ -4728,6 +4738,9 @@ static void gen_WRMSR(DisasContext *s, X86DecodedInsn *decode)
     if (TDX(s)) {
         gen_helper_tdx_ve_msr(tcg_env, tcg_constant_i32(1),
                               cur_insn_len_i32(s));
+    }
+    if (SNP(s)) {
+        gen_helper_snp_vc_msr(tcg_env, tcg_constant_i32(1));
     }
 #endif
     gen_helper_wrmsr(tcg_env);

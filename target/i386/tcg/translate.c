@@ -256,6 +256,11 @@ STUB_HELPER(tdx_ve_io, TCGv_env env, TCGv_i32 port, TCGv_i32 qual,
             TCGv_i32 len)
 STUB_HELPER(tdx_ve_msr, TCGv_env env, TCGv_i32 is_write, TCGv_i32 len)
 STUB_HELPER(tdx_ve_cpuid, TCGv_env env, TCGv_i32 len)
+STUB_HELPER(snp_vc_io, TCGv_env env, TCGv_i32 port, TCGv_i32 flags)
+STUB_HELPER(snp_vc_msr, TCGv_env env, TCGv_i32 is_write)
+STUB_HELPER(snp_vc_cpuid, TCGv_env env)
+STUB_HELPER(snp_vc_hlt, TCGv_env env)
+STUB_HELPER(pvalidate, TCGv_env env)
 #endif
 STUB_HELPER(vmrun, TCGv_env env, TCGv_i32 aflag, TCGv_i32 pc_ofs)
 STUB_HELPER(vmsave, TCGv_env env, TCGv_i32 aflag)
@@ -796,6 +801,21 @@ static bool gen_check_io(DisasContext *s, MemOp ot, TCGv_i32 port,
         gen_update_eip_cur(s);
         gen_helper_tdx_ve_io(tcg_env, port, tcg_constant_i32(qual),
                              cur_insn_len_i32(s));
+    }
+    if (SNP(s)) {
+        /*
+         * SW_EXITINFO1 for SVM_EXIT_IOIO is the SVM IOIO intercept encoding,
+         * which the GUEST(s) path below already builds -- reuse its shape
+         * rather than assembling a second, differently-shaped qualification.
+         */
+        uint32_t snp_flags = svm_flags | (1 << (SVM_IOIO_SIZE_SHIFT + ot));
+
+        if (s->prefix & (PREFIX_REPZ | PREFIX_REPNZ)) {
+            snp_flags |= SVM_IOIO_REP_MASK;
+        }
+        gen_update_cc_op(s);
+        gen_update_eip_cur(s);
+        gen_helper_snp_vc_io(tcg_env, port, tcg_constant_i32(snp_flags));
     }
 #endif
     if (GUEST(s)) {
@@ -3207,6 +3227,24 @@ static void gen_multi0F(DisasContext *s, X86DecodedInsn *decode)
             gen_helper_rdpid(s->T0, tcg_env);
             gen_op_mov_reg_v(s, dflag, R_ECX, s->T0);
             break;
+
+#ifdef TARGET_X86_64
+        case 0xff: /* PVALIDATE (F2 0F 01 FF), emulated SEV-SNP guest */
+            if (!SNP(s) || !CODE64(s) || !(s->prefix & PREFIX_REPNZ)
+                || (s->prefix & (PREFIX_REPZ | PREFIX_DATA))) {
+                goto illegal_op;
+            }
+            if (!check_cpl0(s)) {
+                break;
+            }
+            gen_update_cc_op(s);
+            gen_update_eip_cur(s);
+            gen_helper_pvalidate(tcg_env);
+            /* Writes CF, and may arm reflection, so end the block. */
+            assume_cc_op(s, CC_OP_EFLAGS);
+            s->base.is_jmp = DISAS_EOB_NEXT;
+            break;
+#endif
 
         default:
             goto illegal_op;

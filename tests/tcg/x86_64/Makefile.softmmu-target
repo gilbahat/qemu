@@ -35,6 +35,7 @@ memory: CFLAGS+=-DCHECK_UNALIGNED=1
 # vectorises -- a struct initialiser is enough -- would #UD.
 tdx: CFLAGS+=-mgeneral-regs-only
 sev-snp: CFLAGS+=-mgeneral-regs-only
+sev-snp-vc: CFLAGS+=-mgeneral-regs-only
 
 # Running
 X64_SYSTEM_OPTS=-device isa-debugcon,chardev=output \
@@ -44,6 +45,10 @@ QEMU_OPTS+=$(X64_SYSTEM_OPTS) -kernel
 # The emulated TDX guest interface is off unless asked for.
 run-tdx: QEMU_OPTS=-cpu max,x-tdx-guest=on $(X64_SYSTEM_OPTS) -kernel
 run-sev-snp: QEMU_OPTS=-cpu max,x-sev-snp-guest=on $(X64_SYSTEM_OPTS) -kernel
+# I/O is relaxed: a handler with no GHCB cannot service it, and both the test's
+# output and its exit are port I/O.  See the comment in sev-snp-vc.c.
+run-sev-snp-vc: QEMU_OPTS=-cpu max,x-sev-snp-guest=on,x-sev-snp-relax-io=on \
+                $(X64_SYSTEM_OPTS) -kernel
 
 ifeq ($(CONFIG_PLUGIN),y)
 run-plugin-patch-target-with-libpatch.so:		\
