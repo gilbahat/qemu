@@ -27,14 +27,17 @@
 #include "hw/virtio/virtio-pci.h"
 #include "system/memory.h"
 #include "target/i386/cpu.h"
+#include "target/i386/tcg/system/tdx.h"
 
 #define TYPE_TDX_DMA_MEMORY_REGION "tdx-dma-iommu-memory-region"
 
 typedef struct TdxDmaState {
     IOMMUMemoryRegion iommu;
     AddressSpace as;
+    X86CPU *cpu;
     uint64_t shared_mask;
     bool warned;
+    bool warned_unconverted;
 } TdxDmaState;
 
 static TdxDmaState *tdx_dma_state;
@@ -90,13 +93,37 @@ static IOMMUTLBEntry tdx_dma_translate(IOMMUMemoryRegion *iommu_mr, hwaddr addr,
                               ~(hwaddr)TARGET_PAGE_MASK_TDX;
         ret.perm = IOMMU_RW;
     } else if (addr & s->shared_mask) {
+        hwaddr gpa = (addr & ~s->shared_mask) & ~(hwaddr)TARGET_PAGE_MASK_TDX;
+
+        /*
+         * The SHARED alias is necessary but not sufficient.  Testing only the
+         * address bit would let a TD that never issued TDVMCALL<MapGPA> pass
+         * here and fail on hardware, where the alias is not mapped until the
+         * conversion happens -- so ask the page state when there is one.
+         */
+        if (tdx_sept_enabled(&s->cpu->env) &&
+            !tdx_sept_gpa_is_shared(&s->cpu->env, gpa)) {
+            if (!s->warned_unconverted) {
+                s->warned_unconverted = true;
+                warn_report("tdx: device DMA to GPA 0x%" HWADDR_PRIx " denied: "
+                            "the address carries the SHARED alias but the TD "
+                            "never converted the page with TDVMCALL<MapGPA>. "
+                            "Setting the bit is not enough; on hardware the "
+                            "shared mapping does not exist until the "
+                            "conversion is made.", addr);
+            }
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "tdx: DMA denied, GPA 0x%" HWADDR_PRIx " has the "
+                          "SHARED alias but was never converted\n", addr);
+            return ret;
+        }
+
         /*
          * Shared: strip the alias bit and let the access through to system
          * memory.  There is no encryption to undo -- the alias is the whole of
          * what "shared" means in this model.
          */
-        ret.translated_addr = (addr & ~s->shared_mask) &
-                              ~(hwaddr)TARGET_PAGE_MASK_TDX;
+        ret.translated_addr = gpa;
         ret.perm = IOMMU_RW;
     } else {
         tdx_dma_report_denied(s, addr);
@@ -161,6 +188,7 @@ void tdx_dma_setup(PCIBus *bus)
                                false);
 
     s = g_new0(TdxDmaState, 1);
+    s->cpu = cpu;
     s->shared_mask = 1ULL << (cpu->tdx_gpaw - 1);
     tdx_dma_state = s;
 

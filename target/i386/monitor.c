@@ -31,9 +31,11 @@
 #include "qapi/qapi-commands-misc.h"
 #include "system/memory.h"
 #include "tcg/system/snp.h"
+#include "tcg/system/tdx.h"
 
 /*
- * Page-table address bits, minus the emulated SEV-SNP C-bit.  Without this the
+ * Page-table address bits, minus the emulated SEV-SNP C-bit and TDX SHARED
+ * bit.  Without this the
  * monitor would fold the C-bit into the physical addresses it prints, and --
  * worse -- follow poisoned table pointers while walking.  The masks below cover
  * bits 49:12, so at the default C-bit position of 51 they were correct by
@@ -41,17 +43,20 @@
  */
 static inline uint64_t pte_addr_mask(CPUArchState *env)
 {
-    return 0x3fffffffff000ULL & ~snp_cbit_mask(env);
+    return 0x3fffffffff000ULL & ~snp_cbit_mask(env) &
+           ~tdx_shared_mask(env);
 }
 
 static inline uint64_t pde_addr_mask(CPUArchState *env)
 {
-    return 0x3ffffffe00000ULL & ~snp_cbit_mask(env);
+    return 0x3ffffffe00000ULL & ~snp_cbit_mask(env) &
+           ~tdx_shared_mask(env);
 }
 
 static inline uint64_t pdpe_addr_mask(CPUArchState *env)
 {
-    return 0x3ffffc0000000ULL & ~snp_cbit_mask(env);
+    return 0x3ffffc0000000ULL & ~snp_cbit_mask(env) &
+           ~tdx_shared_mask(env);
 }
 
 /* Perform linear address sign extension */

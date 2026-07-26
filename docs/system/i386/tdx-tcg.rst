@@ -104,6 +104,14 @@ moot, but with an emulated TD it is enforced: PCI devices are given an address
 space that maps the shared alias and nothing else, and a DMA to any other
 address is refused and logged under ``-d guest_errors``.
 
+The alias is necessary but not sufficient. With ``x-tdx-sept`` on, the filter
+also asks whether the page was ever converted, and refuses a DMA whose address
+carries the SHARED bit for a page the TD never passed to
+``TDVMCALL<MapGPA>``. Setting a bit is not the same as doing the work; on
+hardware the shared mapping does not exist until the conversion is made. Without
+that second check a guest could satisfy the emulation by decorating its
+addresses.
+
 Without that enforcement the emulation would certify nothing. Private and shared
 are the same RAM under TCG, so a guest that never shares its virtio rings works
 here and fails on hardware — the failure mode this whole model exists to catch.
@@ -181,10 +189,20 @@ Properties
   Enable the emulated TD guest environment. TCG and 64-bit only.
 
 ``x-tdx-gpaw=N``
-  GPAW reported by ``TDG.VP.INFO``, in [32,63]; default 48. The SHARED GPA bit
-  is bit ``N-1``. TCG pins the physical address width to 40 bits, so with the
-  default the SHARED bit lies above the addressable range and is masked off
-  guest-supplied addresses rather than mapped.
+  GPAW reported by ``TDG.VP.INFO``, in [32,52]; default 48. The SHARED GPA bit
+  is bit ``N-1``. Above 52 the bit would leave ``PG_ADDRESS_MASK`` and could not
+  appear in a page-table entry at all.
+
+  Enabling ``x-tdx-guest`` also sets ``phys_bits`` to GPAW unless the user set it
+  explicitly, in which case it must be at least GPAW. Without that invariant the
+  SHARED bit falls inside the walker's reserved-bit mask, and a TD that maps
+  shared memory takes a ``#PF`` on every access to it — which is to say it cannot
+  use shared memory at all. It does mean a TD sees a different
+  ``CPUID.0x80000008`` width than the same ``-cpu`` model without the property.
+
+``x-tdx-sept=0|1|2``
+  Page-state tracking: off, lazy or strict. See `Page state and the SHARED
+  alias`_.
 
 ``x-tdx-attributes=N``
   TD ATTRIBUTES reported by ``TDG.VP.INFO``; default 0. The DEBUG bit (0) is
@@ -193,11 +211,108 @@ Properties
 ``x-tdx-strict=on|off``, ``x-tdx-ve-io``, ``x-tdx-ve-msr``, ``x-tdx-ve-cpuid``, ``x-tdx-ve-hlt``
   Select which instruction classes are reflected as ``#VE``; see above.
 
+Page state and the SHARED alias
+-------------------------------
+
+``x-tdx-sept`` turns on a Secure-EPT-lite: a per-page state of *shared*,
+*private-pending* or *private-accepted*, moved by ``TDVMCALL<MapGPA>`` and
+``TDG.MEM.PAGE.ACCEPT``, and checked on every page-table walk.
+
+``x-tdx-sept=0`` (default)
+  No tracking. ``MapGPA`` and ``PAGE.ACCEPT`` validate their operands and report
+  success without recording anything. The SHARED alias still folds onto the
+  underlying page, so a TD that uses it runs, but nothing is checked.
+
+``x-tdx-sept=1`` (lazy)
+  Pages start accepted, so a TD that has not adopted ``PAGE.ACCEPT`` runs
+  unchanged, and enforcement applies only to pages it explicitly converts.
+
+``x-tdx-sept=2`` (strict)
+  Guest RAM starts private and pending, as the TDX module leaves it after
+  ``TDH.MEM.PAGE.ADD``, with only the launch image accepted. A ``-kernel``
+  payload's ``.bss`` is not part of that image and so starts pending, exactly as
+  on hardware.
+
+Lazy exists because enforcement is otherwise all-or-nothing: under strict, a TD
+that never accepts its memory faults on its first use of the stack. That is the
+truth and it is what a conformance run wants, but it leaves no way to adopt the
+model a page at a time.
+
+Two failures can arise, and unlike the SEV-SNP equivalent both go to the same
+place — an EPT violation reported as ``#VE``, because that is what hardware does:
+
+* A private access to a page the TD has not accepted. This is what tells a guest
+  to issue ``TDG.MEM.PAGE.ACCEPT``.
+* An alias that disagrees with the page's state: the SHARED alias on a page that
+  was never converted, or the private alias on a page that was.
+
+Both set bit 3 of the exit qualification, which is how hardware distinguishes a
+mapping that is not present from an ordinary permission failure.
+
+Because everything arrives as ``#VE``, a handler **must** consume the information
+with ``TDG.VP.VEINFO.GET``. The next ``#VE`` cannot be delivered while the
+previous one is still pending and ``#DF`` is injected instead, so a handler that
+skips it survives exactly one fault. That is modelled here as well.
+
+MMIO is always shared to a TD — there is no private device memory — so device
+BARs must be mapped through the SHARED alias too. A TD that identity-maps its
+BARs privately takes an EPT violation on the first register access.
+
+Page-state changes flush the TLB when they remove access. Accepting only adds
+access, and a pending page can have no cached entry because the fill that would
+have created it faulted, so accepting needs no flush — which matters, as a TD
+accepting 4 GiB performs a million of them.
+
+The SHARED bit is stripped in all four page-table walkers: the TLB-fill one, the
+debug one behind ``x``, gdb and ``cpu_memory_rw_debug()``, the one behind
+``dump-guest-memory``, and the monitor's ``info mem``/``info tlb``.
+
 Not modelled
 ------------
 
-Memory encryption and host/guest isolation of any kind; SEPT and private-memory
-attributes (``guest_memfd`` requires KVM, so the TD uses plain RAM); TDVF and
-the TD reset vector; AP bring-up via ``TDG.VP.ENTER``; MMIO reflection
-(``EPT_VIOLATION``); ``TDG.VP.CPUIDVE.SET``; ``TDG.SYS.*``; ``TDG.SERVTD.*``;
-and quoting.
+Memory encryption and host/guest isolation of any kind; separate backing for the
+private and shared aliases (``guest_memfd`` requires KVM, so both aliases are the
+same RAM here and a conversion moves an attribute rather than any data — on
+hardware it loses the page contents); SEPT page sizes, so a 2 MiB
+``PAGE.ACCEPT`` is refused with ``PAGE_SIZE_MISMATCH``; multi-page ``MapGPA``
+ranges, which convert their first page and return ``RETRY``; TDVF and the TD
+reset vector; AP bring-up via ``TDG.VP.ENTER``; ``TDG.VP.CPUIDVE.SET``;
+``TDG.SYS.*``; ``TDG.SERVTD.*``; and quoting.
+
+Testing
+-------
+
+``tests/tcg/x86_64/system/`` contains four freestanding tests, run with
+``make run-tcg-tests-x86_64-softmmu``:
+
+``tdx``
+  The interface surface: ``CPUID`` identification, ``TDG.VP.INFO``, the
+  measurement calls, and the ``TDVMCALL`` service routines.
+
+``tdx-sept``
+  Page state, in lazy mode. Builds its own page tables so the SHARED alias can
+  actually be mapped — which was impossible before the ``phys_bits`` invariant —
+  and drives the state machine: converting a page and reaching it through the
+  alias, the refusal to accept a shared page, an alias mismatch, and a pending
+  page accepted on demand from the ``#VE`` handler. That handler is directed
+  entirely by ``TDG.VP.VEINFO.GET`` with nothing arranged in advance.
+
+``tdx-dma``
+  Device DMA, driven through the ``edu`` test device's DMA engine, which calls
+  ``pci_dma_read()`` on the guest's behalf — the same path a virtio ring fetch
+  takes, with no driver needed. A converted page reads back correctly; a private
+  page is refused; and so is a page whose address carries the SHARED alias but
+  which was never converted.
+
+``tdx-strict``
+  The same faults with the TDX module's own defaults, and the answer to whether
+  anything can survive strict mode. It links the ``TDX_ACCEPT_BOOT`` variant of
+  ``boot.S``, which accepts ``.bss`` before the stack is used — the one thing TD
+  firmware must do first. Reaching ``main()`` is the result; it then accepts RAM
+  outside the launch image on demand.
+
+  That bootstrap is a build-time variant rather than the default because
+  accepting memory is wrong wherever it is not pending, and a TD has no way to
+  tell which mode it is in — as on hardware, where the question does not arise.
+  Without ``-DTDX_ACCEPT_BOOT`` the object is byte-identical to the one every
+  other test links.

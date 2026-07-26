@@ -169,6 +169,13 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
      */
     const uint64_t cbit = snp_cbit_mask(env);
     bool leaf_c = false;
+    /*
+     * The emulated TDX SHARED bit, handled the same way and for the same
+     * reason.  leaf_shared records whether the guest reached the page through
+     * the SHARED alias, which is what its page state has to agree with.
+     */
+    const uint64_t sbit = tdx_shared_mask(env);
+    bool leaf_shared = false;
 
  restart_all:
     rsvd_mask = ~MAKE_64BIT_MASK(0, env_archcpu(env)->phys_bits);
@@ -184,7 +191,7 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
                 /*
                  * Page table level 5
                  */
-                pte_addr = ((in->cr3 & ~cbit) & ~0xfff) +
+                pte_addr = ((in->cr3 & ~cbit & ~sbit) & ~0xfff) +
                     (((addr >> 48) & 0x1ff) << 3);
                 if (!ptw_translate(&pte_trans, pte_addr)) {
                     return false;
@@ -192,7 +199,8 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
             restart_5:
                 pte = ptw_ldq(&pte_trans, ra);
                 leaf_c = !!(pte & cbit);
-                pte &= ~cbit;
+                leaf_shared = !!(pte & sbit);
+                pte &= ~cbit & ~sbit;
                 if (!(pte & PG_PRESENT_MASK)) {
                     goto do_fault;
                 }
@@ -204,7 +212,7 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
                 }
                 ptep = pte ^ PG_NX_MASK;
             } else {
-                pte = in->cr3 & ~cbit;
+                pte = in->cr3 & ~cbit & ~sbit;
                 ptep = PG_NX_MASK | PG_USER_MASK | PG_RW_MASK;
             }
 
@@ -218,7 +226,8 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
         restart_4:
             pte = ptw_ldq(&pte_trans, ra);
             leaf_c = !!(pte & cbit);
-            pte &= ~cbit;
+            leaf_shared = !!(pte & sbit);
+            pte &= ~cbit & ~sbit;
             if (!(pte & PG_PRESENT_MASK)) {
                 goto do_fault;
             }
@@ -240,7 +249,8 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
         restart_3_lma:
             pte = ptw_ldq(&pte_trans, ra);
             leaf_c = !!(pte & cbit);
-            pte &= ~cbit;
+            leaf_shared = !!(pte & sbit);
+            pte &= ~cbit & ~sbit;
             if (!(pte & PG_PRESENT_MASK)) {
                 goto do_fault;
             }
@@ -262,7 +272,7 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
             /*
              * Page table level 3
              */
-            pte_addr = ((in->cr3 & ~cbit) & 0xffffffe0ULL) +
+            pte_addr = ((in->cr3 & ~cbit & ~sbit) & 0xffffffe0ULL) +
                 ((addr >> 27) & 0x18);
             if (!ptw_translate(&pte_trans, pte_addr)) {
                 return false;
@@ -271,7 +281,8 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
         restart_3_nolma:
             pte = ptw_ldq(&pte_trans, ra);
             leaf_c = !!(pte & cbit);
-            pte &= ~cbit;
+            leaf_shared = !!(pte & sbit);
+            pte &= ~cbit & ~sbit;
             if (!(pte & PG_PRESENT_MASK)) {
                 goto do_fault;
             }
@@ -294,7 +305,8 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
     restart_2_pae:
         pte = ptw_ldq(&pte_trans, ra);
         leaf_c = !!(pte & cbit);
-        pte &= ~cbit;
+        leaf_shared = !!(pte & sbit);
+        pte &= ~cbit & ~sbit;
         if (!(pte & PG_PRESENT_MASK)) {
             goto do_fault;
         }
@@ -321,7 +333,8 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
         }
         pte = ptw_ldq(&pte_trans, ra);
         leaf_c = !!(pte & cbit);
-        pte &= ~cbit;
+        leaf_shared = !!(pte & sbit);
+        pte &= ~cbit & ~sbit;
         if (!(pte & PG_PRESENT_MASK)) {
             goto do_fault;
         }
@@ -335,7 +348,7 @@ static bool mmu_translate(CPUX86State *env, const TranslateParams *in,
         /*
          * Page table level 2
          */
-        pte_addr = ((in->cr3 & ~cbit) & 0xfffff000ULL) +
+        pte_addr = ((in->cr3 & ~cbit & ~sbit) & 0xfffff000ULL) +
             ((addr >> 20) & 0xffc);
         if (!ptw_translate(&pte_trans, pte_addr)) {
             return false;
@@ -475,6 +488,21 @@ do_check_protect_pse36:
 
         if (unlikely(rmp != SNP_RMP_OK)) {
             snp_rmp_fault(env, rmp, page, leaf_c, ra);
+        }
+    }
+
+    if (unlikely(sbit) && tdx_sept_enabled(env)) {
+        /*
+         * Checked here rather than in tdx_mmio_check(), which runs after the
+         * walk on the assembled physical address: by then the SHARED bit has
+         * been folded away and there is no way to tell which alias the guest
+         * used.  That is the whole question being asked.
+         */
+        hwaddr page = paddr & TARGET_PAGE_MASK;
+        TdxSeptResult sept = tdx_sept_check(env, page, leaf_shared);
+
+        if (unlikely(sept != TDX_SEPT_OK)) {
+            tdx_sept_fault(env, sept, page, leaf_shared, in->access_type, ra);
         }
     }
  stage2:

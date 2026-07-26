@@ -2574,6 +2574,7 @@ struct ArchCPU {
     uint8_t sev_snp_rmp;
     uint32_t sev_snp_vc_mask;
     uint8_t tdx_gpaw;
+    uint8_t tdx_sept;
     uint64_t tdx_attributes;
     /* Derived from the x-tdx-ve-* properties at realize; see TDX_VE_*. */
     uint32_t tdx_ve_mask;

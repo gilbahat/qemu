@@ -20,6 +20,11 @@
 #include "migration/vmstate.h"
 #include "hw/i386/tdx-dma.h"
 #include "tcg/helper-tcg.h"
+#include "hw/core/loader.h"
+#include "exec/target_page.h"
+#include "qemu/lockable.h"
+#include "exec/cputlb.h"
+#include "system/reset.h"
 #include "tdx.h"
 
 #ifdef TARGET_X86_64
@@ -42,6 +47,18 @@ typedef struct TdxTcgState {
      * the guest under test.  See docs/system/i386/tdx-tcg.rst.
      */
     bool ve_armed;
+
+    /*
+     * Secure-EPT-lite.  Only pages whose state differs from the mode default
+     * are stored, so there is nothing to size against RAM and nothing to grow
+     * on hotplug.  Keys are page frame numbers.
+     */
+    GHashTable *sept;
+
+    /* Flattened form of sept, live only across a migration. */
+    uint32_t sept_count;
+    uint64_t *sept_pfn;
+    uint8_t *sept_st;
 } TdxTcgState;
 
 static TdxTcgState *tdx_state;
@@ -53,18 +70,91 @@ static TdxTcgState *tdx_state;
  * ve_armed matters for a different reason -- losing it turns #VE reflection off
  * and the TD stops conforming with no indication that anything happened.
  */
+/*
+ * Page state has to migrate for the same reason the RTMRs do: a TD that has
+ * accepted its memory and is then migrated would otherwise find every page back
+ * at the mode default -- pending under strict -- and take a #VE on its own next
+ * instruction.  Flattened into parallel arrays because a GHashTable has no
+ * VMSTATE representation.
+ */
+static int tdx_pre_save(void *opaque)
+{
+    TdxTcgState *s = opaque;
+    GHashTableIter it;
+    gpointer k, v;
+    uint32_t i = 0;
+
+    s->sept_count = s->sept ? g_hash_table_size(s->sept) : 0;
+    g_free(s->sept_pfn);
+    g_free(s->sept_st);
+    s->sept_pfn = g_new0(uint64_t, s->sept_count);
+    s->sept_st = g_new0(uint8_t, s->sept_count);
+
+    if (s->sept) {
+        g_hash_table_iter_init(&it, s->sept);
+        while (g_hash_table_iter_next(&it, &k, &v)) {
+            s->sept_pfn[i] = GPOINTER_TO_SIZE(k);
+            s->sept_st[i] = GPOINTER_TO_SIZE(v);
+            i++;
+        }
+    }
+    return 0;
+}
+
+static int tdx_post_load(void *opaque, int version_id)
+{
+    TdxTcgState *s = opaque;
+    uint32_t i;
+
+    if (!s->sept) {
+        s->sept = g_hash_table_new(g_direct_hash, g_direct_equal);
+    }
+    g_hash_table_remove_all(s->sept);
+    for (i = 0; i < s->sept_count; i++) {
+        g_hash_table_insert(s->sept, GSIZE_TO_POINTER(s->sept_pfn[i]),
+                            GSIZE_TO_POINTER(s->sept_st[i]));
+    }
+    return 0;
+}
+
 static const VMStateDescription vmstate_tdx_tcg = {
     .name = "tdx-tcg",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
+    .pre_save = tdx_pre_save,
+    .post_load = tdx_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT8_ARRAY(mrtd, TdxTcgState, TDX_MEASUREMENT_LEN),
         VMSTATE_UINT8_2DARRAY(rtmr, TdxTcgState, TDX_RTMR_COUNT,
                               TDX_MEASUREMENT_LEN),
         VMSTATE_BOOL(ve_armed, TdxTcgState),
+        VMSTATE_UINT32(sept_count, TdxTcgState),
+        VMSTATE_VARRAY_UINT32_ALLOC(sept_pfn, TdxTcgState, sept_count, 0,
+                                    vmstate_info_uint64, uint64_t),
+        VMSTATE_VARRAY_UINT32_ALLOC(sept_st, TdxTcgState, sept_count, 0,
+                                    vmstate_info_uint8, uint8_t),
         VMSTATE_END_OF_LIST()
     }
 };
+
+/*
+ * A TD does not survive a reset -- the TDX module tears it down and the next
+ * boot is a different TD.  Page state that outlived the guest that created it
+ * would make a reset loop report nonsense, so drop it here.  The measurement
+ * registers go too, for the same reason.
+ */
+static void tdx_reset(void *opaque)
+{
+    TdxTcgState *s = opaque;
+
+    QEMU_LOCK_GUARD(&s->lock);
+    if (s->sept) {
+        g_hash_table_remove_all(s->sept);
+    }
+    memset(s->mrtd, 0, sizeof(s->mrtd));
+    memset(s->rtmr, 0, sizeof(s->rtmr));
+    s->ve_armed = false;
+}
 
 static TdxTcgState *tdx_get_state(void)
 {
@@ -72,6 +162,7 @@ static TdxTcgState *tdx_get_state(void)
         tdx_state = g_new0(TdxTcgState, 1);
         qemu_mutex_init(&tdx_state->lock);
         vmstate_register(NULL, 0, &vmstate_tdx_tcg, tdx_state);
+        qemu_register_reset(tdx_reset, tdx_state);
     }
     return tdx_state;
 }
@@ -81,11 +172,164 @@ void tdx_tcg_init(void)
     tdx_get_state();
 }
 
+static G_NORETURN void tdx_raise_ve(CPUX86State *env, uint32_t reason,
+                                    uint64_t qual, uint64_t gla, uint64_t gpa,
+                                    uint32_t instr_len, uint32_t instr_info,
+                                    uintptr_t ra);
+
+/*
+ * Secure-EPT-lite.  Structurally identical to the SNP RMP-lite: only pages
+ * differing from the mode default are stored, and the default depends on the
+ * mode and on whether the page is part of the launch image.
+ */
+static bool tdx_gpa_is_ram(CPUX86State *env, hwaddr gpa)
+{
+    CPUState *cs = env_cpu(env);
+    MemTxAttrs attrs = cpu_get_mem_attrs(env);
+    hwaddr xlat, len = 1;
+    MemoryRegion *mr;
+
+    mr = address_space_translate(cpu_addressspace(cs, attrs), gpa, &xlat, &len,
+                                 false, attrs);
+    return memory_region_is_ram(mr) || memory_region_is_romd(mr);
+}
+
+/*
+ * Under LAZY every page starts accepted, so a TD that has not adopted
+ * TDG.MEM.PAGE.ACCEPT runs unchanged and only pages it explicitly converts are
+ * enforced.  Under STRICT guest RAM is private and pending as it is on hardware
+ * after TDH.MEM.PAGE.ADD, and only the launch image is accepted -- rom_ptr() is
+ * the oracle for that, so a -kernel payload's .bss starts pending exactly as it
+ * would on hardware.
+ */
+static TdxPageState tdx_sept_default(CPUX86State *env, hwaddr gpa)
+{
+    X86CPU *cpu = env_archcpu(env);
+
+    if (!tdx_gpa_is_ram(env, gpa)) {
+        return TDX_PAGE_SHARED;      /* MMIO is always shared to a TD */
+    }
+    if (cpu->tdx_sept == TDX_SEPT_LAZY) {
+        return TDX_PAGE_PRIVATE_ACCEPTED;
+    }
+    return rom_ptr(gpa & TARGET_PAGE_MASK, 1) ? TDX_PAGE_PRIVATE_ACCEPTED
+                                              : TDX_PAGE_PRIVATE_PENDING;
+}
+
+static gpointer tdx_sept_key(hwaddr gpa)
+{
+    return GSIZE_TO_POINTER(gpa >> TARGET_PAGE_BITS);
+}
+
+static TdxPageState tdx_sept_get(CPUX86State *env, hwaddr gpa)
+{
+    TdxTcgState *s = tdx_get_state();
+    gpointer v;
+    bool found;
+
+    QEMU_LOCK_GUARD(&s->lock);
+    found = s->sept &&
+            g_hash_table_lookup_extended(s->sept, tdx_sept_key(gpa), NULL, &v);
+    return found ? GPOINTER_TO_SIZE(v) : tdx_sept_default(env, gpa);
+}
+
+static void tdx_sept_set(CPUX86State *env, hwaddr gpa, TdxPageState st)
+{
+    TdxTcgState *s = tdx_get_state();
+
+    QEMU_LOCK_GUARD(&s->lock);
+    if (!s->sept) {
+        s->sept = g_hash_table_new(g_direct_hash, g_direct_equal);
+    }
+    g_hash_table_insert(s->sept, tdx_sept_key(gpa), GSIZE_TO_POINTER(st));
+}
+
+bool tdx_sept_enabled(CPUX86State *env)
+{
+    return env_archcpu(env)->tdx_guest &&
+           env_archcpu(env)->tdx_sept != TDX_SEPT_OFF;
+}
+
+bool tdx_sept_gpa_is_shared(CPUX86State *env, hwaddr gpa)
+{
+    return tdx_sept_get(env, gpa) == TDX_PAGE_SHARED;
+}
+
+TdxSeptResult tdx_sept_check(CPUX86State *env, hwaddr gpa, bool shared)
+{
+    TdxPageState st = tdx_sept_get(env, gpa);
+
+    if (shared) {
+        return st == TDX_PAGE_SHARED ? TDX_SEPT_OK : TDX_SEPT_ALIAS_MISMATCH;
+    }
+    switch (st) {
+    case TDX_PAGE_PRIVATE_ACCEPTED:
+        return TDX_SEPT_OK;
+    case TDX_PAGE_PRIVATE_PENDING:
+        return TDX_SEPT_NOT_ACCEPTED;
+    default:
+        return TDX_SEPT_ALIAS_MISMATCH;
+    }
+}
+
+/*
+ * Convert a page.  Moving to private leaves it pending: the guest must accept
+ * it before use, which is the ordering this teaches.  Only transitions that
+ * remove access need a TLB flush -- a pending page can have no cached entry,
+ * because the fill that would have created it faulted -- so accepting is free,
+ * which matters when a TD accepts gigabytes a page at a time.
+ */
+static void tdx_sept_convert(CPUX86State *env, hwaddr gpa, bool to_shared)
+{
+    CPUState *cs = env_cpu(env);
+
+    if (!tdx_sept_enabled(env)) {
+        return;
+    }
+    tdx_sept_set(env, gpa, to_shared ? TDX_PAGE_SHARED
+                                     : TDX_PAGE_PRIVATE_PENDING);
+    tlb_flush(cs);
+}
+
+/*
+ * An EPT violation, reported to the TD as #VE.  Bit 3 of the qualification says
+ * the mapping was not present, which is how hardware distinguishes a page the
+ * guest still has to accept from an ordinary permission failure.
+ */
+G_NORETURN void tdx_sept_fault(CPUX86State *env, TdxSeptResult res, hwaddr gpa,
+                               bool shared, MMUAccessType access_type,
+                               uintptr_t ra)
+{
+    uint64_t qual;
+
+    switch (access_type) {
+    case MMU_DATA_STORE:
+        qual = 1 << 1;
+        break;
+    case MMU_INST_FETCH:
+        qual = 1 << 2;
+        break;
+    default:
+        qual = 1 << 0;
+        break;
+    }
+    qual |= 1 << 3;
+
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "tdx: EPT violation: %s access to GPA 0x%" HWADDR_PRIx
+                  " which is %s\n",
+                  shared ? "SHARED-alias" : "private", gpa,
+                  res == TDX_SEPT_NOT_ACCEPTED ? "not accepted"
+                      : "mapped with the other alias");
+
+    tdx_raise_ve(env, TDX_EXIT_REASON_EPT_VIOLATION, qual, 0,
+                 shared ? (gpa | tdx_shared_mask(env)) : gpa, 0, 0, ra);
+}
+
 /*
  * Strip the emulated SHARED bit (GPA bit GPAW-1) from a guest-supplied
- * address.  TCG pins phys_bits to TCG_PHYS_ADDR_BITS (40) while the reported
- * GPAW defaults to 48, so the SHARED bit sits above the addressable range and
- * must be removed before any bounds check or memory access.
+ * address.  A TDCALL operand names a page by its GPA, and the SHARED bit is
+ * not part of the address, so it comes off before any bounds check or access.
  */
 static uint64_t tdx_strip_shared(X86CPU *cpu, uint64_t gpa)
 {
@@ -159,6 +403,27 @@ static void tdx_mem_page_accept(CPUX86State *env)
     if (!tdx_gpa_ok(cpu, gpa, 4096, TDX_OPERAND_ID_RCX, &status)) {
         env->regs[R_EAX] = status;
         return;
+    }
+
+    if (tdx_sept_enabled(env)) {
+        switch (tdx_sept_get(env, gpa)) {
+        case TDX_PAGE_PRIVATE_PENDING:
+            /*
+             * Accepting only adds access, and a pending page can have no
+             * cached translation -- the fill that would have made one faulted
+             * -- so no TLB flush is needed here.  That matters: a TD accepting
+             * 4GiB performs a million of these.
+             */
+            tdx_sept_set(env, gpa, TDX_PAGE_PRIVATE_ACCEPTED);
+            break;
+        case TDX_PAGE_PRIVATE_ACCEPTED:
+            env->regs[R_EAX] = TDX_PAGE_ALREADY_ACCEPTED;
+            return;
+        default:
+            /* Shared: the guest must convert it to private first. */
+            env->regs[R_EAX] = TDX_PAGE_ATTR_CONFLICT | TDX_OPERAND_ID_RCX;
+            return;
+        }
     }
 
     env->regs[R_EAX] = TDX_SUCCESS;
@@ -376,10 +641,30 @@ static void tdx_vp_vmcall(CPUX86State *env, int next_eip_addend)
             return;
         }
         /*
-         * Private and shared memory are the same RAM here, so the transition
-         * is a no-op.  Report success so a guest that maps buffers shared
-         * before doing I/O behaves as it would on real hardware.
+         * R12 bit GPAW-1 selects the direction: the guest asks for the alias it
+         * intends to use next.  Converting to private leaves the page pending,
+         * so the guest must accept it before use.
+         *
+         * Only the first page of the range is converted: a range request is
+         * accepted as a whole but modelled one page at a time by the guest
+         * looping, which is what Linux does anyway.  A partial conversion is
+         * reported so a guest that assumes range semantics finds out here.
          */
+        bool to_shared = !!(env->regs[R_R12] & tdx_shared_mask(env));
+
+        if (tdx_sept_enabled(env) && size > 4096) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "tdx: MapGPA of 0x%" PRIx64 " bytes at GPA 0x%"
+                          PRIx64 "; only the first page is converted\n",
+                          size, gpa);
+            env->regs[R_EAX] = TDX_SUCCESS;
+            env->regs[R_R10] = TDVMCALL_RETRY;
+            env->regs[R_R11] = gpa + 4096;
+            tdx_sept_convert(env, gpa, to_shared);
+            break;
+        }
+
+        tdx_sept_convert(env, gpa, to_shared);
         env->regs[R_EAX] = TDX_SUCCESS;
         env->regs[R_R10] = TDVMCALL_SUCCESS;
         break;

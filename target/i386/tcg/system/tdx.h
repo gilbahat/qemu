@@ -39,6 +39,13 @@
 #define TDX_ALIGN_ERROR                 0xC000030000000000ULL
 #define TDX_NO_VE_INFO                  0xC000070000000000ULL
 #define TDX_PAGE_SIZE_MISMATCH          0xC0000B0B00000000ULL
+/*
+ * Returned when TDG.MEM.PAGE.ACCEPT names a page whose attributes do not allow
+ * it -- here, one the guest has converted to shared.  Taken from the TDX module
+ * specification; like TDX_PAGE_ALREADY_ACCEPTED it is not cross-checked against
+ * anything else in tree.
+ */
+#define TDX_PAGE_ATTR_CONFLICT          0xC0000B0900000000ULL
 
 /* Operand identifiers, ORed into bits 31:0 of a status code. */
 #define TDX_OPERAND_ID_RAX              0x00000000U
@@ -126,5 +133,75 @@ void tdx_mmio_check(CPUX86State *env, hwaddr paddr, MMUAccessType access_type,
  * TCG realize so the section exists before an incoming migration needs it.
  */
 void tdx_tcg_init(void);
+
+/*
+ * Secure-EPT-lite modes, selected by x-tdx-sept.
+ *
+ * LAZY exists for the same reason the SNP equivalent does: guest RAM is private
+ * and unaccepted on real hardware, so under STRICT a TD that does not accept
+ * its memory faults on its first instruction fetch.  That is the truth and it
+ * is what a conformance run wants, but it leaves no way to adopt the shared
+ * alias and TDG.MEM.PAGE.ACCEPT a page at a time.
+ */
+#define TDX_SEPT_OFF                    0
+#define TDX_SEPT_LAZY                   1
+#define TDX_SEPT_STRICT                 2
+
+/*
+ * Per-page state.  A TD's memory starts private and pending; the guest accepts
+ * it before use, and MapGPA moves pages between private and shared.
+ */
+typedef enum {
+    TDX_PAGE_SHARED = 0,
+    TDX_PAGE_PRIVATE_PENDING,
+    TDX_PAGE_PRIVATE_ACCEPTED,
+} TdxPageState;
+
+/*
+ * Every one of these is an EPT violation delivered as #VE on hardware, so
+ * unlike SNP -- where a polarity mismatch is invisible to the guest and kills
+ * the VM -- there is a single fault path and the guest can handle all of them.
+ */
+typedef enum {
+    TDX_SEPT_OK = 0,
+    TDX_SEPT_NOT_ACCEPTED,   /* private access to a page not yet accepted */
+    TDX_SEPT_ALIAS_MISMATCH, /* alias used disagrees with the page's state */
+} TdxSeptResult;
+
+/* Is page-state enforcement on?  False unless x-tdx-sept says otherwise. */
+bool tdx_sept_enabled(CPUX86State *env);
+
+/* Check an access against the page's state; @shared is the PTE's SHARED bit. */
+TdxSeptResult tdx_sept_check(CPUX86State *env, hwaddr gpa, bool shared);
+
+/* Reflect an EPT violation as #VE.  Does not return. */
+G_NORETURN void tdx_sept_fault(CPUX86State *env, TdxSeptResult res, hwaddr gpa,
+                               bool shared, MMUAccessType access_type,
+                               uintptr_t ra);
+
+/* Is this GPA shared?  What the DMA filter asks. */
+bool tdx_sept_gpa_is_shared(CPUX86State *env, hwaddr gpa);
+
+/*
+ * The emulated SHARED GPA bit (GPA bit GPAW-1), or 0 when x-tdx-guest is off.
+ * Callers strip it from any address taken out of a page-table entry or CR3: the
+ * phys_bits == GPAW invariant keeps it out of the walker's reserved-bit mask,
+ * but it is still inside PG_ADDRESS_MASK and would otherwise be folded into the
+ * physical address -- pointing the access at RAM that does not exist.
+ *
+ * Folding the SHARED alias back onto the same page is what makes the model
+ * work without encryption: private and shared are the same memory here, so a
+ * page-state change moves an attribute and not any data.  On hardware the two
+ * aliases are distinct Secure-EPT entries and a conversion loses the contents.
+ *
+ * Inline for the same reason snp_cbit_mask() is: target/i386/helper.c needs it
+ * and is built even where tdx.c is not.
+ */
+static inline uint64_t tdx_shared_mask(CPUX86State *env)
+{
+    X86CPU *cpu = env_archcpu(env);
+
+    return cpu->tdx_guest ? (1ULL << (cpu->tdx_gpaw - 1)) : 0;
+}
 
 #endif /* I386_TCG_SYSTEM_TDX_H */

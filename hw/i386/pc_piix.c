@@ -222,8 +222,8 @@ static void pc_init1(MachineState *machine, const char *pci_type)
      * CPU property is set -- but they have to be here as well as in q35, or the
      * guard would be silently absent on whichever machine the user picked.
      */
-    tdx_dma_setup(pcms->pcibus);
 #ifdef CONFIG_TCG
+    tdx_dma_setup(pcms->pcibus);
     snp_dma_setup(pcms->pcibus);
 #endif
 

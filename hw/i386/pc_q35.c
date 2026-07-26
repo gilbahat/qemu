@@ -238,8 +238,8 @@ static void pc_q35_init(MachineState *machine)
      * before any device is created, since a device captures its DMA address
      * space when realized.
      */
-    tdx_dma_setup(pcms->pcibus);
 #ifdef CONFIG_TCG
+    tdx_dma_setup(pcms->pcibus);
     snp_dma_setup(pcms->pcibus);
 #endif
 

@@ -32,6 +32,12 @@ boot-snp.o: $(CRT_PATH)/boot.S
 	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -DSNP_CBIT_BOOT -Wa,--noexecstack -c $< -o $@
 .PRECIOUS: boot-snp.o
 
+# Likewise for TDX: accepting .bss is wrong wherever guest memory is not
+# pending, and a TD cannot tell which it is in.
+boot-tdx.o: $(CRT_PATH)/boot.S
+	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -DTDX_ACCEPT_BOOT -Wa,--noexecstack -c $< -o $@
+.PRECIOUS: boot-tdx.o
+
 # Build and link the tests
 %: %.c $(LINK_SCRIPT) $(CRT_OBJS) $(MINILIB_OBJS)
 	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) $< -o $@ $(LDFLAGS)
@@ -40,6 +46,11 @@ sev-snp-strict: sev-snp-strict.c $(LINK_SCRIPT) boot-snp.o $(MINILIB_OBJS)
 	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) $< -o $@ \
 		-Wl,-T$(LINK_SCRIPT) -Wl,-melf_x86_64 -static -nostdlib \
 		boot-snp.o $(MINILIB_OBJS) -lgcc
+
+tdx-strict: tdx-strict.c $(LINK_SCRIPT) boot-tdx.o $(MINILIB_OBJS)
+	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) $< -o $@ \
+		-Wl,-T$(LINK_SCRIPT) -Wl,-melf_x86_64 -static -nostdlib \
+		boot-tdx.o $(MINILIB_OBJS) -lgcc
 
 memory: CFLAGS+=-DCHECK_UNALIGNED=1
 
@@ -54,6 +65,9 @@ sev-snp-rmp: CFLAGS+=-mgeneral-regs-only
 sev-snp-cbit: CFLAGS+=-mgeneral-regs-only
 sev-snp-strict: CFLAGS+=-mgeneral-regs-only
 sev-snp-dma: CFLAGS+=-mgeneral-regs-only
+tdx-sept: CFLAGS+=-mgeneral-regs-only
+tdx-strict: CFLAGS+=-mgeneral-regs-only
+tdx-dma: CFLAGS+=-mgeneral-regs-only
 
 # Running
 X64_SYSTEM_OPTS=-device isa-debugcon,chardev=output \
@@ -62,6 +76,25 @@ QEMU_OPTS+=$(X64_SYSTEM_OPTS) -kernel
 
 # The emulated TDX guest interface is off unless asked for.
 run-tdx: QEMU_OPTS=-cpu max,x-tdx-guest=on $(X64_SYSTEM_OPTS) -kernel
+
+# Page state in lazy mode: pages start accepted, so the test's own memory keeps
+# working while the pages under test are converted.  I/O is relaxed because the
+# first TDCALL arms reflection and this test's #VE handler is for EPT
+# violations, not for servicing I/O.
+TDX_SEPT_CPU=max,x-tdx-guest=on,x-tdx-sept=1
+run-tdx-sept: QEMU_OPTS=-cpu $(TDX_SEPT_CPU) $(X64_SYSTEM_OPTS) -kernel
+
+# Device DMA: the SHARED alias is necessary but not sufficient, so the filter
+# also asks whether the page was ever converted.
+# edu clamps DMA addresses to its dma_mask, which defaults to 28 bits and would
+# strip the SHARED alias before the filter ever saw it.
+run-tdx-dma: QEMU_OPTS=-cpu $(TDX_SEPT_CPU) \
+             -device edu,dma_mask=0xffffffffffff $(X64_SYSTEM_OPTS) -kernel
+
+# Strict mode: guest RAM private and pending, only the launch image accepted.
+# Nothing boots here without the accept bootstrap, which is what is being shown.
+run-tdx-strict: QEMU_OPTS=-cpu max,x-tdx-guest=on,x-tdx-sept=2 \
+                $(X64_SYSTEM_OPTS) -kernel
 run-sev-snp: QEMU_OPTS=-cpu max,x-sev-snp-guest=on $(X64_SYSTEM_OPTS) -kernel
 # I/O is relaxed: a handler with no GHCB cannot service it, and both the test's
 # output and its exit are port I/O.  See the comment in sev-snp-vc.c.

@@ -16,6 +16,7 @@
 #include "system/memory_mapping.h"
 #include "system/memory.h"
 #include "tcg/system/snp.h"
+#include "tcg/system/tdx.h"
 
 /* PAE Paging or IA-32e Paging */
 static void walk_pte(MemoryMappingList *list, AddressSpace *as,
@@ -82,7 +83,8 @@ static void walk_pte2(MemoryMappingList *list, AddressSpace *as,
 #define PLM4_ADDR_MASK 0xffffffffff000ULL /* selects bits 51:12 */
 
 /*
- * The emulated SEV-SNP C-bit sits inside the masks above, so it is threaded
+ * The emulated SEV-SNP C-bit and TDX SHARED bit sit inside the masks above,
+ * so they are threaded
  * through the walk and removed from every address taken out of an entry -- the
  * same way a20_mask is.  Without it dump-guest-memory would follow poisoned
  * table pointers and record physical addresses that do not exist.  It is 0 for
@@ -292,7 +294,7 @@ bool x86_cpu_get_memory_mapping(CPUState *cs, MemoryMappingList *list,
     }
 
     a20_mask = x86_get_a20_mask(env);
-    cbit = snp_cbit_mask(env);
+    cbit = snp_cbit_mask(env) | tdx_shared_mask(env);
     if (env->cr[4] & CR4_PAE_MASK) {
 #ifdef TARGET_X86_64
         if (env->hflags & HF_LMA_MASK) {

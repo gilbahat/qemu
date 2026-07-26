@@ -10140,9 +10140,16 @@ static void x86_cpu_realizefn(DeviceState *dev, Error **errp)
                        "use -object tdx-guest with KVM");
             return;
         }
-        if (cpu->tdx_gpaw < 32 || cpu->tdx_gpaw > 63) {
-            error_setg(errp, "x-tdx-gpaw must be in [32,63] "
-                       "(real TDX reports 48 or 52)");
+        if (cpu->tdx_gpaw < 32 || cpu->tdx_gpaw > 52) {
+            error_setg(errp, "x-tdx-gpaw must be in [32,52] "
+                       "(real TDX reports 48 or 52); above 52 the SHARED bit "
+                       "would leave PG_ADDRESS_MASK and could not appear in a "
+                       "page-table entry at all");
+            return;
+        }
+        if (cpu->tdx_sept > TDX_SEPT_STRICT) {
+            error_setg(errp, "x-tdx-sept must be 0 (off), 1 (lazy) "
+                       "or 2 (strict)");
             return;
         }
         if (cpu->tdx_attributes & TDX_TD_ATTR_DEBUG) {
@@ -10163,11 +10170,23 @@ static void x86_cpu_realizefn(DeviceState *dev, Error **errp)
                          | (cpu->tdx_ve_hlt ? TDX_VE_HLT : 0)
                          | (cpu->tdx_ve_mmio ? TDX_VE_MMIO : 0);
         /*
-         * Note: cpu->phys_bits is not assigned until later in realize, so the
-         * GPAW-vs-phys_bits relationship cannot be checked here.  TCG pins
-         * phys_bits to 40 while the default GPAW is 48, so the SHARED GPA bit
-         * is above the addressable range; tdx_strip_shared() masks it off.
+         * The SHARED bit is GPA bit GPAW-1, so phys_bits must reach it or the
+         * walker's reserved-bit mask covers it and a TD cannot map shared
+         * memory at all -- every access through the SHARED alias would be a
+         * #PF.  Pinning phys_bits to GPAW makes SHARED the topmost address bit,
+         * exactly as x-sev-snp-cbitpos does for the C-bit, and then rsvd_mask
+         * needs no special case.  Must happen before the phys_bits default
+         * further down, which would otherwise pin it to TCG's 40.
          */
+        if (cpu->phys_bits == 0) {
+            cpu->phys_bits = cpu->tdx_gpaw;
+        } else if (cpu->phys_bits < cpu->tdx_gpaw) {
+            error_setg(errp, "phys-bits (%u) must be at least x-tdx-gpaw (%u), "
+                       "otherwise the SHARED GPA bit is unaddressable and the "
+                       "TD cannot map shared memory",
+                       cpu->phys_bits, cpu->tdx_gpaw);
+            return;
+        }
         warn_report("x-tdx-guest is an EXPERIMENTAL TCG emulation of the "
                     "Intel TDX *guest* ABI. There is no memory encryption, "
                     "no measured launch and NO GENUINE ATTESTATION. Do not "
@@ -11011,6 +11030,7 @@ static const Property x86_cpu_properties[] = {
      */
     DEFINE_PROP_BOOL("x-tdx-guest", X86CPU, tdx_guest, false),
     DEFINE_PROP_UINT8("x-tdx-gpaw", X86CPU, tdx_gpaw, 48),
+    DEFINE_PROP_UINT8("x-tdx-sept", X86CPU, tdx_sept, TDX_SEPT_OFF),
     DEFINE_PROP_UINT64("x-tdx-attributes", X86CPU, tdx_attributes, 0),
     DEFINE_PROP_BOOL("x-tdx-strict", X86CPU, tdx_strict, false),
     DEFINE_PROP_BOOL("x-tdx-ve-io", X86CPU, tdx_ve_io, false),

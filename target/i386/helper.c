@@ -21,6 +21,7 @@
 #include "qapi/qapi-events-run-state.h"
 #include "cpu.h"
 #include "tcg/system/snp.h"
+#include "tcg/system/tdx.h"
 #include "exec/cputlb.h"
 #include "exec/translation-block.h"
 #include "exec/target_page.h"
@@ -265,12 +266,13 @@ bool x86_cpu_translate_for_debug(CPUState *cs, vaddr addr,
     uint32_t page_offset;
     int page_size;
     /*
-     * Strip the emulated SEV-SNP C-bit here too.  This walk backs x/, gdb and
-     * cpu_memory_rw_debug(), so without it every debugging tool would follow
-     * C-bit-poisoned table pointers into unassigned memory.
+     * Strip the emulated SEV-SNP C-bit and TDX SHARED bit here too.  This walk
+     * backs x/, gdb and cpu_memory_rw_debug(), so without it every debugging
+     * tool would follow poisoned table pointers into unassigned memory.
      */
-    const uint64_t amask = PG_ADDRESS_MASK & ~snp_cbit_mask(env);
-    const uint64_t cr3 = env->cr[3] & ~snp_cbit_mask(env);
+    const uint64_t nomark = ~snp_cbit_mask(env) & ~tdx_shared_mask(env);
+    const uint64_t amask = PG_ADDRESS_MASK & nomark;
+    const uint64_t cr3 = env->cr[3] & nomark;
 
     a20_mask = x86_get_a20_mask(env);
     if (!(env->cr[0] & CR0_PG_MASK)) {

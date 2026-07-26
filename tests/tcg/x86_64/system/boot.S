@@ -166,6 +166,37 @@ _start:
 .Lenter64:
 
 
+#ifdef TDX_ACCEPT_BOOT
+	/*
+	 * A TD's memory is private but *pending* until accepted, and .bss is
+	 * not part of the launch image -- so the stack has to be accepted
+	 * before use.  No page-table change is needed: a TD reaches private
+	 * memory through the plain GPA, which this code already maps.
+	 *
+	 * Identified through CPUID leaf 0x21, "IntelTDX    ".  Inert on
+	 * anything that is not a TD, which is why plain boot.S shares this
+	 * source.
+	 */
+	mov $0x21, %eax
+	xor %ecx, %ecx
+	cpuid
+	cmp $0x65746e49, %ebx			/* "Inte" */
+	jne .Lno_accept
+	cmp $0x5844546c, %edx			/* "lTDX" */
+	jne .Lno_accept
+
+	movq $__bss_st, %rbx
+	andq $~0xfff, %rbx
+6:	cmpq $__bss_en, %rbx
+	jae .Lno_accept
+	movq $6, %rax				/* TDG.MEM.PAGE.ACCEPT */
+	movq %rbx, %rcx				/* GPA, level 0 (4KiB) */
+	.byte 0x66, 0x0f, 0x01, 0xcc	/* tdcall */
+	addq $0x1000, %rbx
+	jmp 6b
+.Lno_accept:
+#endif /* TDX_ACCEPT_BOOT */
+
 #ifdef SNP_CBIT_BOOT
 	/*
 	 * .bss is not part of the launch image, so on an SNP machine it is
