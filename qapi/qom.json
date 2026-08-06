@@ -755,9 +755,8 @@
 #
 # @guest-memfd: if 'on', use guest-memfd to back the memory region.
 #     See the :doc:`/system/guest-memfd` documentation for more
-#     details.  If 'auto', the option will default to 'off'
-#     currently, but in the future it may result in the option being
-#     set to 'on' for QEMU configurations that explicitly require it.
+#     details.  If 'auto', the option is set to 'on' for Confidential
+#     VMs with in-place conversion, and to 'off' otherwise.
 #     (default: auto, since: 11.2)
 #
 # Features:
