@@ -60,6 +60,22 @@ void assert_hvf_ok_impl(hv_return_t ret, const char *file, unsigned int line,
     abort();
 }
 
+/*
+ * hv_vm_map(), hv_vm_unmap() and hv_vm_protect() all operate at host page
+ * granularity.  Sections which are not host page aligned are therefore never
+ * mapped into the guest; accesses to them trap and are emulated as MMIO.
+ * Since they are never mapped, they must not be unmapped or reprotected
+ * either: passing an unaligned range to the hypervisor returns
+ * HV_BAD_ARGUMENT.
+ */
+static bool hvf_section_is_host_aligned(const MemoryRegionSection *section)
+{
+    uint64_t page_size = qemu_real_host_page_size();
+
+    return QEMU_IS_ALIGNED(section->offset_within_address_space, page_size) &&
+           QEMU_IS_ALIGNED(int128_get64(section->size), page_size);
+}
+
 static void do_hv_vm_protect(hwaddr start, size_t size,
                              hv_memory_flags_t flags)
 {
@@ -93,7 +109,6 @@ static void hvf_set_phys_mem(MemoryRegionSection *section, bool add)
     MemoryRegion *area = section->mr;
     bool writable = !area->readonly && !area->rom_device;
     hv_memory_flags_t flags;
-    uint64_t page_size = qemu_real_host_page_size();
     uint64_t gpa = section->offset_within_address_space;
     uint64_t size = int128_get64(section->size);
     hv_return_t ret;
@@ -111,10 +126,13 @@ static void hvf_set_phys_mem(MemoryRegionSection *section, bool add)
         }
     }
 
-    if (!QEMU_IS_ALIGNED(size, page_size) ||
-        !QEMU_IS_ALIGNED(gpa, page_size)) {
-        /* Not page aligned, so we can not map as RAM */
-        add = false;
+    if (!hvf_section_is_host_aligned(section)) {
+        /*
+         * Not host page aligned, so we can not map it as RAM.  It was never
+         * mapped for exactly the same reason, so there is nothing to unmap
+         * either: leave the hypervisor alone and let accesses trap.
+         */
+        return;
     }
 
     if (!add) {
@@ -139,7 +157,7 @@ static void hvf_log_start(MemoryListener *listener,
                           MemoryRegionSection *section, int old, int new)
 {
     assert(new != 0);
-    if (old == 0) {
+    if (old == 0 && hvf_section_is_host_aligned(section)) {
         hvf_protect_clean_range(section->offset_within_address_space,
                                 int128_get64(section->size));
     }
@@ -149,7 +167,7 @@ static void hvf_log_stop(MemoryListener *listener,
                          MemoryRegionSection *section, int old, int new)
 {
     assert(old != 0);
-    if (new == 0) {
+    if (new == 0 && hvf_section_is_host_aligned(section)) {
         hvf_unprotect_dirty_range(section->offset_within_address_space,
                                   int128_get64(section->size));
     }
@@ -163,8 +181,10 @@ static void hvf_log_clear(MemoryListener *listener,
      * Some number of those pages may have been dirtied and
      * the write permission enabled.  Reset the range read-only.
      */
-    hvf_protect_clean_range(section->offset_within_address_space,
-                            int128_get64(section->size));
+    if (hvf_section_is_host_aligned(section)) {
+        hvf_protect_clean_range(section->offset_within_address_space,
+                                int128_get64(section->size));
+    }
 }
 
 static void hvf_region_add(MemoryListener *listener,
