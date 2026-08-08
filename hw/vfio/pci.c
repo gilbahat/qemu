@@ -323,13 +323,24 @@ static void vfio_irqchip_change(Notifier *notify, void *data)
 static bool vfio_intx_enable(VFIOPCIDevice *vdev, Error **errp)
 {
     PCIDevice *pdev = PCI_DEVICE(vdev);
-    uint8_t pin = vfio_pci_read_config(pdev, PCI_INTERRUPT_PIN, 1);
+    uint32_t val = vfio_pci_read_config(pdev, PCI_INTERRUPT_PIN, 1);
+    uint8_t pin;
     Error *err = NULL;
     int32_t fd;
 
+    if (val == (uint32_t)-1) {
+        error_setg(errp, "failed to read PCI_INTERRUPT_PIN");
+        return false;
+    }
+    pin = val;
 
     if (!pin) {
         return true;
+    }
+
+    if (pin > PCI_NUM_PINS) {
+        error_setg(errp, "invalid PCI interrupt pin %d", pin);
+        return false;
     }
 
     /*
@@ -578,7 +589,7 @@ static void vfio_connect_kvm_msi_virq(VFIOMSIVector *vector, int nr)
 {
     const char *name = "kvm_interrupt";
 
-    if (vector->virq < 0) {
+    if (!vector->use || vector->virq < 0) {
         return;
     }
 
@@ -688,7 +699,7 @@ static int vfio_msix_vector_do_use(PCIDevice *pdev, unsigned int nr,
         if (msg) {
             if (vdev->defer_kvm_irq_routing) {
                 vfio_pci_add_kvm_msi_virq(vdev, vector, nr, true);
-            } else {
+            } else if (accel_msi_via_irqfd_enabled()) {
                 vfio_route_change = accel_irqchip_begin_route_changes();
                 vfio_pci_add_kvm_msi_virq(vdev, vector, nr, true);
                 accel_irqchip_commit_route_changes(&vfio_route_change);
@@ -790,7 +801,9 @@ void vfio_pci_prepare_kvm_msi_virq_batch(VFIOPCIDevice *vdev)
 {
     assert(!vdev->defer_kvm_irq_routing);
     vdev->defer_kvm_irq_routing = true;
-    vfio_route_change = accel_irqchip_begin_route_changes();
+    if (accel_msi_via_irqfd_enabled()) {
+        vfio_route_change = accel_irqchip_begin_route_changes();
+    }
 }
 
 void vfio_pci_commit_kvm_msi_virq_batch(VFIOPCIDevice *vdev)
@@ -1118,6 +1131,8 @@ static bool vfio_pci_load_rom(VFIOPCIDevice *vdev, Error **errp)
             data[6] = -csum;
         }
     }
+
+    vfio_rom_quirk_setup(vdev);
 
     return true;
 }
@@ -2764,6 +2779,7 @@ bool vfio_pci_add_capabilities(VFIOPCIDevice *vdev, Error **errp)
 void vfio_pci_pre_reset(VFIOPCIDevice *vdev)
 {
     PCIDevice *pdev = PCI_DEVICE(vdev);
+    uint32_t val;
     uint16_t cmd;
 
     vfio_disable_interrupts(vdev);
@@ -2772,23 +2788,34 @@ void vfio_pci_pre_reset(VFIOPCIDevice *vdev)
      * Stop any ongoing DMA by disconnecting I/O, MMIO, and bus master.
      * Also put INTx Disable in known state.
      */
-    cmd = vfio_pci_read_config(pdev, PCI_COMMAND, 2);
-    cmd &= ~(PCI_COMMAND_IO | PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER |
-             PCI_COMMAND_INTX_DISABLE);
-    vfio_pci_write_config(pdev, PCI_COMMAND, cmd, 2);
+    val = vfio_pci_read_config(pdev, PCI_COMMAND, 2);
+    if (val != (uint32_t)-1) {
+        cmd = val;
+        cmd &= ~(PCI_COMMAND_IO | PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER |
+                 PCI_COMMAND_INTX_DISABLE);
+        vfio_pci_write_config(pdev, PCI_COMMAND, cmd, 2);
+    }
 
     /* Make sure the device is in D0 */
     if (pdev->pm_cap) {
         uint16_t pmcsr;
         uint8_t state;
 
-        pmcsr = vfio_pci_read_config(pdev, pdev->pm_cap + PCI_PM_CTRL, 2);
+        val = vfio_pci_read_config(pdev, pdev->pm_cap + PCI_PM_CTRL, 2);
+        if (val == (uint32_t)-1) {
+            return;
+        }
+        pmcsr = val;
         state = pmcsr & PCI_PM_CTRL_STATE_MASK;
         if (state) {
             pmcsr &= ~PCI_PM_CTRL_STATE_MASK;
             vfio_pci_write_config(pdev, pdev->pm_cap + PCI_PM_CTRL, pmcsr, 2);
             /* vfio handles the necessary delay here */
-            pmcsr = vfio_pci_read_config(pdev, pdev->pm_cap + PCI_PM_CTRL, 2);
+            val = vfio_pci_read_config(pdev, pdev->pm_cap + PCI_PM_CTRL, 2);
+            if (val == (uint32_t)-1) {
+                return;
+            }
+            pmcsr = val;
             state = pmcsr & PCI_PM_CTRL_STATE_MASK;
             if (state) {
                 error_report("vfio: Unable to power on device, stuck in D%d",

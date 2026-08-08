@@ -30,6 +30,10 @@ translate32_d = [
 arm_ss.add(when: 'TARGET_AARCH64', if_true: gen_a64)
 arm_stubs_ss.add(files('stubs32.c'))
 
+arm_ss.add(files(
+  'cpu32.c',
+))
+
 arm_ss.add(when: 'TARGET_AARCH64', if_true: files(
   'gengvec64.c',
   'translate-a64.c',
@@ -82,11 +86,13 @@ arm_common_user_system_ss.add(when: 'TARGET_AARCH64', if_true: files(
 
 arm_common_system_ss.add(files(
   'cpregs-at.c',
-  'cpu32-system.c',
   'gicv5-cpuif.c',
   'psci.c',
   'tlb_helper.c',
   'tlb-insns.c',
+))
+arm_common_system_ss.add(when: 'CONFIG_ARM_GICV5', if_true: files(
+  'gicv5-cpuif.c',
 ))
 arm_user_ss.add(files(
   'tlb_helper.c',

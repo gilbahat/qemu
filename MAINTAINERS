@@ -1357,6 +1357,7 @@ F: hw/hexagon/
 F: include/hw/hexagon/
 F: configs/devices/hexagon-softmmu/default.mak
 F: docs/system/hexagon/
+F: tests/functional/hexagon/
 F: docs/devel/hexagon-sys.rst
 
 LoongArch Machines
@@ -2204,7 +2205,9 @@ M: Peter Maydell <peter.maydell@linaro.org>
 L: qemu-arm@nongnu.org
 S: Odd Fixes
 F: hw/*/omap*
+F: hw/dma/soc_dma.c
 F: include/hw/arm/omap.h
+F: include/hw/dma/soc_dma.h
 F: docs/system/arm/sx1.rst
 F: tests/functional/arm/test_sx1.py
 
@@ -4390,7 +4393,7 @@ F: block/parallels.c
 F: block/parallels-ext.c
 F: docs/interop/parallels.rst
 F: docs/interop/prl-xml.rst
-T: git https://src.openvz.org/scm/~den/qemu.git parallels
+T: git https://gitlab.com/dlunev/qemu.git parallels
 
 qed
 M: Stefan Hajnoczi <stefanha@redhat.com>
