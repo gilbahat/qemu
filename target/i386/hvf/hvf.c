@@ -164,6 +164,16 @@ static bool ept_emulation_fault(CPUState *cs, uint64_t gpa, uint64_t ept_qual)
         !(read && memory_region_is_romd(mr))) {
         return true;
     }
+
+    /*
+     * A fault on a ram region which we did not just write unprotect for dirty
+     * logging means the page is not mapped into the guest at all (e.g. a
+     * sub-page ram device region such as the TPM PPI buffer), so it has to be
+     * emulated.  Returning false here would retry the same access forever.
+     */
+    if (memory_region_is_ram(mr) && !memory_region_get_dirty_log_mask(mr)) {
+        return true;
+    }
     return false;
 }
 

@@ -2406,7 +2406,16 @@ static int hvf_handle_exception(CPUState *cpu, hv_vcpu_exit_exception_t *excp)
             MemoryRegion *mr = address_space_translate(as, ipa, &xlat,
                                                        NULL, true,
                                                        MEMTXATTRS_UNSPECIFIED);
-            if (memory_region_is_ram(mr)) {
+            /*
+             * A write fault can only be taken on a page which is mapped into
+             * the guest if we write protected it for dirty logging.  Any other
+             * write fault on a ram region means the page is not mapped at all
+             * (e.g. a sub-page ram device region such as the TPM PPI buffer),
+             * and must be emulated as MMIO below -- retrying would fault
+             * again, forever.
+             */
+            if (memory_region_is_ram(mr) &&
+                memory_region_get_dirty_log_mask(mr)) {
                 uintptr_t page_size = qemu_real_host_page_size();
                 intptr_t page_mask = -(intptr_t)page_size;
                 uint64_t ipa_page = ipa & page_mask;
@@ -2414,10 +2423,8 @@ static int hvf_handle_exception(CPUState *cpu, hv_vcpu_exit_exception_t *excp)
                 /* TODO: Inject exception to the guest. */
                 assert(!mr->readonly);
 
-                if (memory_region_get_dirty_log_mask(mr)) {
-                    memory_region_set_dirty(mr, xlat, page_size);
-                    hvf_unprotect_dirty_range(ipa_page, page_size);
-                }
+                memory_region_set_dirty(mr, xlat, page_size);
+                hvf_unprotect_dirty_range(ipa_page, page_size);
 
                 /* Retry with page writes enabled. */
                 break;
