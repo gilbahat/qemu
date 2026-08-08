@@ -20,6 +20,17 @@ typedef struct TPMPPI {
 } TPMPPI;
 
 /**
+ * tpm_ppi_init_memory:
+ * @tpmppi: a TPMPPI
+ * @obj: the owner object
+ *
+ * Allocate the PPI buffer and create its memory region, without placing it
+ * in any address space.  Use this from relocatable (sysbus) devices, which
+ * expose the region with sysbus_init_mmio() instead.
+ **/
+void tpm_ppi_init_memory(TPMPPI *tpmppi, Object *obj);
+
+/**
  * tpm_ppi_init:
  * @tpmppi: a TPMPPI
  * @m: the address-space / MemoryRegion to use

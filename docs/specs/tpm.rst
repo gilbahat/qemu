@@ -46,7 +46,44 @@ The CRB interface makes a memory mapped IO region in the area
 operating system.
 
 QEMU files related to TPM CRB interface:
+ - ``hw/tpm/tpm_crb_common.c``
  - ``hw/tpm/tpm_crb.c``
+ - ``hw/tpm/tpm_crb_sysbus.c``
+ - ``hw/tpm/tpm_crb.h``
+
+As with TIS, both a fixed-address device and a sysbus device are
+available. ``tpm-crb`` is used with the pc/q35 machines and hardcodes
+the addresses above. ``tpm-crb-device`` is a sysbus device that can be
+instantiated on the Arm virt machine, where the platform bus assigns
+its register window and its PPI region dynamically, exactly as it does
+for ``tpm-tis-device``::
+
+    -device tpm-crb-device,tpmdev=tpm0
+
+Limitations of ``tpm-crb-device``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+**Firmware does not use it.** CRB is discovered purely through ACPI --
+the ``MSFT0101`` device in the DSDT plus the TPM2 table's CRB start
+method -- so no device tree node is generated. Firmware for the Arm
+virt machine (edk2/OVMF) locates a TPM through the device tree and only
+recognises the ``tcg,tpm-tis-mmio`` binding, so with ``tpm-crb-device``
+it reports ``Tpm2SubmitCommand - Tcg2 - Not Found`` and performs no
+measurements. The guest OS still drives the TPM normally, but it must
+issue ``TPM2_Startup`` itself and **the firmware boot stages are not
+measured into the PCRs**. Use ``tpm-tis-device`` if measured boot
+matters.
+
+**Sub-page regions are not mapped by HVF.** The register window and the
+command/response buffer are smaller than, and not aligned to, the 16 KiB
+host page used on Apple Silicon, so Hypervisor.framework cannot map them
+and every guest access is trapped and emulated. Emulation needs a valid
+instruction syndrome, so a guest reaching the CRB window with an
+instruction that reports ``ISV=0`` -- notably ``LDP``/``STP`` and SIMD
+accesses -- will hit the ``assert(isv)`` in
+``target/arm/hvf/hvf.c:hvf_handle_exception()`` and abort QEMU. Linux
+uses ``memcpy_toio()``/``memcpy_fromio()`` and is unaffected; other
+guests may not be.
 
 SPAPR interface
 ---------------
@@ -190,8 +227,8 @@ leave enough room for future updates.
 PPI on ARM64 virt
 -----------------
 
-The ARM virt machine supports PPI for ``tpm-tis-device`` as defined
-in the `PPI specification`_.
+The ARM virt machine supports PPI for ``tpm-tis-device`` and
+``tpm-crb-device`` as defined in the `PPI specification`_.
 
 Unlike the x86 TIS device where the PPI memory region is mapped at
 the fixed address ``0xFED45000`` (within the TIS MMIO range), the
@@ -204,6 +241,7 @@ address.
 PPI is controlled by the ``ppi`` property (default ``on``)::
 
     -device tpm-tis-device,tpmdev=tpm0,ppi=on
+    -device tpm-crb-device,tpmdev=tpm0,ppi=on
 
 Without PPI, guest operating systems such as Windows 11
 ARM64 will log errors when attempting to query TPM Physical

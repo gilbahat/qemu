@@ -136,6 +136,8 @@ static bool type_match(SysBusDevice *sbdev, const BindingEntry *entry)
 static const BindingEntry bindings[] = {
 #ifdef CONFIG_TPM
     TYPE_BINDING(TYPE_TPM_TIS_SYSBUS, add_tpm_tis_fdt_node),
+    /* CRB is discovered through ACPI only; there is no DT binding for it */
+    TYPE_BINDING(TYPE_TPM_CRB_SYSBUS, no_fdt_node),
 #endif
     /* No generic DT support for smmuv3 dev. Support added for arm virt only */
     TYPE_BINDING(TYPE_ARM_SMMUV3, no_fdt_node),

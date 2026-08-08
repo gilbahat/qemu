@@ -2623,6 +2623,15 @@ void build_tpm2(GArray *table_data, BIOSLinker *linker, GArray *tcpalog,
     } else if (TPM_IS_CRB(tpmif)) {
         control_area_start_address = TPM_CRB_ADDR_CTRL;
         start_method = TPM2_START_METHOD_CRB;
+    } else if (TPM_IS_CRB_SYSBUS(tpmif)) {
+        /*
+         * The sysbus CRB device is placed by the machine, so ask it where its
+         * control area ended up rather than assuming the PC chipset address.
+         */
+        control_area_start_address =
+            object_property_get_uint(OBJECT(tpmif), "ctrl-area-addr",
+                                     &error_abort);
+        start_method = TPM2_START_METHOD_CRB;
     } else {
         g_assert_not_reached();
     }
