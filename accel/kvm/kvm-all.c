@@ -3607,6 +3607,9 @@ static int kvm_post_convert_section(MemoryRegionSection *section, bool to_privat
         }
     }
 
+    if (current_machine->cgs && current_machine->cgs->convert_in_place)
+        return 0;
+
     if (to_private) {
         if (rb->page_size != qemu_real_host_page_size()) {
             /*
