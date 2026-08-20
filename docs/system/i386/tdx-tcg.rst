@@ -162,6 +162,19 @@ the 64-bit ``queue_desc``/``queue_driver``/``queue_device`` registers reached
 through the PCI capability structures, with ``VIRTIO_F_VERSION_1`` and
 ``VIRTIO_F_ACCESS_PLATFORM`` negotiated.
 
+**Device models must be in-process.** A device QEMU emulates itself walks its
+own rings, so every descriptor fetch and buffer mapping goes through the filter
+above and is checked like any other DMA. A device whose datapath is handed to
+another process does not: ``VHOST_USER_SET_MEM_TABLE`` gives the backend a flat
+list of mappable regions, and no flat list can express a translate function
+whose answer depends on runtime conversion state. So ``virtio-blk``,
+``virtio-net`` and :doc:`virtio-vsock <../devices/virtio/virtio-vsock>` work
+under an emulated TD, while their ``vhost`` and ``vhost-user`` counterparts do
+not. The vhost-user IOTLB extension exists for precisely this problem, but it
+has to be implemented at both ends, and the common vsock backend
+(``vhost-device-vsock``) advertises neither ``VIRTIO_F_ACCESS_PLATFORM`` nor
+``VHOST_USER_PROTOCOL_F_BACKEND_REQ``.
+
 The order a guest meets these in is not the order they are listed. Device work
 comes last, not first: a modern virtio device is configured through MMIO, and
 MMIO is shared to a TD, so a BAR has to be mapped through the SHARED alias before

@@ -23,6 +23,7 @@ can also be off-loaded to an external process via :ref:`vhost user
    virtio-gpu.rst
    virtio-pmem.rst
    virtio-snd.rst
+   virtio-vsock.rst
    vhost-user.rst
    vhost-user-contrib.rst
 

@@ -36,7 +36,10 @@ Machine-specific options
 
 It supports the following machine-specific options:
 
-- nitro-enclave.vsock=string (required) (Id of the chardev from '-chardev' option that vhost-user-vsock device will use)
+- nitro-enclave.vsock=string (Id of the chardev from '-chardev' option that vhost-user-vsock device will use)
+- nitro-enclave.vsock-path=string (Host socket path for the built-in virtio-vsock device; mutually exclusive with 'vsock', and one of the two is required)
+- nitro-enclave.vsock-cid=uint32 (optional) (CID of the enclave when using 'vsock-path'; default 4)
+- nitro-enclave.vsock-listen=string (optional) ('+'-separated enclave ports to accept host connections on when using 'vsock-path')
 - nitro-enclave.id=string (optional) (Set enclave identifier)
 - nitro-enclave.parent-role=string (optional) (Set parent instance IAM role ARN)
 - nitro-enclave.parent-id=string (optional) (Set parent instance identifier)
@@ -76,3 +79,22 @@ connect to the enclave VM, run them on the host machine after enclave VM starts.
 You need to modify the applications to connect to CID 1 (instead of the enclave
 VM's CID) and use the forward-listen (e.g., 9001+9002) option of vhost-device-vsock
 to forward the ports they connect to.
+
+Using the built-in vsock device
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``vsock-path`` uses QEMU's own :doc:`../devices/virtio/virtio-vsock` device
+instead, so there is no daemon to run alongside and no host ``AF_VSOCK``
+support required::
+
+  $ qemu-system-x86_64 -M nitro-enclave,vsock-path=/tmp/vsock.uds,vsock-cid=4,\
+vsock-listen=9001+9002,id=hello-world \
+     -kernel hello-world.eif -nographic -m 4G
+
+The host end is an ordinary Unix socket speaking the same hybrid protocol as
+``vhost-device-vsock --uds-path``, so host programs written against that keep
+working. Connections *to* the enclave go to ``/tmp/vsock.uds_<port>`` for each
+port named in ``vsock-listen``; unlike the vhost-device-vsock recipe above, they
+do not need to be redirected through CID 1.
+
+See :doc:`../devices/virtio/virtio-vsock` for the protocol in full.

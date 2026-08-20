@@ -3029,8 +3029,17 @@ static void gen_multi0F(DisasContext *s, X86DecodedInsn *decode)
                  * not CPL-0-restricted on hardware -- a #VC can be taken at
                  * CPL 3 -- and the GHCB is guest memory, so nothing is exposed
                  * by allowing it.
+                 *
+                 * Nor is it 64-bit-only.  VMMCALL is valid in every protected
+                 * mode, and the GHCB MSR protocol is specifically what a guest
+                 * uses *before* it has paging and long mode: OVMF's SEC phase
+                 * and any unikernel that must discover the C-bit before it can
+                 * build page tables run the exchange from 32-bit code.  This
+                 * required CODE64 and so refused that exchange with #UD, which
+                 * on a guest with no IDT yet is a triple fault with nothing to
+                 * look at.  Protected mode is the real requirement.
                  */
-                if (!SNP(s) || !CODE64(s)
+                if (!SNP(s) || !PE(s)
                     || (s->prefix & (PREFIX_REPNZ | PREFIX_DATA))) {
                     goto illegal_op;
                 }

@@ -97,6 +97,13 @@ config VHOST_USER_VSOCK
     select VHOST_VSOCK_COMMON
     depends on VIRTIO && VHOST_USER
 
+# In-QEMU vsock device: owns its virtqueues, so it needs no vhost backend and
+# works behind a translating address space (see hw/i386/tdx-dma.c).
+config VIRTIO_VSOCK
+    bool
+    default y
+    depends on VIRTIO
+
 config VHOST_USER_I2C
     bool
     default y

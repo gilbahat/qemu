@@ -47,6 +47,7 @@ config NITRO_ENCLAVE_AARCH64
     select EIF
     select ARM_VIRT
     select VHOST_USER_VSOCK
+    select VIRTIO_VSOCK
     select VIRTIO_NSM
 
 config CUBIEBOARD

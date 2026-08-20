@@ -18,6 +18,9 @@
 
 /* Machine type options */
 #define NITRO_ENCLAVE_VSOCK_CHARDEV_ID "vsock"
+#define NITRO_ENCLAVE_VSOCK_PATH "vsock-path"
+#define NITRO_ENCLAVE_VSOCK_CID "vsock-cid"
+#define NITRO_ENCLAVE_VSOCK_LISTEN "vsock-listen"
 #define NITRO_ENCLAVE_ID    "id"
 #define NITRO_ENCLAVE_PARENT_ROLE "parent-role"
 #define NITRO_ENCLAVE_PARENT_ID "parent-id"
@@ -34,6 +37,12 @@ struct NitroEnclaveMachineState {
 
     /* Machine type options */
     char *vsock;
+    /* Host socket path for the built-in virtio-vsock device */
+    char *vsock_path;
+    /* CID given to the built-in virtio-vsock device */
+    uint32_t vsock_cid;
+    /* '+'-separated host->guest ports for the built-in device */
+    char *vsock_listen;
     /* Enclave identifier */
     char *id;
     /* Parent instance IAM role ARN */

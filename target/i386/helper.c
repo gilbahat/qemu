@@ -255,8 +255,17 @@ void cpu_x86_update_cr4(CPUX86State *env, uint32_t new_cr4)
 }
 
 #if !defined(CONFIG_USER_ONLY)
-bool x86_cpu_translate_for_debug(CPUState *cs, vaddr addr,
-                                 TranslateForDebugResult *result)
+/*
+ * (leaf_c), when asked for, reports the C-bit of the entry that terminated the
+ * walk -- the one that governs the data page. result->physaddr deliberately
+ * does not carry it, and callers that need to know whether the guest reached
+ * the page privately or through a shared mapping cannot recover it afterwards.
+ * PVALIDATE is one: the instruction faults on a shared mapping rather than
+ * returning a status, so the emulation has to know.
+ */
+static bool x86_translate_for_debug(CPUState *cs, vaddr addr,
+                                    TranslateForDebugResult *result,
+                                    bool *leaf_c)
 {
     X86CPU *cpu = X86_CPU(cs);
     CPUX86State *env = &cpu->env;
@@ -380,6 +389,15 @@ bool x86_cpu_translate_for_debug(CPUState *cs, vaddr addr,
 #ifdef TARGET_X86_64
 out:
 #endif
+    if (leaf_c) {
+        /*
+         * With paging disabled there is no entry to carry a C-bit, and an SNP
+         * guest's accesses are private in that state, so report private.
+         */
+        *leaf_c = !(env->cr[0] & CR0_PG_MASK) ||
+                  !!(pte & snp_cbit_mask(env));
+    }
+
     pte &= amask & ~(page_size - 1);
     page_offset = addr & (page_size - 1);
 
@@ -388,6 +406,19 @@ out:
     result->physaddr = pte | page_offset;
     result->lg_page_size = ctz64(page_size);
     return true;
+}
+
+bool x86_cpu_translate_for_debug(CPUState *cs, vaddr addr,
+                                 TranslateForDebugResult *result)
+{
+    return x86_translate_for_debug(cs, addr, result, NULL);
+}
+
+bool x86_cpu_translate_for_debug_c(CPUState *cs, vaddr addr,
+                                   TranslateForDebugResult *result,
+                                   bool *leaf_c)
+{
+    return x86_translate_for_debug(cs, addr, result, leaf_c);
 }
 
 typedef struct MCEInjectionParams {

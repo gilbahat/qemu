@@ -2650,6 +2650,10 @@ int x86_cpu_pending_interrupt(CPUState *cs, int interrupt_request);
 
 bool x86_cpu_translate_for_debug(CPUState *cpu, vaddr addr,
                                  TranslateForDebugResult *result);
+/* As above, and also reports the C-bit of the entry that ended the walk. */
+bool x86_cpu_translate_for_debug_c(CPUState *cpu, vaddr addr,
+                                   TranslateForDebugResult *result,
+                                   bool *leaf_c);
 int cpu_get_pic_interrupt(CPUX86State *s);
 
 /* MS-DOS compatibility mode FPU exception support */

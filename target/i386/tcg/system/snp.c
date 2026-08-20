@@ -368,18 +368,22 @@ void helper_snp_vc_msr(CPUX86State *env, uint32_t is_write)
 }
 
 /*
- * CPUID leaf 0 and the SEV feature leaf always answer natively: a guest that
- * could not execute them would have no way to discover it is an SNP guest, nor
- * to find the C-bit it needs before it can map a GHCB.  Leaf 0x80000000 is
- * included because a guest must read the maximum extended leaf before it can
- * ask for 0x8000001F.
+ * Every CPUID is intercepted, with no exemptions.
+ *
+ * Leaf 0, leaf 0x80000000 and the SEV feature leaf 0x8000001F used to answer
+ * natively, on the reasoning that a guest which could not execute them would
+ * have no way to discover it is an SNP guest nor to find the C-bit it needs
+ * before it can map a GHCB.  That reasoning is sound and the conclusion was
+ * still wrong: hardware grants no such exemption, and the GHCB MSR protocol
+ * already answers both questions -- SEV Information carries the C-bit position
+ * and MSR CPUID answers a leaf -- from the guest's first instruction, needing
+ * neither a handler nor a GHCB page.  The exemption did not make early
+ * discovery possible; it made a guest that never learned to do it look like it
+ * worked.
  */
 void helper_snp_vc_cpuid(CPUX86State *env)
 {
-    uint32_t leaf = (uint32_t)env->regs[R_EAX];
-
-    if (!snp_vc_enabled(env, SNP_VC_CPUID) ||
-        leaf == 0 || leaf == 0x80000000 || leaf == 0x8000001F) {
+    if (!snp_vc_enabled(env, SNP_VC_CPUID)) {
         return;
     }
     snp_raise_vc(env, SVM_EXIT_CPUID, GETPC());
@@ -576,6 +580,7 @@ void helper_pvalidate(CPUX86State *env)
     bool validate = env->regs[R_EDX] & 1;
     uint64_t align = page_size ? (2 * MiB) : (4 * KiB);
     TranslateForDebugResult dbg;
+    bool mapped_private = false;
     hwaddr gpa;
     SnpPageState cur;
 
@@ -601,20 +606,44 @@ void helper_pvalidate(CPUX86State *env)
         return;
     }
 
-    if (!snp_rmp_enabled(env)) {
-        env->regs[R_EAX] = PVALIDATE_SUCCESS;
-        return;
-    }
-
     /*
      * PVALIDATE takes a linear address.  Translating it through the walker
      * would re-enter the RMP check on the very page being validated, so use
      * the debug walk, which does not consult page state.
      */
-    if (!x86_cpu_translate_for_debug(cs, gva & TARGET_PAGE_MASK, &dbg)) {
-        env->regs[R_EAX] = PVALIDATE_FAIL_INPUT;
+    if (!x86_cpu_translate_for_debug_c(cs, gva & TARGET_PAGE_MASK, &dbg,
+                                       &mapped_private)) {
+        /*
+         * Unmapped.  Each mode keeps the answer it has always given: a guest
+         * may deliberately leave a page unmapped as a NULL guard and walk over
+         * it, and changing that at the same time as the check below would be
+         * changing two things at once.
+         */
+        env->regs[R_EAX] = snp_rmp_enabled(env) ? PVALIDATE_FAIL_INPUT
+                                                : PVALIDATE_SUCCESS;
         return;
     }
+
+    /*
+     * The page must be mapped *private*.  PVALIDATE on a mapping without the
+     * C-bit does not return a status -- it raises #PF with the reserved bit
+     * set -- so a guest cannot discover this by checking the result, and one
+     * that shares a page and later walks over it again dies here rather than
+     * being told.  This is checked whether or not the RMP is modelled: it is
+     * a property of the instruction, not of page state, and it is how the
+     * guest's own GHCB page went unnoticed until hardware refused it.
+     */
+    if (!mapped_private) {
+        env->cr[2] = gva;
+        raise_exception_err_ra(env, EXCP0E_PAGE,
+                               PG_ERROR_P_MASK | PG_ERROR_RSVD_MASK, GETPC());
+    }
+
+    if (!snp_rmp_enabled(env)) {
+        env->regs[R_EAX] = PVALIDATE_SUCCESS;
+        return;
+    }
+
     gpa = dbg.physaddr & ~snp_cbit_mask(env);
 
     cur = snp_rmp_get(env, gpa);
@@ -702,8 +731,14 @@ static void snp_ghcb_msr_protocol(CPUX86State *env)
     }
 
     case GHCB_MSR_PSC_REQ: {
-        uint64_t op = val >> 56;
-        /* The GPA is bits 51:12; the operation rides in 63:56 and must go. */
+        /*
+         * GHCBData[55:52] is the page operation and GHCBData[51:12] the GFN,
+         * per the GHCB specification's Page State Change MSR protocol -- which
+         * is also what Linux's GHCB_MSR_PSC_REQ_GFN() encodes.  This decoded
+         * 63:56 until it was checked against the specification; a guest that
+         * matched was matching a bug, not an interface.
+         */
+        uint64_t op = (val >> 52) & 0xf;
         hwaddr gpa = val & MAKE_64BIT_MASK(12, 40);
 
         /*
@@ -1333,21 +1368,47 @@ static void snp_ghcb_page_protocol(CPUX86State *env, int next_eip_addend)
 
 /*
  * VMGEXIT (F3 0F 01 D9).  A request in the GHCB MSR runs the MSR protocol;
- * otherwise the event is dispatched through the registered GHCB page.
+ * otherwise the register holds the address of the GHCB page to use.
+ *
+ * That last part is the whole of the contract and it is easy to get wrong in
+ * an emulator's favour.  The hypervisor learns where the GHCB is from this
+ * register at the moment of the exit -- not from the GHCB Registration
+ * exchange, which is a separate and optional step saying which page the guest
+ * intends to use.  This used to ignore the register and fall back to whatever
+ * REG_GPA had recorded, which is a kindness KVM does not extend: it answers a
+ * zeroed register with "vmgexit: GHCB gpa is not set" and re-enters the guest,
+ * so a guest that never learned to write the address livelocks -- and does so
+ * with no console, because the console is what it was trying to reach.
  */
 void helper_vmgexit(CPUX86State *env, int next_eip_addend)
 {
+    uint64_t gpa;
+
     if (snp_msr_is_request(env->snp_ghcb_msr)) {
         snp_ghcb_msr_protocol(env);
         return;
     }
 
-    if (!env->snp_ghcb_gpa) {
+    gpa = SNP_GHCB_MSR_DATA(env->snp_ghcb_msr);
+    if (!gpa) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "sev-snp: VMGEXIT with neither a GHCB MSR request nor a "
-                      "registered GHCB page\n");
+                      "GHCB address in the MSR: GHCB gpa is not set\n");
         return;
     }
+
+    /*
+     * A registration, if one was made, is binding: the guest asked for that
+     * page and may not then exit through another.
+     */
+    if (env->snp_ghcb_gpa && gpa != env->snp_ghcb_gpa) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "sev-snp: VMGEXIT names GHCB 0x%" PRIx64 " but 0x%"
+                      PRIx64 " is the registered one\n",
+                      gpa, env->snp_ghcb_gpa);
+        return;
+    }
+    env->snp_ghcb_gpa = gpa;
 
     snp_ghcb_page_protocol(env, next_eip_addend);
 }

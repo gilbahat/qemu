@@ -144,6 +144,7 @@ config NITRO_ENCLAVE
     select EIF
     select MICROVM
     select VHOST_USER_VSOCK
+    select VIRTIO_VSOCK
     select VIRTIO_NSM
 
 config X86_IOMMU
