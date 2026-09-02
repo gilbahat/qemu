@@ -62,14 +62,17 @@ static unsigned long read_cr3(void)
     return v;
 }
 
+/*
+ * Handed over by the bootstrap, which read it from CPUID.0x8000001F before it
+ * validated anything.  Asking again here is not an option: the bootstrap's own
+ * PVALIDATE armed #VC reflection, so a CPUID at this point faults -- and does
+ * it on the first line of main(), before there is a handler to take it.
+ */
+extern unsigned int snp_cbit_pos;
+
 static unsigned int cbitpos(void)
 {
-    unsigned int a, b, c, d;
-
-    __asm__ __volatile__("cpuid"
-                         : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
-                         : "a"(0x8000001F), "c"(0));
-    return b & 0x3f;
+    return snp_cbit_pos;
 }
 
 /* --- #VC handler --------------------------------------------------------- */

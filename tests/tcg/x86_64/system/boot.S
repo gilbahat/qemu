@@ -128,6 +128,16 @@ _start:
 	 * per entry is enough.
 	 */
 	and $0x3f, %ebx
+
+	/*
+	 * Keep it.  Every CPUID reflects as #VC from the first PVALIDATE
+	 * onwards -- which this bootstrap is about to do -- so a payload that
+	 * asks for the C-bit again faults, and faults before it has had a
+	 * chance to install a handler.  Real firmware hands the position on for
+	 * the same reason rather than making the payload re-derive it.
+	 */
+	mov %ebx, snp_cbit_pos
+
 	sub $32, %ebx
 	mov %ebx, %ecx
 	mov $1, %esi
@@ -277,6 +287,11 @@ __sys_outc:
 	/* Interrupt Descriptor Table */
 
         .section .data
+	.globl snp_cbit_pos
+	.align 4
+snp_cbit_pos:
+	.long 0
+
         .align 16
 
 idt_00: .int 0, 0
