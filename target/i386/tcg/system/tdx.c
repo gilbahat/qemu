@@ -481,7 +481,7 @@ static void tdx_launch_bsp(CPUX86State *env, hwaddr hob_gpa)
      * reset value instead gives a guest that enables PAE paging over a
      * long-mode table and takes a page fault on its own next instruction.
      */
-    cpu_load_efer(env, env->efer | MSR_EFER_LME);
+    cpu_load_efer(env, env->efer | MSR_EFER_SCE | MSR_EFER_LME | MSR_EFER_NXE);
     cpu_x86_update_cr0(env, (env->cr[0] | CR0_PE_MASK) & ~CR0_PG_MASK);
 
     /*
