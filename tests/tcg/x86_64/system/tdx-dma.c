@@ -2,16 +2,24 @@
  * Emulated Intel TDX device DMA test.
  *
  * A TD's private memory is unreachable by the host, so a device may only DMA
- * to memory the TD has converted to shared -- and it addresses that memory
- * through the SHARED alias.  Both halves are checked, because the address bit
- * alone is not the answer: a TD that sets the bit without ever issuing
- * TDVMCALL<MapGPA> has done nothing, and on hardware the shared mapping would
- * not exist.
+ * to memory the TD has converted with TDVMCALL<MapGPA> -- and it addresses that
+ * memory by its *plain* GPA.  Both halves are checked, because neither is the
+ * answer on its own.
+ *
+ * The alias bit does not belong in a DMA address.  A TDVMCALL argument carries
+ * it, because that is how the call names the alias to the TDX module; device
+ * DMA is not relayed through the module at all.  A VMM resolves a DMA address
+ * itself, against the ordinary guest memory map, where an address above RAM
+ * resolves to nothing: the descriptors are written, the device is kicked, and
+ * no data moves.  So an aliased DMA address is refused here whether or not the
+ * page behind it was converted, which is the case a guest would otherwise
+ * discover on hardware as a virtio device that negotiates and then hangs.
  *
  * The vehicle is the "edu" test device, whose DMA engine is programmable from
  * MMIO and calls pci_dma_read() on the guest's behalf -- the same path a virtio
  * ring fetch takes, with no driver needed.  Its dma_mask has to be widened past
- * the SHARED bit or it would clamp the alias away before the filter sees it.
+ * the SHARED bit anyway, so that an aliased address reaches the filter and is
+ * refused there rather than being quietly clamped before it arrives.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -226,7 +234,7 @@ int main(void)
     unsigned long src, res, zero, priv;
     volatile unsigned long *resp;
 
-    ml_printf("Emulated TDX device DMA test (SHARED bit %d)\n",
+    ml_printf("Emulated TDX device DMA test (MapGPA, SHARED bit %d)\n",
               (int)__builtin_ctzl(shared));
 
     if (!find_edu(&devfn)) {
@@ -262,46 +270,60 @@ int main(void)
     make_shared(zero, shared);
     resp = (volatile unsigned long *)res;
 
-    /* A converted page, addressed through the SHARED alias, must work. */
-    check(edu_dma(src | shared, EDU_DMA_BUF, 8, 0),
-          "DMA from a shared page did not complete");
-    check(edu_dma(EDU_DMA_BUF, res | shared, 8, EDU_DMA_TO_PCI),
-          "DMA back to a shared page did not complete");
+    /* A converted page, addressed by its plain GPA, must work. */
+    check(edu_dma(src, EDU_DMA_BUF, 8, 0),
+          "DMA from a converted page did not complete");
+    check(edu_dma(EDU_DMA_BUF, res, 8, EDU_DMA_TO_PCI),
+          "DMA back to a converted page did not complete");
     check(*resp == PATTERN_SHARED,
           "device did not read a converted page correctly");
 
     /* Blank the device buffer so a leftover cannot be mistaken for success. */
-    check(edu_dma(zero | shared, EDU_DMA_BUF, 8, 0),
+    check(edu_dma(zero, EDU_DMA_BUF, 8, 0),
           "DMA of the zero page did not complete");
     *resp = PATTERN_SHARED;
-    check(edu_dma(EDU_DMA_BUF, res | shared, 8, EDU_DMA_TO_PCI),
+    check(edu_dma(EDU_DMA_BUF, res, 8, EDU_DMA_TO_PCI),
           "DMA of the blanked buffer did not complete");
     check(*resp == 0, "device buffer was not blanked");
 
-    /* Private memory, addressed privately: refused, as before. */
+    /* Private memory, addressed privately: refused. */
     check(edu_dma(priv, EDU_DMA_BUF, 8, 0), "denied DMA did not complete");
-    check(edu_dma(EDU_DMA_BUF, res | shared, 8, EDU_DMA_TO_PCI),
+    check(edu_dma(EDU_DMA_BUF, res, 8, EDU_DMA_TO_PCI),
           "DMA of the buffer did not complete");
     check(*resp != PATTERN_PRIVATE, "device read TD-private memory");
 
     /*
-     * And the case the address bit alone would have let through: the SHARED
-     * alias on a page that was never converted.  Setting the bit is not the
-     * same as doing the work, and on hardware there would be no mapping.
+     * A page that was never converted, addressed through the alias: refused.
+     * Setting the bit is not the same as doing the work.
      */
     check(edu_dma(priv | shared, EDU_DMA_BUF, 8, 0),
           "denied DMA did not complete");
-    check(edu_dma(EDU_DMA_BUF, res | shared, 8, EDU_DMA_TO_PCI),
+    check(edu_dma(EDU_DMA_BUF, res, 8, EDU_DMA_TO_PCI),
           "DMA of the buffer did not complete");
     check(*resp != PATTERN_PRIVATE,
-          "device read a page whose SHARED alias was never mapped");
+          "device read a page addressed through the SHARED alias");
+
+    /*
+     * And the case that distinguishes this model from one that keys off the
+     * address bit: a page the TD really did convert, addressed through the
+     * alias anyway.  The conversion is not what makes this wrong -- carrying
+     * the alias into a DMA address is, because no VMM resolves one.  It must
+     * be refused just as firmly as the unconverted page above.
+     */
+    *resp = PATTERN_PRIVATE;
+    check(edu_dma(src | shared, EDU_DMA_BUF, 8, 0),
+          "denied DMA did not complete");
+    check(edu_dma(EDU_DMA_BUF, res, 8, EDU_DMA_TO_PCI),
+          "DMA of the buffer did not complete");
+    check(*resp != PATTERN_SHARED,
+          "device honoured a SHARED alias in a DMA address");
 
     if (failures) {
         ml_printf("%d failure(s)\n", failures);
         return 1;
     }
 
-    ml_printf("All TDX DMA checks passed (unconverted read gave 0x%lx)\n",
+    ml_printf("All TDX DMA checks passed (refused read gave 0x%lx)\n",
               *resp);
     return 0;
 }

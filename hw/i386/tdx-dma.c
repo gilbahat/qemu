@@ -65,9 +65,10 @@ static void tdx_dma_report_denied(TdxDmaState *s, hwaddr addr)
     if (!s->warned) {
         s->warned = true;
         warn_report("tdx: device DMA to GPA 0x%" HWADDR_PRIx " denied: the "
-                    "guest has not shared this memory. A TD must place DMA "
-                    "buffers in the SHARED alias (GPA bit %d set); on hardware "
-                    "the host cannot read TD-private memory at all.",
+                    "guest has not shared this memory. A TD must convert its "
+                    "DMA buffers with TDVMCALL<MapGPA> (which names the alias, "
+                    "GPA bit %d) and then give the device the plain GPA; on "
+                    "hardware the host cannot read TD-private memory at all.",
                     addr, ctz64(s->shared_mask));
     }
     qemu_log_mask(LOG_GUEST_ERROR,
@@ -93,37 +94,39 @@ static IOMMUTLBEntry tdx_dma_translate(IOMMUMemoryRegion *iommu_mr, hwaddr addr,
                               ~(hwaddr)TARGET_PAGE_MASK_TDX;
         ret.perm = IOMMU_RW;
     } else if (addr & s->shared_mask) {
-        hwaddr gpa = (addr & ~s->shared_mask) & ~(hwaddr)TARGET_PAGE_MASK_TDX;
-
         /*
-         * The SHARED alias is necessary but not sufficient.  Testing only the
-         * address bit would let a TD that never issued TDVMCALL<MapGPA> pass
-         * here and fail on hardware, where the alias is not mapped until the
-         * conversion happens -- so ask the page state when there is one.
+         * The SHARED alias has no business in a DMA address.
+         *
+         * A TDVMCALL argument carries the bit, because that is how the call
+         * tells the TDX module which alias it means.  Device DMA is not
+         * relayed through the module: a VMM resolves the address itself,
+         * against the ordinary guest memory map, and an address above RAM
+         * resolves to nothing -- the descriptors are written, the device is
+         * kicked, and no data moves.  Refusing it here is what makes that
+         * visible, rather than leaving a guest to discover it on hardware as
+         * a virtio device that negotiates and then hangs.
          */
-        if (tdx_sept_enabled(&s->cpu->env) &&
-            !tdx_sept_gpa_is_shared(&s->cpu->env, gpa)) {
-            if (!s->warned_unconverted) {
-                s->warned_unconverted = true;
-                warn_report("tdx: device DMA to GPA 0x%" HWADDR_PRIx " denied: "
-                            "the address carries the SHARED alias but the TD "
-                            "never converted the page with TDVMCALL<MapGPA>. "
-                            "Setting the bit is not enough; on hardware the "
-                            "shared mapping does not exist until the "
-                            "conversion is made.", addr);
-            }
-            qemu_log_mask(LOG_GUEST_ERROR,
-                          "tdx: DMA denied, GPA 0x%" HWADDR_PRIx " has the "
-                          "SHARED alias but was never converted\n", addr);
-            return ret;
+        if (!s->warned_unconverted) {
+            s->warned_unconverted = true;
+            warn_report("tdx: device DMA to 0x%" HWADDR_PRIx " denied: the "
+                        "address carries the SHARED alias. A TDVMCALL argument "
+                        "names the alias; a DMA address does not -- on hardware "
+                        "this resolves above RAM and silently transfers "
+                        "nothing.", addr);
         }
-
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "tdx: DMA denied, 0x%" HWADDR_PRIx " carries the SHARED "
+                      "alias\n", addr);
+    } else if (!tdx_sept_enabled(&s->cpu->env) ||
+               tdx_sept_gpa_is_shared(&s->cpu->env,
+                                      addr & ~(hwaddr)TARGET_PAGE_MASK_TDX)) {
         /*
-         * Shared: strip the alias bit and let the access through to system
-         * memory.  There is no encryption to undo -- the alias is the whole of
-         * what "shared" means in this model.
+         * A plain GPA over a page the TD converted with TDVMCALL<MapGPA>.
+         * That is what a device is given and all it can reach: private pages
+         * are behind guest_memfd on a real host and simply are not readable by
+         * the VMM.  With no page-state model to ask, fall back to allowing it.
          */
-        ret.translated_addr = gpa;
+        ret.translated_addr = addr & ~(hwaddr)TARGET_PAGE_MASK_TDX;
         ret.perm = IOMMU_RW;
     } else {
         tdx_dma_report_denied(s, addr);
@@ -202,9 +205,10 @@ void tdx_dma_setup(PCIBus *bus)
     address_space_init(&s->as, MEMORY_REGION(&s->iommu), "tdx-dma");
     pci_setup_iommu(bus, &tdx_dma_iommu_ops, s);
 
-    warn_report("tdx: device DMA is restricted to guest-shared memory "
-                "(SHARED alias at GPA bit %d) and legacy virtio is disabled. "
-                "This is an emulation aid, not a security boundary.",
+    warn_report("tdx: device DMA is restricted to pages the TD has converted "
+                "with TDVMCALL<MapGPA> (the alias is GPA bit %d, which belongs "
+                "in the call and not in a DMA address) and legacy virtio is "
+                "disabled. This is an emulation aid, not a security boundary.",
                 cpu->tdx_gpaw - 1);
 }
 
