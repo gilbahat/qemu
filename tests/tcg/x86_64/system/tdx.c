@@ -179,7 +179,7 @@ static void test_vmcall_io(void)
 
     a = (struct tdx_args){ .rax = TDG_VP_VMCALL, .rcx = EXPOSE_REGS,
                            .r10 = 0, .r11 = TDVMCALL_INSTR_IO,
-                           .r12 = 1, .r13 = 1, .r14 = 0x71 };
+                           .r12 = 1, .r13 = 0, .r14 = 0x71 };
     tdcall(&a);
     check(a.r10 == TDVMCALL_SUCCESS, "TDVMCALL<Instruction.IO> status");
     check((unsigned char)a.r11 == native, "TDVMCALL IO read != native inb");
@@ -187,7 +187,7 @@ static void test_vmcall_io(void)
     /* A size the architecture does not define must be refused. */
     a = (struct tdx_args){ .rax = TDG_VP_VMCALL, .rcx = EXPOSE_REGS,
                            .r10 = 0, .r11 = TDVMCALL_INSTR_IO,
-                           .r12 = 3, .r13 = 1, .r14 = 0x71 };
+                           .r12 = 3, .r13 = 0, .r14 = 0x71 };
     tdcall(&a);
     check(a.r10 == TDVMCALL_INVALID_OPERAND, "TDVMCALL IO accepted size 3");
 }
@@ -212,7 +212,7 @@ static void test_vmcall_mmio(void)
 {
     struct tdx_args a = { .rax = TDG_VP_VMCALL, .rcx = EXPOSE_REGS,
                           .r10 = 0, .r11 = TDVMCALL_REQUEST_MMIO,
-                          .r12 = 4, .r13 = 1, .r14 = LAPIC_VER };
+                          .r12 = 4, .r13 = 0, .r14 = LAPIC_VER };
     volatile unsigned int *p = (volatile unsigned int *)LAPIC_VER;
     unsigned int native;
 
@@ -225,7 +225,7 @@ static void test_vmcall_mmio(void)
 
     a = (struct tdx_args){ .rax = TDG_VP_VMCALL, .rcx = EXPOSE_REGS,
                            .r10 = 0, .r11 = TDVMCALL_REQUEST_MMIO,
-                           .r12 = 3, .r13 = 1, .r14 = LAPIC_VER };
+                           .r12 = 3, .r13 = 0, .r14 = LAPIC_VER };
     tdcall(&a);
     check(a.r10 == TDVMCALL_INVALID_OPERAND, "RequestMMIO accepted size 3");
 }

@@ -812,24 +812,31 @@ static void tdx_mem_page_accept(CPUX86State *env)
 }
 
 /*
- * TDVMCALL<Instruction.IO>: R12 access size, R13 direction (0 write, 1 read),
+ * TDVMCALL<Instruction.IO>: R12 access size, R13 direction (0 read, 1 write),
  * R14 port, R15 data for a write.  A read returns the value in R11.
  */
 static uint64_t tdx_vmcall_io(CPUX86State *env)
 {
     uint64_t size = env->regs[R_R12];
-    uint64_t is_read = env->regs[R_R13];
+    /*
+     * R13 is 0 for a read and 1 for a write, which is the opposite way round
+     * from the exit qualification bit a guest derives it from -- and this read
+     * it the wrong way for as long as the guest in this tree did, so the two
+     * agreed and every emulated test passed. A TDX host disagreed on the first
+     * inb().
+     */
+    uint64_t is_write = env->regs[R_R13];
     uint32_t port = (uint32_t)env->regs[R_R14];
     uint32_t data = (uint32_t)env->regs[R_R15];
 
     if (size != 1 && size != 2 && size != 4) {
         return TDVMCALL_INVALID_OPERAND;
     }
-    if (is_read > 1) {
+    if (is_write > 1) {
         return TDVMCALL_INVALID_OPERAND;
     }
 
-    if (is_read) {
+    if (!is_write) {
         uint64_t val;
 
         switch (size) {
@@ -861,7 +868,7 @@ static uint64_t tdx_vmcall_io(CPUX86State *env)
 }
 
 /*
- * TDVMCALL<#VE.RequestMMIO>: R12 size, R13 direction (0 write, 1 read),
+ * TDVMCALL<#VE.RequestMMIO>: R12 size, R13 direction (0 read, 1 write),
  * R14 GPA, R15 data for a write.  A read returns the value in R11.  This is
  * the counterpart of the #VE raised by tdx_mmio_check(): the guest cannot
  * touch device memory directly, so it asks the VMM to do it.
@@ -872,7 +879,8 @@ static uint64_t tdx_vmcall_mmio(CPUX86State *env)
     CPUState *cs = env_cpu(env);
     MemTxAttrs attrs = cpu_get_mem_attrs(env);
     uint64_t size = env->regs[R_R12];
-    uint64_t is_read = env->regs[R_R13];
+    /* 0 is a read and 1 is a write; see tdx_vmcall_io(). */
+    uint64_t is_write = env->regs[R_R13];
     uint64_t gpa = tdx_strip_shared(cpu, env->regs[R_R14]);
     uint64_t data = env->regs[R_R15];
     uint8_t buf[8];
@@ -880,11 +888,11 @@ static uint64_t tdx_vmcall_mmio(CPUX86State *env)
     if (size != 1 && size != 2 && size != 4 && size != 8) {
         return TDVMCALL_INVALID_OPERAND;
     }
-    if (is_read > 1) {
+    if (is_write > 1) {
         return TDVMCALL_INVALID_OPERAND;
     }
 
-    if (is_read) {
+    if (!is_write) {
         if (address_space_read(cpu_addressspace(cs, attrs), gpa, attrs, buf,
                                size) != MEMTX_OK) {
             return TDVMCALL_INVALID_OPERAND;
