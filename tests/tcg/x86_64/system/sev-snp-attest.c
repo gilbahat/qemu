@@ -522,7 +522,17 @@ int main(void)
     vmgexit();
     resp = rdmsr(MSR_AMD64_SEV_ES_GHCB);
     check((resp & 0xfff) == GHCB_MSR_REG_GPA_RESP, "GHCB registration");
-    wrmsr(MSR_AMD64_SEV_ES_GHCB, 0);
+
+    /*
+     * Leave the GHCB address in the register, which is what the page protocol
+     * runs on: the VMM reads the GHCB out of the MSR at each VMGEXIT, not out
+     * of the registration.  Zeroing it here would make every request below
+     * arrive with no GHCB at all -- KVM answers that with "GHCB gpa is not
+     * set" and re-enters the guest, so the failure is a livelock, not an
+     * error.  Registration says which page this guest intends to use; the
+     * register still has to name it.
+     */
+    wrmsr(MSR_AMD64_SEV_ES_GHCB, (unsigned long)ghcb);
 
     /* VMPCK0 comes out of the secrets page the emulator placed. */
     mem_cpy(vmpck, (const void *)SECRETS_VMPCK0, VMPCK_LEN);
