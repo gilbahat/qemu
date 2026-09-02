@@ -17,6 +17,8 @@
 #include "hw/core/boards.h"
 #include "hw/core/qdev.h"
 #include "system/memory.h"
+#include "hw/i386/apic.h"
+#include "hw/i386/e820_memory_layout.h"
 #include "migration/vmstate.h"
 #include "hw/i386/tdx-dma.h"
 #include "hw/i386/x86-launch-image.h"
@@ -52,6 +54,8 @@ typedef struct TdxTcgState {
      */
     bool ve_armed;
     bool mrtd_valid;
+    /* A firmware launch has been performed; see tdx_launch_firmware(). */
+    bool launched;
 
     /*
      * A GetQuote in flight.  Quoting is asynchronous on hardware -- the VMM
@@ -205,6 +209,468 @@ static TdxTcgState *tdx_get_state(void);
  * reading a whole page through it walks off the end of the allocation.  Guest
  * memory holds the data followed by the zero fill, which is what was launched.
  */
+/*
+ * Launching a TD from firmware, rather than direct-booting a payload.
+ *
+ * On hardware the TDX module does this: it reads the TDVF metadata out of the
+ * firmware image, populates the described sections into private memory, builds
+ * the TD HOB, and starts the BSP in 32-bit protected mode with the HOB's
+ * address in a register. QEMU never has to know the register contract because
+ * the module performs the setup -- which is why nothing in the KVM path
+ * describes it, and why this is the piece a TCG emulation has to supply.
+ *
+ * Without it a firmware image cannot be booted here at all: the reset vector is
+ * 32-bit code, the architectural reset is 16-bit real mode, and the guest
+ * decodes its own entry point as garbage and wanders off. That is exactly what
+ * it did.
+ *
+ * The sections themselves need no copying on this path. A -bios image is mapped
+ * at 4 GiB minus its size, and a TDVF's BFV/CFV MemoryAddress values are its
+ * own file offsets in that same window, so they already sit where the metadata
+ * says. What is missing is the TD HOB, which lives in low RAM.
+ */
+
+static void tdx_sept_set(CPUX86State *env, hwaddr gpa, TdxPageState st);
+static bool tdx_gpa_is_ram(CPUX86State *env, hwaddr gpa);
+
+/* The GUIDed table OVMF puts at the end of a flash image, little-endian. */
+static const uint8_t tdx_ovmf_footer_guid[16] = {
+    0xde, 0x82, 0xb5, 0x96, 0xb2, 0x1f, 0xf7, 0x45,
+    0xba, 0xea, 0xa3, 0x66, 0xc5, 0x5a, 0x08, 0x2d,
+};
+/* e47a6535-984a-4798-865e-4685a7bf8ec2 */
+static const uint8_t tdx_metadata_guid[16] = {
+    0x35, 0x65, 0x7a, 0xe4, 0x4a, 0x98, 0x98, 0x47,
+    0x86, 0x5e, 0x46, 0x85, 0xa7, 0xbf, 0x8e, 0xc2,
+};
+
+#define TDX_FW_TOP          0x100000000ULL
+#define TDX_FW_TABLE_SCAN   0x1000     /* enough to hold the GUIDed table */
+
+#define TDVF_SECTION_BFV        0
+#define TDVF_SECTION_CFV        1
+#define TDVF_SECTION_TD_HOB     2
+#define TDVF_SECTION_TEMP_MEM   3
+
+/* EFI HOB, only the two shapes a payload needs to find its memory. */
+#define EFI_HOB_TYPE_HANDOFF            0x0001
+#define EFI_HOB_TYPE_RESOURCE_DESCRIPTOR 0x0003
+#define EFI_HOB_TYPE_END_OF_HOB_LIST    0xFFFF
+#define EFI_RESOURCE_SYSTEM_MEMORY      0x00000000
+#define EFI_RESOURCE_MEMORY_UNACCEPTED  0x00000007
+/* PRESENT | INITIALIZED | TESTED, which is what QEMU's own builder uses. */
+#define EFI_RESOURCE_ATTRIBUTE_TDVF     0x00000007
+
+/*
+ * Find the TDVF metadata the way a VMM does: the footer GUID sits 48 bytes
+ * before the end of the image, the table is walked backwards from just before
+ * it, and the metadata entry holds an offset back from the image's end.
+ */
+static bool tdx_find_metadata(hwaddr *meta_gpa)
+{
+    g_autofree uint8_t *buf = g_malloc(TDX_FW_TABLE_SCAN);
+    unsigned foot, p, start;
+    uint16_t tbl_len;
+
+    if (address_space_read(&address_space_memory,
+                           TDX_FW_TOP - TDX_FW_TABLE_SCAN,
+                           MEMTXATTRS_UNSPECIFIED, buf,
+                           TDX_FW_TABLE_SCAN) != MEMTX_OK) {
+        return false;
+    }
+
+    foot = TDX_FW_TABLE_SCAN - 0x30;
+    if (memcmp(buf + foot, tdx_ovmf_footer_guid, 16) != 0) {
+        return false;
+    }
+    tbl_len = lduw_le_p(buf + foot - 2);
+    if (tbl_len < 18 || tbl_len > foot) {
+        return false;
+    }
+
+    p = foot - 2;
+    start = p - (tbl_len - 18);
+    while (p > start) {
+        uint16_t elen = lduw_le_p(buf + p - 18);
+
+        if (elen < 18 || elen > p) {
+            return false;
+        }
+        if (memcmp(buf + p - 16, tdx_metadata_guid, 16) == 0) {
+            *meta_gpa = TDX_FW_TOP - ldl_le_p(buf + p - elen);
+            return true;
+        }
+        p -= elen;
+    }
+    return false;
+}
+
+/*
+ * Make the firmware window writable.
+ *
+ * -bios installs the image as RAM marked read-only, and on hardware it is
+ * nothing of the kind: KVM_TDX_INIT_MEM_REGION populates those pages as
+ * ordinary private memory and the firmware writes to them. td-shim builds its
+ * page tables in a TEMP_MEM section inside that window, so against a read-only
+ * region the writes are silently dropped and it enables paging on a table full
+ * of zeroes -- which is exactly where it stopped.
+ *
+ * The region is found by address rather than by name so this does not depend on
+ * which of the several -bios paths installed it.
+ */
+static void tdx_firmware_make_writable(hwaddr base, uint64_t size)
+{
+    MemoryRegionSection mrs = memory_region_find(get_system_memory(), base, 1);
+
+    if (!mrs.mr) {
+        return;
+    }
+    if (memory_region_is_rom(mrs.mr) || mrs.mr->readonly) {
+        memory_region_set_readonly(mrs.mr, false);
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "tdx: firmware window at 0x%" HWADDR_PRIx
+                      " made writable for the TD launch\n", base);
+    }
+    memory_region_unref(mrs.mr);
+}
+
+static void tdx_hob_put_header(uint8_t *b, size_t *o, uint16_t type,
+                               uint16_t len)
+{
+    stw_le_p(b + *o, type);
+    stw_le_p(b + *o + 2, len);
+    stl_le_p(b + *o + 4, 0);
+    *o += 8;
+}
+
+/*
+ * Build the TD HOB. One resource descriptor covering RAM is all a payload
+ * needs; the firmware's own reserved windows are above it and are not
+ * described as system memory.
+ */
+static void tdx_hob_put_resource(uint8_t *b, size_t *o, uint32_t type,
+                                 uint64_t start, uint64_t len)
+{
+    if (!len) {
+        return;
+    }
+    tdx_hob_put_header(b, o, EFI_HOB_TYPE_RESOURCE_DESCRIPTOR, 0x30);
+    memset(b + *o, 0, 16);                                  /* Owner GUID */
+    stl_le_p(b + *o + 16, type);
+    stl_le_p(b + *o + 20, EFI_RESOURCE_ATTRIBUTE_TDVF);
+    stq_le_p(b + *o + 24, start);
+    stq_le_p(b + *o + 32, len);
+    *o += 0x28;
+}
+
+/*
+ * Build the TD HOB, following what QEMU's own tdvf_hob_create() produces.
+ *
+ * The distinction that matters is accepted versus not. Memory the launch
+ * populated -- here just the TD HOB's own pages -- is SYSTEM_MEMORY; everything
+ * else is MEMORY_UNACCEPTED, which is how the firmware is told what it has to
+ * accept before touching. Reporting all of RAM as SYSTEM_MEMORY, as this did
+ * at first, tells the firmware its memory is already usable when none of it is.
+ *
+ * Efi{Free}Memory{Top,Bottom} are left zeroed deliberately: the reference
+ * builder notes they are ignored, and inventing values invites a firmware to
+ * believe them.
+ */
+/*
+ * Emit one run of RAM, splitting it where the TD HOB falls inside: those pages
+ * are already populated and accepted, so they are system memory rather than
+ * unaccepted memory.
+ */
+static void tdx_hob_put_ram(uint8_t *hob, size_t *o, hwaddr start, uint64_t len,
+                            hwaddr hob_gpa, uint64_t hob_size)
+{
+    hwaddr end = start + len;
+
+    if (hob_gpa < start || hob_gpa >= end) {
+        tdx_hob_put_resource(hob, o, EFI_RESOURCE_MEMORY_UNACCEPTED, start, len);
+        return;
+    }
+
+    if (hob_gpa > start) {
+        tdx_hob_put_resource(hob, o, EFI_RESOURCE_MEMORY_UNACCEPTED,
+                             start, hob_gpa - start);
+    }
+    tdx_hob_put_resource(hob, o, EFI_RESOURCE_SYSTEM_MEMORY, hob_gpa, hob_size);
+    if (hob_gpa + hob_size < end) {
+        tdx_hob_put_resource(hob, o, EFI_RESOURCE_MEMORY_UNACCEPTED,
+                             hob_gpa + hob_size, end - hob_gpa - hob_size);
+    }
+}
+
+static void tdx_build_hob(CPUX86State *env, hwaddr gpa, uint64_t hob_size)
+{
+    g_autofree uint8_t *hob = g_malloc0(hob_size);
+    size_t o = 0, handoff;
+
+    handoff = o;
+    tdx_hob_put_header(hob, &o, EFI_HOB_TYPE_HANDOFF, 0x38);
+    stl_le_p(hob + o, 9);            /* EFI_HOB_HANDOFF_TABLE_VERSION */
+    stl_le_p(hob + o + 4, 0);        /* BOOT_WITH_FULL_CONFIGURATION */
+    o = handoff + 0x38;
+
+    /*
+     * One unaccepted span for RAM, with the TD HOB's own pages carved out.
+     *
+     * Deliberately the same shape a real VMM produces: QEMU's KVM path builds
+     * its TD HOB from e820_get_table(), which reports low memory as a single
+     * RAM entry from zero -- the legacy VGA and option-ROM window at
+     * 0xa0000-0xfffff included. That is not an oversight there. A TD has no
+     * VGA, its private memory is one guest_memfd span, and the hole exists
+     * only in the *shared* view legacy devices use, so the firmware is right
+     * to accept straight through it. Describing the hole here instead would
+     * hand the guest a memory map no real TD is given.
+     */
+    ram_addr_t ram_size = current_machine->ram_size;
+
+    tdx_hob_put_ram(hob, &o, 0, ram_size, gpa, hob_size);
+
+    /*
+     * EfiEndOfHobList is the byte *after* the end HOB's header, not the header
+     * itself: td-shim's check_hob_length() requires
+     *
+     *     efi_end_of_hob_list - hob_base == offset_of_end_hob + sizeof(Header)
+     *
+     * and rejects the whole list otherwise. Taken after writing the header, so
+     * the cursor has already advanced past it.
+     */
+    tdx_hob_put_header(hob, &o, EFI_HOB_TYPE_END_OF_HOB_LIST, 8);
+    stq_le_p(hob + handoff + 8 + 40, gpa + o);
+
+    address_space_write(&address_space_memory, gpa,
+                        MEMTXATTRS_UNSPECIFIED, hob, hob_size);
+
+    if (qemu_loglevel_mask(LOG_GUEST_ERROR)) {
+        g_autoptr(GString) d = g_string_new(NULL);
+        size_t i;
+
+        for (i = 0; i < o; i++) {
+            g_string_append_printf(d, "%02x", hob[i]);
+        }
+        qemu_log("tdx: TD HOB at 0x%" HWADDR_PRIx " (%zu bytes): %s\n",
+                 gpa, o, d->str);
+    }
+}
+
+/*
+ * The register state the TDX module leaves for the reset vector, transcribed
+ * from td-shim's ResetVector/Main.asm:
+ *
+ *   RAX 0, RFLAGS 2, RCX and R8 the TD HOB, RDX the VCPUID,
+ *   RBX the CPU's GPA width, RSI the VCPU index, RDI and RBP 0,
+ *   32-bit protected mode with flat segments.
+ */
+static void tdx_launch_bsp(CPUX86State *env, hwaddr hob_gpa)
+{
+    static const uint32_t code32 = 0xc09b00; /* type 0xb, S, P, D/B, G */
+    static const uint32_t data32 = 0xc09300; /* type 0x3, S, P, D/B, G */
+    X86CPU *cpu = env_archcpu(env);
+
+    /*
+     * Long mode enabled but not active: EFER.LME with paging still off.
+     *
+     * td-shim's reset vector never sets LME itself -- it loads a four-level
+     * PML4 into CR3, enables paging and far-jumps straight to a 64-bit
+     * selector. That only works if the TD was started long-mode-capable, which
+     * is what the TDX module does and what the documented entry contract
+     * implies by handing arguments in R8. Leaving EFER at its architectural
+     * reset value instead gives a guest that enables PAE paging over a
+     * long-mode table and takes a page fault on its own next instruction.
+     */
+    cpu_load_efer(env, env->efer | MSR_EFER_LME);
+    cpu_x86_update_cr0(env, (env->cr[0] | CR0_PE_MASK) & ~CR0_PG_MASK);
+
+    /*
+     * x2APIC mode, which a TD is always started in.
+     *
+     * TDX gives a TD no xAPIC: the APIC page is not mapped and the interface
+     * is the x2APIC MSR block, which the TDX module enables before the TD's
+     * first instruction. A guest is therefore entitled to read MSR 0x800-0x8ff
+     * without enabling anything, and td-payload's interrupt setup does exactly
+     * that. Left at the architectural reset value the APIC is in xAPIC mode,
+     * apic_msr_read() refuses the access and the guest takes a #GP on an
+     * instruction that cannot fault that way on hardware.
+     *
+     * ENABLE is already set at reset, which matters: apic_set_base_check()
+     * rejects a direct transition from disabled straight to x2APIC.
+     */
+    if (cpu->apic_state) {
+        uint64_t base = cpu_get_apic_base(cpu->apic_state);
+
+        if (cpu_set_apic_base(cpu->apic_state,
+                              base | MSR_IA32_APICBASE_ENABLE
+                                   | MSR_IA32_APICBASE_EXTD) < 0) {
+            warn_report("tdx: could not put the APIC in x2APIC mode; "
+                        "the guest will see xAPIC, which no TD ever does");
+        }
+    }
+
+    cpu_x86_load_seg_cache(env, R_CS, 0x08, 0, 0xffffffff, code32);
+    cpu_x86_load_seg_cache(env, R_DS, 0x10, 0, 0xffffffff, data32);
+    cpu_x86_load_seg_cache(env, R_ES, 0x10, 0, 0xffffffff, data32);
+    cpu_x86_load_seg_cache(env, R_FS, 0x10, 0, 0xffffffff, data32);
+    cpu_x86_load_seg_cache(env, R_GS, 0x10, 0, 0xffffffff, data32);
+    cpu_x86_load_seg_cache(env, R_SS, 0x10, 0, 0xffffffff, data32);
+
+    env->regs[R_EAX] = 0;
+    env->regs[R_ECX] = hob_gpa;
+    env->regs[R_EDX] = 0;                       /* VCPUID */
+    env->regs[R_EBX] = cpu->tdx_gpaw;
+    env->regs[R_ESI] = env_cpu(env)->cpu_index; /* VCPU_Index */
+    env->regs[R_EDI] = 0;
+    env->regs[R_EBP] = 0;
+    env->regs[8]     = hob_gpa;
+    env->eflags = 2;
+    env->eip = 0xfffffff0;
+
+    /*
+     * Every vCPU of a TD starts here, not just the first.
+     *
+     * There is no INIT-SIPI-SIPI in a TD: the module blocks it, and an AP is
+     * brought up by the firmware parking it in the ACPI multiprocessor wakeup
+     * mailbox and the OS writing a command there. Which means the firmware has
+     * to be running on the AP already -- td-shim's reset vector branches on
+     * VCPU_Index for exactly this reason, and its BSP then waits for the APs
+     * to check in.
+     *
+     * QEMU's APs are halted out of reset waiting for a SIPI that a TD will
+     * never send, so without this the BSP spins in wait_for_ap_arrive()
+     * forever and nothing else in the guest ever runs.
+     */
+    env_cpu(env)->halted = 0;
+}
+
+static void tdx_launch_firmware(void *opaque, bool running, RunState state)
+{
+    TdxTcgState *td = opaque;
+    CPUX86State *env;
+    hwaddr meta_gpa, hob_gpa = 0, hob_size = 0;
+    uint8_t hdr[16];
+    uint32_t n, i;
+
+    if (!running || td->launched) {
+        return;
+    }
+    if (!first_cpu) {
+        return;
+    }
+    env = &X86_CPU(first_cpu)->env;
+
+    if (!tdx_find_metadata(&meta_gpa)) {
+        /* No firmware, or not a TDVF: the direct-boot paths still work. */
+        return;
+    }
+
+    if (address_space_read(&address_space_memory, meta_gpa,
+                           MEMTXATTRS_UNSPECIFIED, hdr,
+                           sizeof(hdr)) != MEMTX_OK) {
+        return;
+    }
+    if (memcmp(hdr, "TDVF", 4) != 0) {
+        return;
+    }
+    n = ldl_le_p(hdr + 12);
+    if (n == 0 || n > 64) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "tdx: TDVF metadata claims %u sections\n", n);
+        return;
+    }
+
+    hwaddr fw_base = TDX_FW_TOP;
+
+    for (i = 0; i < n; i++) {
+        uint8_t se[32];
+        uint64_t addr, memsz;
+        uint32_t type;
+
+        if (address_space_read(&address_space_memory, meta_gpa + 16 + i * 32,
+                               MEMTXATTRS_UNSPECIFIED, se,
+                               sizeof(se)) != MEMTX_OK) {
+            return;
+        }
+        addr = ldq_le_p(se + 8);
+        memsz = ldq_le_p(se + 16);
+        type = ldl_le_p(se + 24);
+
+        switch (type) {
+        case TDVF_SECTION_TD_HOB:
+            hob_gpa = addr;
+            hob_size = memsz;
+            break;
+        case TDVF_SECTION_BFV:
+        case TDVF_SECTION_CFV:
+            /*
+             * The sections with file content behind them; the lowest is where
+             * -bios mapped the image.
+             */
+            if (addr < fw_base) {
+                fw_base = addr;
+            }
+            break;
+        case TDVF_SECTION_TEMP_MEM:
+            /*
+             * Scratch the VMM provides, not part of the image -- its raw size
+             * is zero. Deliberately not counted towards fw_base: td-shim's
+             * stock layout happens to put it inside the firmware window, but
+             * nothing requires that and it must not, because QEMU's KVM path
+             * insists TEMP_MEM lie inside e820 RAM (tdx_accept_ram_range()).
+             * Taking the minimum over it would then drag fw_base down into low
+             * memory and make the whole of RAM writable as "firmware".
+             */
+            break;
+        default:
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "tdx: TDVF section type %u is not one this "
+                          "emulation knows; a VMM would refuse the image\n",
+                          type);
+            return;
+        }
+
+        /*
+         * Everything the metadata describes is part of the launch: accepted,
+         * so a guest running under strict SEPT does not have to accept the
+         * memory it was started on.
+         */
+        if (memsz) {
+            hwaddr g;
+
+            for (g = addr & TARGET_PAGE_MASK; g < addr + memsz;
+                 g += TARGET_PAGE_SIZE) {
+                tdx_sept_set(env, g, TDX_PAGE_PRIVATE_ACCEPTED);
+            }
+        }
+    }
+
+    if (!hob_gpa || hob_size < 0x80) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "tdx: TDVF metadata has no usable TD_HOB section\n");
+        return;
+    }
+
+    if (fw_base < TDX_FW_TOP) {
+        tdx_firmware_make_writable(fw_base, TDX_FW_TOP - fw_base);
+    }
+
+    tdx_build_hob(env, hob_gpa, hob_size);
+
+    {
+        CPUState *cs;
+
+        CPU_FOREACH(cs) {
+            tdx_launch_bsp(&X86_CPU(cs)->env, hob_gpa);
+        }
+    }
+    td->launched = true;
+
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "tdx: launched from firmware, TD HOB at 0x%" HWADDR_PRIx
+                  "\n", hob_gpa);
+}
+
 static void tdx_measure_launch_image(void *opaque, bool running, RunState state)
 {
     TdxTcgState *td = opaque;
@@ -290,6 +756,11 @@ static TdxTcgState *tdx_get_state(void)
         qemu_mutex_init(&tdx_state->lock);
         vmstate_register(NULL, 0, &vmstate_tdx_tcg, tdx_state);
         qemu_register_reset(tdx_reset, tdx_state);
+        /*
+         * Before the measurement handler: this one places the TD HOB and sets
+         * the BSP up, and the measurement is of what was launched.
+         */
+        qemu_add_vm_change_state_handler(tdx_launch_firmware, tdx_state);
         qemu_add_vm_change_state_handler(tdx_measure_launch_image,
                                         tdx_state);
     }
@@ -335,7 +806,19 @@ static TdxPageState tdx_sept_default(CPUX86State *env, hwaddr gpa)
 {
     X86CPU *cpu = env_archcpu(env);
 
-    if (!tdx_gpa_is_ram(env, gpa)) {
+    /*
+     * Below the top of RAM a TD's memory is private, whether or not this
+     * machine happens to overlay something else at that GPA.
+     *
+     * tdx_gpa_is_ram() answers "what does the current memory-region view show
+     * here", and for a PC that is false across the legacy VGA and option-ROM
+     * window at 0xa0000-0xfffff even though the GPA is inside RAM. A TD has no
+     * such window: its private memory is one contiguous span and the firmware
+     * accepts through it -- td-shim does, and panics rather than skips when an
+     * accept is refused (tdx-tdcall's td_accept_pages()). Treating the window
+     * as shared made that a boot failure here and nowhere else.
+     */
+    if (gpa >= current_machine->ram_size && !tdx_gpa_is_ram(env, gpa)) {
         return TDX_PAGE_SHARED;      /* MMIO is always shared to a TD */
     }
     if (cpu->tdx_sept == TDX_SEPT_LAZY) {
@@ -783,6 +1266,9 @@ static void tdx_mem_page_accept(CPUX86State *env)
 
     gpa = tdx_strip_shared(cpu, gpa & ~7ULL);
     if (!tdx_gpa_ok(cpu, gpa, 4096, TDX_OPERAND_ID_RCX, &status)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "tdx: ACCEPT rejected gpa 0x%" PRIx64 " status 0x%"
+                      PRIx64 "\n", gpa, status);
         env->regs[R_EAX] = status;
         return;
     }
@@ -803,6 +1289,8 @@ static void tdx_mem_page_accept(CPUX86State *env)
             return;
         default:
             /* Shared: the guest must convert it to private first. */
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "tdx: ACCEPT on a shared gpa 0x%" PRIx64 "\n", gpa);
             env->regs[R_EAX] = TDX_PAGE_ATTR_CONFLICT | TDX_OPERAND_ID_RCX;
             return;
         }
@@ -938,6 +1426,27 @@ static uint64_t tdx_vmcall_msr(CPUX86State *env, bool write)
     uint64_t val;
 
     env->regs[R_ECX] = (uint32_t)env->regs[R_R12];
+
+    /*
+     * An MSR the platform will not serve is reported in R10, not raised as a
+     * fault on the TDCALL. helper_rdmsr()/helper_wrmsr() raise #GP directly,
+     * and letting that escape would push an exception frame pointing at the
+     * TDCALL -- a fault the instruction cannot take on hardware, and one the
+     * guest's handler has no way to interpret. The x2APIC block is the case
+     * that occurs in practice, because it is the one range whose accessibility
+     * depends on APIC mode rather than on the MSR existing.
+     */
+    if ((uint32_t)env->regs[R_ECX] >= 0x800 &&
+        (uint32_t)env->regs[R_ECX] <= 0x8ff) {
+        X86CPU *cpu = env_archcpu(env);
+
+        if (!cpu->apic_state ||
+            !(cpu_get_apic_base(cpu->apic_state) & MSR_IA32_APICBASE_EXTD)) {
+            env->regs[R_ECX] = save_rcx;
+            return TDVMCALL_INVALID_OPERAND;
+        }
+    }
+
     if (write) {
         val = env->regs[R_R13];
         env->regs[R_EAX] = (uint32_t)val;
