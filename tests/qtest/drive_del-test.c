@@ -167,6 +167,11 @@ static void test_drive_without_dev(void)
 {
     QTestState *qts;
 
+#ifndef CONFIG_HMP
+    g_test_skip("HMP not enabled");
+    return;
+#endif
+
     /* Start with an empty drive */
     qts = qtest_init("-drive if=none,id=drive0 -M none");
 
@@ -186,6 +191,11 @@ static void test_after_failed_device_add(void)
     char driver[32];
     QDict *response;
     QTestState *qts;
+
+#ifndef CONFIG_HMP
+    g_test_skip("HMP not enabled");
+    return;
+#endif
 
     if (!has_device_builtin("virtio-blk")) {
         g_test_skip("Device virtio-blk is not available");
@@ -223,6 +233,11 @@ static void test_drive_del_device_del(void)
 {
     QTestState *qts;
 
+#ifndef CONFIG_HMP
+    g_test_skip("HMP not enabled");
+    return;
+#endif
+
     if (!has_device_builtin("virtio-scsi")) {
         g_test_skip("Device virtio-scsi is not available");
         return;
@@ -258,6 +273,10 @@ static void test_cli_device_del(void)
     }
 
     if (strcmp(arch, "i386") == 0 || strcmp(arch, "x86_64") == 0) {
+        if (!qtest_has_machine("pc")) {
+            g_test_skip("Machine 'pc' is not available");
+            return;
+        }
         machine_addition = "-machine pc";
     }
 
@@ -332,6 +351,10 @@ static void test_device_add_and_del(void)
     }
 
     if (strcmp(arch, "i386") == 0 || strcmp(arch, "x86_64") == 0) {
+        if (!qtest_has_machine("pc")) {
+            g_test_skip("Machine 'pc' is not available");
+            return;
+        }
         machine_addition = "-machine pc";
     }
 
@@ -397,12 +420,21 @@ static void test_drive_add_device_add_and_del(void)
     const char *arch = qtest_get_arch();
     const char *machine_addition = "";
 
+#ifndef CONFIG_HMP
+    g_test_skip("HMP not enabled");
+    return;
+#endif
+
     if (!has_device_builtin("virtio-blk")) {
         g_test_skip("Device virtio-blk is not available");
         return;
     }
 
     if (strcmp(arch, "i386") == 0 || strcmp(arch, "x86_64") == 0) {
+        if (!qtest_has_machine("pc")) {
+            g_test_skip("Machine 'pc' is not available");
+            return;
+        }
         machine_addition = "-machine pc";
     }
 
@@ -423,6 +455,11 @@ static void test_drive_add_device_add_and_del(void)
 static void test_drive_add_device_add_and_del_q35(void)
 {
     QTestState *qts;
+
+#ifndef CONFIG_HMP
+    g_test_skip("HMP not enabled");
+    return;
+#endif
 
     if (!has_device_builtin("virtio-blk")) {
         g_test_skip("Device virtio-blk is not available");
@@ -456,6 +493,10 @@ static void test_blockdev_add_device_add_and_del(void)
     }
 
     if (strcmp(arch, "i386") == 0 || strcmp(arch, "x86_64") == 0) {
+        if (!qtest_has_machine("pc")) {
+            g_test_skip("Machine 'pc' is not available");
+            return;
+        }
         machine_addition = "-machine pc";
     }
 

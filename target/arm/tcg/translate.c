@@ -1,3 +1,4 @@
+
 /*
  *  ARM translation
  *
@@ -3339,6 +3340,24 @@ static bool trans_NOP(DisasContext *s, arg_NOP *a)
     return true;
 }
 
+static bool trans_MAYBE_UNDEF_T1_HINT(DisasContext *s,
+                                      arg_MAYBE_UNDEF_T1_HINT *a)
+{
+    /*
+     * The Thumb T1 encoding hint space was only defined starting
+     * in v6T2 for A-profile. For M-profile it always exists, even
+     * in v6M.
+     */
+    if (arm_dc_feature(s, ARM_FEATURE_M) ||
+        arm_dc_feature(s, ARM_FEATURE_THUMB2)) {
+        /* Allow decode to fall through to the hint insns and NOP space */
+        return false;
+    }
+    /* On the earlier cores, we must UNDEF */
+    unallocated_encoding(s);
+    return true;
+}
+
 static bool trans_MSR_imm(DisasContext *s, arg_MSR_imm *a)
 {
     uint32_t val = ror32(a->imm, a->rot * 2);
@@ -4835,7 +4854,7 @@ static bool trans_RBIT(DisasContext *s, arg_rr *a)
     if (!ENABLE_ARCH_6T2) {
         return false;
     }
-    return op_rr(s, a, gen_helper_rbit);
+    return op_rr(s, a, tcg_gen_revbit32_i32);
 }
 
 /*
@@ -5783,7 +5802,14 @@ static bool trans_TBH(DisasContext *s, arg_tbranch *a)
 
 static bool trans_CBZ(DisasContext *s, arg_CBZ *a)
 {
-    TCGv_i32 tmp = load_reg(s, a->rn);
+    TCGv_i32 tmp;
+
+    /* CBZ was introduced in v6T2 and v7M */
+    if (!arm_dc_feature(s, ARM_FEATURE_THUMB2)) {
+        return false;
+    }
+
+    tmp = load_reg(s, a->rn);
 
     arm_gen_condlabel(s);
     tcg_gen_brcondi_i32(a->nz ? TCG_COND_EQ : TCG_COND_NE,
@@ -6030,6 +6056,16 @@ static bool trans_PLI(DisasContext *s, arg_PLI *a)
 static bool trans_IT(DisasContext *s, arg_IT *a)
 {
     int cond_mask = a->cond_mask;
+
+    /*
+     * IT insn introduced in v6T2 for A-profile; it is only present
+     * on M-profile if the Main Extension is implemented.
+     */
+    if (!(arm_dc_feature(s, ARM_FEATURE_M)
+          ? arm_dc_feature(s, ARM_FEATURE_M_MAIN)
+          : arm_dc_feature(s, ARM_FEATURE_THUMB2))) {
+        return false;
+    }
 
     /*
      * No actual code generated for this insn, just setup state.
@@ -6342,6 +6378,7 @@ static void arm_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
     ARMCPU *cpu = env_archcpu(env);
     CPUARMTBFlags tb_flags = arm_tbflags_from_tb(dc->base.tb);
     uint32_t condexec, core_mmu_idx;
+    bool d32dis = false;
 
     dc->isar = &cpu->isar;
     dc->condjmp = 0;
@@ -6403,7 +6440,14 @@ static void arm_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
         dc->vec_stride = EX_TBFLAG_A32(tb_flags, VECSTRIDE);
         dc->sme_trap_nonstreaming =
             EX_TBFLAG_A32(tb_flags, SME_TRAP_NONSTREAMING);
+        dc->neon_excp_el = EX_TBFLAG_A32(tb_flags, NEONEXC_EL);
+        d32dis = EX_TBFLAG_A32(tb_flags, D32DIS);
     }
+
+    dc->invalid_vfp_dreg_mask =
+        (d32dis || !dc_isar_feature(aa32_simd_r32, dc)) ? 0x10 : 0;
+    dc->invalid_neon_dreg_mask = !dc_isar_feature(aa32_simd_r32, dc) ? 0x10 : 0;
+
     dc->lse2 = false; /* applies only to aarch64 */
     dc->cp_regs = cpu->cp_regs;
     dc->features = env->features;

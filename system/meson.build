@@ -18,15 +18,22 @@ system_ss.add(files(
   'memory_mapping.c',
   'memory.c',
   'physmem.c',
+  'physmem-qmp-cmds.c',
   'qdev-monitor.c',
   'qtest.c',
   'rtc.c',
   'runstate-action.c',
-  'runstate-hmp-cmds.c',
   'runstate.c',
-  'tpm-hmp-cmds.c',
   'watchpoint.c',
 ))
+
+if have_hmp
+  system_ss.add(files(
+    'dirtylimit-hmp-cmds.c',
+    'runstate-hmp-cmds.c',
+    'tpm-hmp-cmds.c',
+  ))
+endif
 
 if have_tpm
   system_ss.add(files('tpm.c'))

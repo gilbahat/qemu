@@ -1012,6 +1012,20 @@ char *qtest_hmp(QTestState *s, const char *fmt, ...)
     return ret;
 }
 
+void qtest_qemu_io(QTestState *s, const char *device,
+                   const char *fmt, ...)
+{
+    va_list ap;
+    g_autofree char *cmd = NULL;
+
+    va_start(ap, fmt);
+    cmd = g_strdup_vprintf(fmt, ap);
+    va_end(ap);
+
+    qtest_sendf(s, "qemu-io %s %s\n", device, cmd);
+    qtest_rsp(s);
+}
+
 const char *qtest_get_arch(void)
 {
     /*
@@ -2151,8 +2165,7 @@ bool mkimg(const char *file, const char *fmt, unsigned size_mb)
 
 bool qtest_verbose(const char *domain)
 {
-    const char *log = getenv("QTEST_LOG");
-    const char *found;
+    const gchar *found, *log = g_getenv("QTEST_LOG");
 
     assert(domain);
 
@@ -2178,11 +2191,11 @@ bool qtest_verbose(const char *domain)
          *  QTEST_LOG=<domain1>,-<domain2> (only false for domain2)
          *  allows other separators, except - and +
          */
-        found = strstr(log, domain);
+        found = g_strstr_len(log, -1, domain);
 
         if (found) {
             /* reject options given twice */
-            assert(!strstr(found + strlen(domain), domain));
+            assert(!g_strstr_len(found + strlen(domain), -1, domain));
 
             if (found > log) {
                 ptrdiff_t i = found - log - 1;
@@ -2196,7 +2209,7 @@ bool qtest_verbose(const char *domain)
              * If filtering out a specific domain, all others are
              * enabled.
              */
-            return !!strstr(log, "-");
+            return !!g_strstr_len(log, -1, "-");
         }
     }
 
