@@ -84,19 +84,31 @@ static unsigned int pvalidate(unsigned long gva, unsigned int validate)
 static unsigned long psc_private(unsigned long gpa)
 {
     wrmsr(MSR_AMD64_SEV_ES_GHCB, GHCB_MSR_PSC_REQ |
-          ((unsigned long)PSC_OP_PRIVATE << 56) | (gpa & ~0xfffUL));
+          ((unsigned long)PSC_OP_PRIVATE << 52) | (gpa & ~0xfffUL));
     vmgexit();
     return rdmsr(MSR_AMD64_SEV_ES_GHCB) >> 32;
 }
+
+/*
+ * Read once and cached, because every CPUID reflects as #VC from the first
+ * PVALIDATE onwards and map_private() is called well after that.  A real
+ * guest caches it for the same reason: the C-bit is what it needs in order to
+ * reach a GHCB, so it cannot afford to need a GHCB to ask for it.
+ */
+static unsigned long cbit_cached;
 
 static unsigned long cbit(void)
 {
     unsigned int a, b, c, d;
 
+    if (cbit_cached) {
+        return cbit_cached;
+    }
     __asm__ __volatile__("cpuid"
                          : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
                          : "a"(0x8000001F), "c"(0));
-    return 1UL << (b & 0x3f);
+    cbit_cached = 1UL << (b & 0x3f);
+    return cbit_cached;
 }
 
 /* --- page tables ---------------------------------------------------------- */
@@ -258,6 +270,7 @@ int main(void)
 
     idt_init();
 
+    (void)cbit();               /* before the first PVALIDATE arms reflection */
     build_tables(page_a);
     load_cr3();
     ml_printf("running on self-built page tables\n");
@@ -268,12 +281,17 @@ int main(void)
     check(vc_count == 0, "a shared C=0 access raised #VC");
 
     /*
-     * Page A: claim it, validate it, then map it encrypted.  This is the
+     * Page A: claim it, map it encrypted, then validate it.  This is the
      * ordering a guest is supposed to follow, and it must just work.
+     *
+     * The mapping has to come first.  PVALIDATE takes a linear address and
+     * the walk decides which page it means, so on a mapping with C=0 it does
+     * not return a status at all -- it raises #PF with the reserved bit set.
+     * Linux sets the C-bit in the PTE before validating for the same reason.
      */
     check(psc_private(page_a) == 0, "page-state change to private failed");
-    check(pvalidate(page_a, 1) == 0, "PVALIDATE of a claimed page failed");
     map_private(page_a);
+    check(pvalidate(page_a, 1) == 0, "PVALIDATE of a claimed page failed");
 
     *a = 0x2222;
     check(*a == 0x2222, "validated private page not usable with C=1");

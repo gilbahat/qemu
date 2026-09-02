@@ -94,7 +94,7 @@ static unsigned int pvalidate(unsigned long gva, unsigned int validate)
 static void psc_private(unsigned long gpa)
 {
     wrmsr(MSR_AMD64_SEV_ES_GHCB, GHCB_MSR_PSC_REQ |
-          ((unsigned long)PSC_OP_PRIVATE << 56) | (gpa & ~0xfffUL));
+          ((unsigned long)PSC_OP_PRIVATE << 52) | (gpa & ~0xfffUL));
     vmgexit();
     wrmsr(MSR_AMD64_SEV_ES_GHCB, 0);
 }

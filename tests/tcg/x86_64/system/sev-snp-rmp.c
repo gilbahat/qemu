@@ -81,7 +81,7 @@ static unsigned int pvalidate(unsigned long gva, unsigned int page_size,
 static unsigned long psc(unsigned long gpa, unsigned long op)
 {
     wrmsr(MSR_AMD64_SEV_ES_GHCB,
-          GHCB_MSR_PSC_REQ | (op << 56) | (gpa & ~0xfffUL));
+          GHCB_MSR_PSC_REQ | (op << 52) | (gpa & ~0xfffUL));
     vmgexit();
     return rdmsr(MSR_AMD64_SEV_ES_GHCB);
 }

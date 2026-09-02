@@ -24,6 +24,7 @@
 #define GHCB_MSR_PREF_GPA_RESP  0x011
 #define GHCB_MSR_REG_GPA_REQ    0x012
 #define GHCB_MSR_REG_GPA_RESP   0x013
+/* Operation in GHCBData[55:52], GFN in GHCBData[51:12]. */
 #define GHCB_MSR_PSC_REQ        0x014
 #define GHCB_MSR_PSC_RESP       0x015
 #define GHCB_MSR_HV_FT_REQ      0x080
@@ -128,13 +129,13 @@ int main(void)
     check((resp & ~0xfffUL) == ghcb_gpa, "register GPA did not echo the page");
 
     /* Page state change: a defined operation succeeds... */
-    resp = ghcb_msr_call(GHCB_MSR_PSC_REQ | ((unsigned long)2 << 56) |
+    resp = ghcb_msr_call(GHCB_MSR_PSC_REQ | ((unsigned long)2 << 52) |
                          ghcb_gpa);
     check(INFO(resp) == GHCB_MSR_PSC_RESP, "PSC response code");
     check((resp >> 32) == 0, "PSC to shared reported an error");
 
     /* ...and an undefined one does not. */
-    resp = ghcb_msr_call(GHCB_MSR_PSC_REQ | ((unsigned long)9 << 56) |
+    resp = ghcb_msr_call(GHCB_MSR_PSC_REQ | ((unsigned long)9 << 52) |
                          ghcb_gpa);
     check(INFO(resp) == GHCB_MSR_PSC_RESP, "PSC response code (bad op)");
     check((resp >> 32) != 0, "PSC accepted an undefined operation");
