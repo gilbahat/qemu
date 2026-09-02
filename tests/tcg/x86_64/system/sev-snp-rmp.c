@@ -6,8 +6,9 @@
  * claimed as private before it can be validated.
  *
  * Run with x-sev-snp-rmp=1 (lazy): pages are shared until the guest claims
- * them, so this test -- whose page tables carry no C-bit -- runs normally while
- * still exercising the state machine on the one page it does claim.
+ * them, so only the one page this test claims ever leaves the shared state.
+ * It still needs its own tables, because PVALIDATE reads the C-bit out of the
+ * mapping and boot.S's tables have none -- see snp-ptes.h.
  *
  * Port I/O is relaxed for the same reason as sev-snp-vc: the first PVALIDATE
  * arms reflection, this test installs no #VC handler, and its own output is
@@ -17,6 +18,8 @@
  */
 
 #include <minilib.h>
+
+#include "snp-ptes.h"
 
 #define PVALIDATE_SUCCESS           0
 #define PVALIDATE_FAIL_INPUT        1
@@ -86,28 +89,32 @@ static unsigned long psc(unsigned long gpa, unsigned long op)
     return rdmsr(MSR_AMD64_SEV_ES_GHCB);
 }
 
-static unsigned int cbitpos(void)
-{
-    unsigned int a, b, c, d;
-
-    __asm__ __volatile__("cpuid"
-                         : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
-                         : "a"(0x8000001F), "c"(0));
-    return b & 0x3f;
-}
-
 static char scratch[8192] __attribute__((aligned(4096)));
 
 int main(void)
 {
-    unsigned long cbit = 1UL << cbitpos();
     unsigned long page = ((unsigned long)scratch + 0xfff) & ~0xfffUL;
     unsigned int cf, status;
-    unsigned long resp;
+    unsigned long resp, cbit;
 
-    ml_printf("Emulated SEV-SNP RMP-lite test (C-bit %d)\n", (int)cbitpos());
+    snp_tables_init(page);
+    cbit = snp_cbit();
 
-    /* A shared page cannot be validated: the guest must claim it first. */
+    ml_printf("Emulated SEV-SNP RMP-lite test (C-bit %d)\n",
+              (int)snp_cbitpos());
+
+    /*
+     * Map the page encrypted before validating anything.  PVALIDATE on a
+     * mapping with C=0 does not report a status, it raises #PF -- so without
+     * this the first check below would not fail, it would kill the guest.
+     */
+    snp_map_private(page);
+
+    /*
+     * A page the RMP still calls shared cannot be validated, even though the
+     * mapping now says private.  That mismatch is the whole point: the guest
+     * must claim it first.
+     */
     status = pvalidate(page, 0, 1, &cf);
     check(status == PVALIDATE_FAIL_PERMISSION,
           "PVALIDATE of a shared page was not refused");

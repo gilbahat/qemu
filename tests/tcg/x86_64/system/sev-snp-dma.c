@@ -20,6 +20,8 @@
 
 #include <minilib.h>
 
+#include "snp-ptes.h"
+
 #define MSR_AMD64_SEV_ES_GHCB   0xc0010130
 #define GHCB_MSR_PSC_REQ        0x014
 #define PSC_OP_PRIVATE          1
@@ -195,17 +197,27 @@ int main(void)
     pci_cfg_write(devfn, PCI_COMMAND,
                   cmd | PCI_COMMAND_MEM | PCI_COMMAND_MASTER);
 
+    /* Own tables, so the private page can be mapped encrypted on its own. */
+    snp_tables_init((unsigned long)page_private);
+
     page_shared[0] = PATTERN_SHARED;
     page_private[0] = PATTERN_PRIVATE;
     page_zero[0] = 0;
     page_result[0] = 0;
 
     /*
-     * Claim the private page.  This is also what arms the filter, so every DMA
-     * below is judged.  Nothing may touch page_private from the CPU after this:
-     * the page tables say C=0 and the page is now private, which is a mismatch.
+     * Claim the private page: change its state, map it encrypted, then
+     * validate it.  The mapping has to come before the validation, because
+     * PVALIDATE reads the C-bit out of it and answers a C=0 mapping with #PF
+     * instead of a status.
+     *
+     * The PVALIDATE is also what arms the filter, so every DMA below is
+     * judged.  From here the CPU reaches this page only through the encrypted
+     * mapping, which is the point: the device is about to be handed the plain
+     * address and must come away with nothing.
      */
     psc_private((unsigned long)page_private);
+    snp_map_private((unsigned long)page_private);
     check(pvalidate((unsigned long)page_private, 1) == 0,
           "PVALIDATE of the claimed page failed");
 

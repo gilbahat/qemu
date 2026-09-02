@@ -20,6 +20,8 @@
 
 #include <minilib.h>
 
+#include "snp-ptes.h"
+
 #define SVM_EXIT_CPUID  0x072
 #define SVM_EXIT_HLT    0x078
 #define SVM_EXIT_MSR    0x07c
@@ -201,6 +203,16 @@ int main(void)
     ml_printf("Emulated SEV-SNP #VC reflection test\n");
 
     idt_init();
+
+    /*
+     * Own tables, with the page under test mapped encrypted.  PVALIDATE reads
+     * the C-bit out of the mapping, and on a mapping without it raises #PF
+     * rather than returning a status -- which this test has no handler for.
+     * Both happen before the first PVALIDATE, so the CPUID inside costs
+     * nothing: reflection is not armed yet.
+     */
+    snp_tables_init((unsigned long)page);
+    snp_map_private((unsigned long)page);
 
     /* Nothing should reflect before the first PVALIDATE arms it. */
     n = vc_count;

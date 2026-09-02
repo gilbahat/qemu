@@ -12,6 +12,8 @@
 
 #include <minilib.h>
 
+#include "snp-ptes.h"
+
 #define MSR_AMD64_SEV_ES_GHCB   0xc0010130
 #define GHCB_MSR_REG_GPA_REQ    0x012
 #define GHCB_MSR_REG_GPA_RESP   0x013
@@ -240,6 +242,9 @@ static void idt_init(void)
     __asm__ __volatile__("lidt %0" : : "m"(ptr));
 }
 
+/* Something the guest may legitimately claim; see its use below. */
+static unsigned char arm_page[4096] __attribute__((aligned(4096)));
+
 static unsigned int pvalidate(unsigned long gva)
 {
     unsigned int status;
@@ -258,6 +263,9 @@ int main(void)
     ml_printf("Emulated SEV-SNP GHCB page / NAE test\n");
 
     idt_init();
+
+    /* Own tables, so arm_page below can be mapped encrypted on its own. */
+    snp_tables_init((unsigned long)arm_page);
 
     resp = 0;
     wrmsr(MSR_AMD64_SEV_ES_GHCB,
@@ -304,8 +312,15 @@ int main(void)
     /*
      * Arm reflection.  From here every ml_printf() faults and is serviced by
      * the handler above -- so the remaining output is itself the test.
+     *
+     * Not the GHCB: that page is shared by definition, since the hypervisor
+     * has to read it, so it is mapped C=0 and PVALIDATE answers a C=0 mapping
+     * with #PF rather than a status.  This test used to validate its own GHCB
+     * and get away with it, which is the exact confusion the emulator's check
+     * exists to surface.  Claim a page that may actually be claimed.
      */
-    check(pvalidate((unsigned long)ghcb) == 0, "PVALIDATE status");
+    snp_map_private((unsigned long)arm_page);
+    check(pvalidate((unsigned long)arm_page) == 0, "PVALIDATE status");
 
     ml_printf("output below this line travels over the GHCB\n");
     check(vc_count > 0, "no #VC was taken after arming");

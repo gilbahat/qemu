@@ -1,10 +1,10 @@
 /*
  * Emulated AMD SEV-SNP C-bit test.
  *
- * The other SNP tests all run on boot.S's page tables, which carry no C-bit, so
- * they can only ever reach page-state enforcement from the shared side.  This
- * one builds its own page tables, maps two pages encrypted, and drives the
- * private side of the check:
+ * The other SNP tests build their own tables (snp-ptes.h) only so far as they
+ * need one validatable page.  This one is about what the C-bit does once it is
+ * set, so it maps two pages encrypted and drives the private side of the
+ * check:
  *
  *   - a page it has claimed and validated is usable with C=1;
  *   - a page it has claimed but *not* validated raises #VC on first touch, and
@@ -25,19 +25,14 @@
 
 #include <minilib.h>
 
+#include "snp-ptes.h"
+
 #define MSR_AMD64_SEV_ES_GHCB   0xc0010130
 #define GHCB_MSR_PSC_REQ        0x014
 #define PSC_OP_PRIVATE          1
 
 #define SNP_EXIT_PAGE_NOT_VALIDATED  0x404
 
-/* Page-table entry bits.  No Global bit: these must respond to invlpg. */
-#define PTE_FLAGS               0x067   /* D | A | US | RW | P        */
-#define PDE_LARGE_FLAGS         0x0e7   /* PS | D | A | US | RW | P   */
-#define PDE_TABLE_FLAGS         0x007   /* US | RW | P                */
-
-#define PAGE_SIZE               4096UL
-#define LARGE_PAGE_SIZE         (2UL * 1024 * 1024)
 
 static int failures;
 
@@ -89,91 +84,7 @@ static unsigned long psc_private(unsigned long gpa)
     return rdmsr(MSR_AMD64_SEV_ES_GHCB) >> 32;
 }
 
-/*
- * Read once and cached, because every CPUID reflects as #VC from the first
- * PVALIDATE onwards and map_private() is called well after that.  A real
- * guest caches it for the same reason: the C-bit is what it needs in order to
- * reach a GHCB, so it cannot afford to need a GHCB to ask for it.
- */
-static unsigned long cbit_cached;
-
-static unsigned long cbit(void)
-{
-    unsigned int a, b, c, d;
-
-    if (cbit_cached) {
-        return cbit_cached;
-    }
-    __asm__ __volatile__("cpuid"
-                         : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
-                         : "a"(0x8000001F), "c"(0));
-    cbit_cached = 1UL << (b & 0x3f);
-    return cbit_cached;
-}
-
-/* --- page tables ---------------------------------------------------------- */
-
-/*
- * A fresh identity map of the low 4GiB with 2MiB pages, except for the one
- * 2MiB region holding the pages under test, which is split into 4KiB entries so
- * the C-bit can be set per page.  Everything here lives in .bss and so stays
- * shared, which is what lets the walk itself keep working.
- */
-static unsigned long pml4[512] __attribute__((aligned(4096)));
-static unsigned long pdp[512] __attribute__((aligned(4096)));
-static unsigned long pd[4][512] __attribute__((aligned(4096)));
-static unsigned long pt[512] __attribute__((aligned(4096)));
-
-static unsigned char arena[4 * PAGE_SIZE] __attribute__((aligned(4096)));
-static unsigned long split_base;
-
-static void build_tables(unsigned long split_addr)
-{
-    unsigned long g, i;
-
-    for (i = 0; i < 512; i++) {
-        pml4[i] = 0;
-        pdp[i] = 0;
-    }
-    for (g = 0; g < 4; g++) {
-        for (i = 0; i < 512; i++) {
-            pd[g][i] = (g << 30) | (i << 21) | PDE_LARGE_FLAGS;
-        }
-        pdp[g] = (unsigned long)&pd[g][0] | PDE_TABLE_FLAGS;
-    }
-    pml4[0] = (unsigned long)pdp | PDE_TABLE_FLAGS;
-
-    /* Split the region holding the test pages down to 4KiB granularity. */
-    split_base = split_addr & ~(LARGE_PAGE_SIZE - 1);
-    for (i = 0; i < 512; i++) {
-        pt[i] = (split_base + i * PAGE_SIZE) | PTE_FLAGS;
-    }
-    pd[split_base >> 30][(split_base >> 21) & 0x1ff] =
-        (unsigned long)pt | PDE_TABLE_FLAGS;
-}
-
-static unsigned long *pte_for(unsigned long va)
-{
-    return &pt[(va - split_base) / PAGE_SIZE];
-}
-
-static void load_cr3(void)
-{
-    __asm__ __volatile__("mov %0, %%cr3"
-                         : : "r"((unsigned long)pml4) : "memory");
-}
-
-static void invlpg(unsigned long va)
-{
-    __asm__ __volatile__("invlpg (%0)" : : "r"(va) : "memory");
-}
-
-/* Map a page encrypted, and drop any translation cached for it. */
-static void map_private(unsigned long va)
-{
-    *pte_for(va) |= cbit();
-    invlpg(va);
-}
+static unsigned char arena[4 * SNP_PAGE_SIZE] __attribute__((aligned(4096)));
 
 /* --- #VC handler --------------------------------------------------------- */
 
@@ -262,7 +173,7 @@ static void idt_init(void)
 int main(void)
 {
     unsigned long page_a = (unsigned long)arena;
-    unsigned long page_b = page_a + PAGE_SIZE;
+    unsigned long page_b = page_a + SNP_PAGE_SIZE;
     volatile unsigned long *a = (volatile unsigned long *)page_a;
     volatile unsigned long *b = (volatile unsigned long *)page_b;
 
@@ -270,9 +181,7 @@ int main(void)
 
     idt_init();
 
-    (void)cbit();               /* before the first PVALIDATE arms reflection */
-    build_tables(page_a);
-    load_cr3();
+    snp_tables_init(page_a);
     ml_printf("running on self-built page tables\n");
 
     /* A shared page must still be reachable with C=0 -- the baseline. */
@@ -290,7 +199,7 @@ int main(void)
      * Linux sets the C-bit in the PTE before validating for the same reason.
      */
     check(psc_private(page_a) == 0, "page-state change to private failed");
-    map_private(page_a);
+    snp_map_private(page_a);
     check(pvalidate(page_a, 1) == 0, "PVALIDATE of a claimed page failed");
 
     *a = 0x2222;
@@ -304,7 +213,7 @@ int main(void)
      * cached anything.
      */
     check(psc_private(page_b) == 0, "page-state change to private failed");
-    map_private(page_b);
+    snp_map_private(page_b);
 
     vc_expect_page = page_b;
     *b = 0x3333;
