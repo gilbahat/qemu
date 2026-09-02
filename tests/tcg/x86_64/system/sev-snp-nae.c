@@ -266,8 +266,14 @@ int main(void)
     resp = rdmsr(MSR_AMD64_SEV_ES_GHCB);
     check((resp & 0xfff) == GHCB_MSR_REG_GPA_RESP, "GHCB registration");
 
-    /* Clear the register so it is not mistaken for an in-flight request. */
-    wrmsr(MSR_AMD64_SEV_ES_GHCB, 0);
+    /*
+     * Leave the GHCB address in the register: the page protocol takes the
+     * GHCB from the MSR at each VMGEXIT, so clearing it makes every exit below
+     * arrive with no GHCB and do nothing at all.  A bare page-aligned address
+     * carries no request code, so it cannot be read as an in-flight request
+     * either, which is what the zero was for.
+     */
+    wrmsr(MSR_AMD64_SEV_ES_GHCB, (unsigned long)ghcb);
 
     /* NAE CPUID through the page, cross-checked against the instruction. */
     ghcb_clear();
