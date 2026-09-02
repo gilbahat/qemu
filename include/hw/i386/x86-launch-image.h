@@ -36,6 +36,16 @@ void x86_launch_image_add(hwaddr addr, const void *data, size_t datasize,
 bool x86_launch_image_contains(hwaddr gpa);
 
 /**
+ * x86_launch_image_limit: one past the highest launch-image address, or 0.
+ *
+ * A caller walking guest pages to find the launch image needs somewhere to
+ * stop.  RAM size is the obvious bound and the wrong one: a firmware launch
+ * places its image in the window just below 4GiB, which is above RAM and would
+ * be missed entirely.
+ */
+hwaddr x86_launch_image_limit(void);
+
+/**
  * x86_launch_image_page: launch-image bytes for the page containing @gpa.
  * @data: set to the real bytes for that page, or NULL if the page is entirely
  *        zero fill.

@@ -78,6 +78,20 @@ bool x86_launch_image_contains(hwaddr gpa)
     return launch_find(gpa) != NULL;
 }
 
+hwaddr x86_launch_image_limit(void)
+{
+    hwaddr limit = 0;
+    guint i;
+
+    for (i = 0; launch_extents && i < launch_extents->len; i++) {
+        const LaunchExtent *e =
+            &g_array_index(launch_extents, LaunchExtent, i);
+
+        limit = MAX(limit, e->addr + e->totalsize);
+    }
+    return limit;
+}
+
 bool x86_launch_image_page(hwaddr gpa, const void **data, size_t *valid)
 {
     hwaddr page = gpa & LAUNCH_PAGE_MASK;

@@ -22,6 +22,7 @@
 #include "migration/vmstate.h"
 #include "hw/i386/tdx-dma.h"
 #include "hw/i386/x86-launch-image.h"
+#include "hw/i386/tdvf.h"
 #include "tcg/helper-tcg.h"
 #include "hw/core/loader.h"
 #include "exec/target_page.h"
@@ -247,10 +248,6 @@ static const uint8_t tdx_metadata_guid[16] = {
 #define TDX_FW_TOP          0x100000000ULL
 #define TDX_FW_TABLE_SCAN   0x1000     /* enough to hold the GUIDed table */
 
-#define TDVF_SECTION_BFV        0
-#define TDVF_SECTION_CFV        1
-#define TDVF_SECTION_TD_HOB     2
-#define TDVF_SECTION_TEMP_MEM   3
 
 /* EFI HOB, only the two shapes a payload needs to find its memory. */
 #define EFI_HOB_TYPE_HANDOFF            0x0001
@@ -585,7 +582,7 @@ static void tdx_launch_firmware(void *opaque, bool running, RunState state)
     for (i = 0; i < n; i++) {
         uint8_t se[32];
         uint64_t addr, memsz;
-        uint32_t type;
+        uint32_t type, rawsz, sattrs;
 
         if (address_space_read(&address_space_memory, meta_gpa + 16 + i * 32,
                                MEMTXATTRS_UNSPECIFIED, se,
@@ -595,14 +592,16 @@ static void tdx_launch_firmware(void *opaque, bool running, RunState state)
         addr = ldq_le_p(se + 8);
         memsz = ldq_le_p(se + 16);
         type = ldl_le_p(se + 24);
+        rawsz = ldl_le_p(se + 4);
+        sattrs = ldl_le_p(se + 28);
 
         switch (type) {
-        case TDVF_SECTION_TD_HOB:
+        case TDVF_SECTION_TYPE_TD_HOB:
             hob_gpa = addr;
             hob_size = memsz;
             break;
-        case TDVF_SECTION_BFV:
-        case TDVF_SECTION_CFV:
+        case TDVF_SECTION_TYPE_BFV:
+        case TDVF_SECTION_TYPE_CFV:
             /*
              * The sections with file content behind them; the lowest is where
              * -bios mapped the image.
@@ -611,7 +610,7 @@ static void tdx_launch_firmware(void *opaque, bool running, RunState state)
                 fw_base = addr;
             }
             break;
-        case TDVF_SECTION_TEMP_MEM:
+        case TDVF_SECTION_TYPE_TEMP_MEM:
             /*
              * Scratch the VMM provides, not part of the image -- its raw size
              * is zero. Deliberately not counted towards fw_base: td-shim's
@@ -642,6 +641,35 @@ static void tdx_launch_firmware(void *opaque, bool running, RunState state)
                  g += TARGET_PAGE_SIZE) {
                 tdx_sept_set(env, g, TDX_PAGE_PRIVATE_ACCEPTED);
             }
+        }
+
+        /*
+         * MRTD covers the sections whose attributes ask for it, and only
+         * those.  The metadata decides, not this code: TDVF marks its
+         * firmware volumes MR_EXTEND and leaves the TD HOB and the scratch
+         * regions out, because the HOB is the VMM's word and measuring it
+         * would make the launch measurement depend on the host.  The KVM path
+         * hands the same bit to the TDX module as
+         * KVM_TDX_MEASURE_MEMORY_REGION and lets it do the extending; here
+         * there is no module, so record the bytes and let the measurement
+         * handler that runs next take them.
+         */
+        if ((sattrs & TDVF_SECTION_ATTRIBUTES_MR_EXTEND) && memsz) {
+            g_autofree uint8_t *content = NULL;
+            size_t datasize = MIN((uint64_t)rawsz, memsz);
+
+            if (datasize) {
+                content = g_malloc(datasize);
+                if (address_space_read(&address_space_memory, addr,
+                                       MEMTXATTRS_UNSPECIFIED, content,
+                                       datasize) != MEMTX_OK) {
+                    qemu_log_mask(LOG_GUEST_ERROR,
+                                  "tdx: cannot read TDVF section at 0x%"
+                                  PRIx64 " to measure it\n", addr);
+                    return;
+                }
+            }
+            x86_launch_image_add(addr, content, datasize, memsz);
         }
     }
 
@@ -674,7 +702,11 @@ static void tdx_launch_firmware(void *opaque, bool running, RunState state)
 static void tdx_measure_launch_image(void *opaque, bool running, RunState state)
 {
     TdxTcgState *td = opaque;
-    ram_addr_t ram_size = current_machine->ram_size;
+    /*
+     * Not RAM size: a firmware launch places its image in the window below
+     * 4GiB, above RAM, and stopping at RAM would measure none of it.
+     */
+    hwaddr limit = MAX(current_machine->ram_size, x86_launch_image_limit());
     g_autoptr(GByteArray) buf = g_byte_array_new();
     g_autofree uint8_t *page = g_malloc0(TARGET_PAGE_SIZE);
     struct iovec iov;
@@ -685,7 +717,7 @@ static void tdx_measure_launch_image(void *opaque, bool running, RunState state)
         return;
     }
 
-    for (gpa = 0; gpa < ram_size; gpa += TARGET_PAGE_SIZE) {
+    for (gpa = 0; gpa < limit; gpa += TARGET_PAGE_SIZE) {
         uint64_t le_gpa;
 
         const void *src;
@@ -729,7 +761,10 @@ static void tdx_measure_launch_image(void *opaque, bool running, RunState state)
     }
     td->mrtd_valid = true;
     qemu_log_mask(LOG_GUEST_ERROR,
-                  "tdx: MRTD computed over %u launch pages\n", pages);
+                  "tdx: MRTD computed over %u launch pages: "
+                  "%02x%02x%02x%02x%02x%02x%02x%02x...\n", pages,
+                  td->mrtd[0], td->mrtd[1], td->mrtd[2], td->mrtd[3],
+                  td->mrtd[4], td->mrtd[5], td->mrtd[6], td->mrtd[7]);
 }
 
 static void tdx_reset(void *opaque)
