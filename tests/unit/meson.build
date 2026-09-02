@@ -81,8 +81,9 @@ if have_block
     'test-crypto-hash': [crypto],
     'test-crypto-hmac': [crypto],
     'test-crypto-cipher': [crypto],
-    # snp-gcm.c is hand-written AES-256-GCM for the emulated SEV-SNP guest
-    # message protocol, which needs an AEAD mode the crypto API does not have.
+    # snp-gcm.c adapts the crypto API's GCM mode for the emulated SEV-SNP
+    # guest message protocol.  The known-answer vectors are kept because they
+    # are what pins the protocol's use of it, not just the cipher.
     # Compiled in directly: it lives in a target-specific library otherwise.
     'test-snp-gcm': [files('../../target/i386/tcg/system/snp-gcm.c'), crypto],
     'test-x86-launch-image': [files('../../hw/i386/x86-launch-image.c')],
