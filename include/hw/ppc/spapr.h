@@ -185,6 +185,7 @@ struct SpaprMachineState {
     SpaprPendingHpt *pending_hpt; /* in-progress resize */
 
     hwaddr rma_size;
+    bool rma_enforce;
     uint32_t fdt_size;
     uint32_t fdt_initial_size;
     void *fdt_blob;
@@ -884,6 +885,13 @@ void close_htab_fd(SpaprMachineState *spapr);
 void spapr_setup_hpt(SpaprMachineState *spapr);
 void spapr_free_hpt(SpaprMachineState *spapr);
 void spapr_check_mmu_mode(bool guest_radix);
+
+/*
+ * (Re)apply the real-mode addressing limit to every CPU.  Inert unless
+ * x-rma-enforce is on, and always inert for a radix guest, which has no
+ * real mode area to be held to.
+ */
+void spapr_apply_real_mode_limit(SpaprMachineState *spapr, bool guest_radix);
 SpaprTceTable *spapr_tce_new_table(DeviceState *owner, uint32_t liobn);
 void spapr_tce_table_enable(SpaprTceTable *tcet,
                             uint32_t page_shift, uint64_t bus_offset,

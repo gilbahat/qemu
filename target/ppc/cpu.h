@@ -1526,6 +1526,13 @@ struct ArchCPU {
     uint32_t compat_pvr;
     PPCVirtualHypervisor *vhyp;
     PPCVirtualHypervisorClass *vhyp_class;
+    /*
+     * Guest real-mode addressing limit, or 0 for none.  Only meaningful
+     * under a virtual hypervisor, which is the configuration where the
+     * machine -- not the CPU -- owns the real mode area: there is no LPCR
+     * or RMOR here to carry it.  See ppc_hash64_xlate().
+     */
+    hwaddr vhyp_real_mode_limit;
     void *machine_data;
     int32_t node_id; /* NUMA node this CPU belongs to */
     PPCHash64Options *hash64_opts;

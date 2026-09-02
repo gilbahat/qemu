@@ -1014,9 +1014,47 @@ bool ppc_hash64_xlate(PowerPCCPU *cpu, vaddr eaddr, MMUAccessType access_type,
 
         if (cpu->vhyp) {
             /*
-             * In virtual hypervisor mode, there's nothing to do:
+             * In virtual hypervisor mode, there's nothing to translate:
              *   EA == GPA == qemu guest address
+             *
+             * The machine may still ask us to bound it.  A real partition's
+             * real mode is not untranslated -- the hardware runs it through
+             * VRMA entries the hypervisor placed, covering just the RMA, and
+             * an access past them traps to the hypervisor, which reflects a
+             * storage interrupt down to the partition.  We are the
+             * hypervisor here, so we do the second half only: refuse what we
+             * advertised and hand the guest what it would have seen.  The
+             * first half is CPU state a vhyp deliberately does not model.
+             *
+             * The exception is raised here rather than through
+             * ppc_hash64_set_dsi()/set_isi() on purpose.  Those promote to
+             * HDSI/HISI whenever ppc_hash64_use_vrma() holds, which is
+             * unconditionally true on POWER9 and later -- and a PAPR
+             * partition, which never runs with MSR[HV], cannot take a
+             * hypervisor interrupt.  The RMLS arm below only escapes that
+             * because it is unreachable when VRMA is in use.
              */
+            if (cpu->vhyp_real_mode_limit &&
+                raddr >= cpu->vhyp_real_mode_limit) {
+                if (!guest_visible) {
+                    return false;
+                }
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "real-mode access to 0x%" VADDR_PRIx " is above "
+                              "the real mode area (limit 0x%" HWADDR_PRIx
+                              ")\n", eaddr, cpu->vhyp_real_mode_limit);
+                if (access_type == MMU_INST_FETCH) {
+                    cs->exception_index = POWERPC_EXCP_ISI;
+                    env->error_code = SRR1_PROTFAULT;
+                } else {
+                    cs->exception_index = POWERPC_EXCP_DSI;
+                    env->spr[SPR_DAR] = eaddr;
+                    env->spr[SPR_DSISR] = DSISR_PROTFAULT |
+                        (access_type == MMU_DATA_STORE ? DSISR_ISSTORE : 0);
+                    env->error_code = 0;
+                }
+                return false;
+            }
         } else if (mmuidx_hv(mmu_idx) || !env->has_hv_mode) {
             /* In HV mode, add HRMOR if top EA bit is clear */
             if (!(eaddr >> 63)) {

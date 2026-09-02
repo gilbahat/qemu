@@ -717,6 +717,20 @@ static bool ppc_radix64_xlate_impl(PowerPCCPU *cpu, vaddr eaddr,
                 *raddr |= env->spr[SPR_HRMOR];
            }
         }
+
+        /*
+         * No real mode area check here, deliberately.  Radix has none: RMLS
+         * and RMOR went away in ISA v3.0 and nothing replaced them, so there
+         * is no architected bound on a partition's real-mode reach and no
+         * DSISR encoding for having exceeded one.
+         *
+         * This is not merely a purity argument.  A radix Linux allocates its
+         * process table at the top of guest RAM and writes it in real mode,
+         * before translation is on -- correctly, because under radix there is
+         * no RMA to keep it below.  Bounding this arm by the advertised RMA
+         * kills that guest at boot, whatever the RMA is set to.  The hash
+         * path in ppc_hash64_xlate() is where the limit belongs.
+         */
         *protp = PAGE_READ | PAGE_WRITE | PAGE_EXEC;
         *psizep = qemu_target_page_bits();
         return true;

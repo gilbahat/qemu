@@ -1720,6 +1720,8 @@ int spapr_reallocate_hpt(SpaprMachineState *spapr, int shift, Error **errp)
     }
     /* We're setting up a hash table, so that means we're not radix */
     spapr->patb_entry = 0;
+    /* CAS has not run yet, so the guest is on hash until it says otherwise. */
+    spapr_apply_real_mode_limit(spapr, false);
     spapr_init_all_lpcrs(0, LPCR_HR | LPCR_UPRT);
     return 0;
 }
@@ -1748,6 +1750,22 @@ void spapr_setup_hpt(SpaprMachineState *spapr)
                          spapr->rma_size / MiB, vrma_limit / MiB);
             exit(EXIT_FAILURE);
         }
+    }
+}
+
+void spapr_apply_real_mode_limit(SpaprMachineState *spapr, bool guest_radix)
+{
+    /*
+     * The RMA is a hash-MMU concept.  A radix guest is entitled to reach the
+     * whole of its memory in real mode, and does: Linux writes its process
+     * table at the top of RAM before translation is on.  So the limit only
+     * ever applies to a guest that did not ask for radix.
+     */
+    hwaddr limit = (spapr->rma_enforce && !guest_radix) ? spapr->rma_size : 0;
+    CPUState *cs;
+
+    CPU_FOREACH(cs) {
+        POWERPC_CPU(cs)->vhyp_real_mode_limit = limit;
     }
 }
 
@@ -3351,6 +3369,16 @@ static void spapr_set_resize_hpt(Object *obj, const char *value, Error **errp)
     }
 }
 
+static bool spapr_get_rma_enforce(Object *obj, Error **errp)
+{
+    return SPAPR_MACHINE(obj)->rma_enforce;
+}
+
+static void spapr_set_rma_enforce(Object *obj, bool value, Error **errp)
+{
+    SPAPR_MACHINE(obj)->rma_enforce = value;
+}
+
 static bool spapr_get_vof(Object *obj, Error **errp)
 {
     SpaprMachineState *spapr = SPAPR_MACHINE(obj);
@@ -3495,6 +3523,15 @@ static void spapr_instance_init(Object *obj)
     object_property_add_bool(obj, "x-vof", spapr_get_vof, spapr_set_vof);
     object_property_set_description(obj, "x-vof",
                                     "Enable Virtual Open Firmware (experimental)");
+
+    object_property_add_bool(obj, "x-rma-enforce",
+                             spapr_get_rma_enforce, spapr_set_rma_enforce);
+    object_property_set_description(obj, "x-rma-enforce",
+                                    "Fault real-mode accesses above the RMA "
+                                    "advertised in /memory@0. TCG and hash "
+                                    "MMU only -- radix has no real mode area. "
+                                    "A development aid; the fault encoding is "
+                                    "provisional");
 
     /* The machine class defines the default interrupt controller mode */
     spapr->irq = smc->irq;

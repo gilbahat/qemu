@@ -78,6 +78,48 @@ Booting via ``-kernel`` supports the following:
 
 ¹ must set kernel-addr=0
 
+The Real Mode Area
+==================
+
+A PAPR partition may only reach part of its memory with translation off. That
+window is the Real Mode Area, and the guest learns its size from the first
+``/memory@0`` node -- there is no separate property for it.
+
+QEMU sizes the RMA as the smaller of guest RAM, the first NUMA node, and 1 TiB,
+so by default it is simply all of memory and there is nothing above it. To get
+a realistic one, make the first NUMA node small::
+
+  -m 8G \
+  -object memory-backend-ram,id=ram0,size=256M \
+  -object memory-backend-ram,id=ram1,size=7936M \
+  -numa node,nodeid=0,memdev=ram0 \
+  -numa node,nodeid=1,memdev=ram1
+
+That advertises a 256 MiB RMA to a guest with 8 GiB of memory. NUMA nodes must
+be a multiple of 256 MiB and the size is rounded down to a power of two, so
+256 MiB is the smallest RMA reachable this way.
+
+Shrinking the RMA also lowers where the device tree is placed and how much room
+the initrd has -- the kernel and initrd together must fit below
+``MIN(RMA, 2 GiB) - 40 MiB``, which is about 212 MiB at a 256 MiB RMA.
+
+``x-rma-enforce=on`` makes real-mode accesses above the RMA fault, instead of
+succeeding as they otherwise would. It is off by default and is a development
+aid for guest code that is meant to respect the RMA: it turns a silent
+assumption that real mode reaches all of memory into a Data or Instruction
+Storage Interrupt. Note that
+
+* it only does anything under TCG, since with KVM the hardware translates;
+* it only applies to a hash-MMU guest. Radix has no real mode area -- the
+  concept went away in ISA v3.0 -- so a guest that negotiates radix is not
+  bounded, and correctly so: Linux writes its process table at the top of RAM
+  in real mode;
+* the interrupt it raises is a guest-visible DSI/ISI with ``DSISR_PROTFAULT``.
+  That is consistent with what QEMU already does when an RMLS bound is
+  exceeded, but which interrupt PowerVM actually reflects for this case is not
+  architected, so treat the encoding as provisional and the refusal itself as
+  the useful part.
+
 Build directions
 ================
 

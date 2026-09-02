@@ -274,6 +274,12 @@ static bool spapr_realize_vcpu(PowerPCCPU *cpu, SpaprMachineState *spapr,
     }
 
     cpu_ppc_set_vhyp(cpu, PPC_VIRTUAL_HYPERVISOR(spapr));
+    /*
+     * Enforce exactly what the device tree advertised, or nothing at all.
+     * spapr->rma_size is settled in spapr_machine_init(), well before any
+     * CPU is realized.
+     */
+    cpu->vhyp_real_mode_limit = spapr->rma_enforce ? spapr->rma_size : 0;
     kvmppc_set_papr(cpu);
 
     env->spr_cb[SPR_PIR].default_value = cs->cpu_index;

@@ -1309,6 +1309,7 @@ target_ulong do_client_architecture_support(PowerPCCPU *cpu,
     spapr_ovec_cleanup(ov5_guest);
 
     spapr_check_mmu_mode(guest_radix);
+    spapr_apply_real_mode_limit(spapr, guest_radix);
 
     spapr->cas_pre_isa3_guest = !spapr_ovec_test(ov1_guest, OV1_PPC_3_00);
     spapr_ovec_cleanup(ov1_guest);
