@@ -213,20 +213,27 @@ int main(void)
     check(pvalidate((unsigned long)page, 9, 1) == 1,
           "bad page size not rejected");
 
-    /* CPUID: 0f a2, two bytes.  Leaf 1 is not one of the native carve-outs. */
+    /* CPUID: 0f a2, two bytes. */
     n = vc_count;
     __asm__ __volatile__("cpuid" : : "a"(1) : "rbx", "rcx", "rdx");
     check(expect_vc(n) == 1, "CPUID did not reflect after arming");
     check(vc_error_code == SVM_EXIT_CPUID, "CPUID #VC error code");
 
-    /* Leaf 0 must stay native, or a guest could never identify itself. */
+    /*
+     * Every leaf reflects, with no carve-outs.  Leaf 0 and the SEV feature
+     * leaf 0x8000001F used to answer natively so that a guest could identify
+     * itself and find the C-bit before it had a handler; hardware grants no
+     * such exemption, and the GHCB MSR protocol answers both questions from
+     * the first instruction, so the carve-out only flattered a guest that had
+     * never learned to ask.  See helper_snp_vc_cpuid().
+     */
     n = vc_count;
     __asm__ __volatile__("cpuid" : : "a"(0) : "rbx", "rcx", "rdx");
-    check(expect_vc(n) == 0, "CPUID leaf 0 should not reflect");
+    check(expect_vc(n) == 1, "CPUID leaf 0 did not reflect");
 
     n = vc_count;
     __asm__ __volatile__("cpuid" : : "a"(0x8000001F) : "rbx", "rcx", "rdx");
-    check(expect_vc(n) == 0, "CPUID.0x8000001F should not reflect");
+    check(expect_vc(n) == 1, "CPUID.0x8000001F did not reflect");
 
     /* Relaxed for this test, so it must stay native; see the file comment. */
     n = vc_count;
