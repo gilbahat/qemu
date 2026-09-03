@@ -209,6 +209,17 @@ static inline bool kvm_arm_el2_supported(void)
  */
 int kvm_arm_get_max_vm_ipa_size(MachineState *ms, bool *fixed_ipa);
 
+/**
+ * kvm_arm_vm_type:
+ * @ms: Machine state handle
+ *
+ * Returns the KVM VM type for @ms: a Realm if the machine has a confidential
+ * guest attached, otherwise a normal VM.  Kept here rather than in the machine
+ * model so that <linux/kvm.h> stays out of hw/arm/virt.c, which is built on
+ * hosts that have no such header.
+ */
+int kvm_arm_vm_type(MachineState *ms);
+
 int kvm_arm_vgic_probe(void);
 
 void kvm_arm_pmu_init(ARMCPU *cpu);
