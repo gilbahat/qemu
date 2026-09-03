@@ -1063,6 +1063,7 @@ struct ArchCPU {
      */
     bool cca_guest;
     uint8_t cca_ipa_bits;
+    uint8_t cca_ripas;
 
     /* Uniprocessor system with MP extensions */
     bool mp_is_up;

@@ -3963,7 +3963,21 @@ static bool get_phys_addr_gpc(CPUARMState *env, S1Translate *ptw,
      * alias for that page is a page-state question and is not asked yet.
      */
     if (unlikely(env_archcpu(env)->cca_guest)) {
-        result->f.phys_addr &= ~cca_shared_mask(env);
+        uint64_t mask = cca_shared_mask(env);
+        bool shared = !!(result->f.phys_addr & mask);
+
+        result->f.phys_addr &= ~mask;
+
+        if (!arm_cca_ipa_permitted(env, result->f.phys_addr, shared)) {
+            /*
+             * What a Realm sees for a granule its RMM has not mapped: a
+             * translation fault at the top level, from the stage the guest
+             * cannot see.
+             */
+            fi->type = ARMFault_Translation;
+            fi->level = 0;
+            return false;
+        }
     }
 
     if (FIELD_EX64(env->cp15.gpccr_el3, GPCCR, GPC)) {

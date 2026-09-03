@@ -1547,6 +1547,8 @@ void aarch64_max_v9_tcg_initfn(Object *obj)
                              cpu_arm_set_cca_guest);
     object_property_add_uint8_ptr(obj, "x-cca-ipa-bits", &cpu->cca_ipa_bits,
                                   OBJ_PROP_FLAG_READWRITE);
+    object_property_add_uint8_ptr(obj, "x-cca-ripas", &cpu->cca_ripas,
+                                  OBJ_PROP_FLAG_READWRITE);
 }
 
 static const ARMCPUInfo aarch64_cpus[] = {

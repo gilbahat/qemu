@@ -77,9 +77,20 @@ QEMU_EL2_MACHINE=-machine virt,virtualization=on,gic-version=2 -cpu cortex-a57 -
 QEMU_EL2_BASE_ARGS=-semihosting-config enable=on,target=native,chardev=output,arg="2"
 run-vtimer: QEMU_OPTS=$(QEMU_EL2_MACHINE) $(QEMU_EL2_BASE_ARGS) -kernel
 
+# cca-ripas provokes the faults it is testing, so it needs a vector table that
+# records and returns rather than the default one that stops.
+vector_log_el1_boot.o: $(CRT_PATH)/boot.S
+	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -DLOGGING_VECTOR_TABLE_EL1 \
+		-x assembler-with-cpp -Wa,--noexecstack -c $< -o $@
+.PRECIOUS: vector_log_el1_boot.o
+
+cca-ripas: cca-ripas.c $(LINK_SCRIPT) vector_log_el1_boot.o $(MINILIB_OBJS)
+	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) $< -o $@ $(LDFLAGS) vector_log_el1_boot.o
+
 # the CCA guest interface is serviced in software; a Realm guest runs at EL1
 QEMU_CCA_MACHINE=-machine virt,virtualization=on -cpu max,x-cca-guest=on
 run-cca: QEMU_OPTS=$(QEMU_CCA_MACHINE) $(QEMU_BASE_ARGS) -kernel
+run-cca-ripas: QEMU_OPTS=$(QEMU_CCA_MACHINE),x-cca-ripas=1 $(QEMU_BASE_ARGS) -kernel
 
 # gpc tests need EL3 and RME
 QEMU_EL3_MACHINE=-machine virt,virtualization=on,secure=on,gic-version=3 -cpu max,x-rme=on

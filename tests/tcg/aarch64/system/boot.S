@@ -94,6 +94,35 @@ skip_return:
 	add     sp, sp, #16
 	eret
 #endif
+#ifdef LOGGING_VECTOR_TABLE_EL1
+	/*
+	 * The same idea as LOGGING_VECTOR_TABLE above, for a test that runs at
+	 * EL1 and must survive the fault it provoked.  A separate block rather
+	 * than a parameterised one because the register names are part of the
+	 * instruction, not operands.
+	 */
+	sub     sp, sp, #16
+	stp     x0, x1, [sp, #0]
+	mrs     x0, ESR_EL1
+	lsr     x0, x0, #26
+	and     x0, x0, #0x3f
+	cmp     x0, #37			/* EC 0x25: data abort, same EL */
+	beq     data_fault_el1
+	b       generic_exception
+
+data_fault_el1:
+	mrs     x0, FAR_EL1
+	adrp    x1, exception_log
+	str     x0, [x1]
+	ldr     x0, =0x1001
+	str     x0, [x1, #8]
+	mrs     x0, ELR_EL1
+	add     x0, x0, #4		/* Skip the faulting instruction */
+	msr     ELR_EL1, x0
+	ldp     x0, x1, [sp, #0]
+	add     sp, sp, #16
+	eret
+#endif
 curr_spx_irq:
 curr_spx_fiq:
 curr_spx_serror:
@@ -448,7 +477,7 @@ realms_gpt0:
 	/* GPT stage 1 table, initialised to all 0xFF (full access) */
 realms_gpt1:
 	.space 524288, 0xFF
-#ifdef LOGGING_VECTOR_TABLE
+#if defined(LOGGING_VECTOR_TABLE) || defined(LOGGING_VECTOR_TABLE_EL1)
 	.align 12
 	.global exception_fault_address
 	.type exception_fault_address, @object

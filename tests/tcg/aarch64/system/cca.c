@@ -47,8 +47,14 @@ struct smc_res {
  * Eleven registers in, four out: the widest RSI call carries a 48-byte value
  * across x3-x10, so a narrower helper would silently truncate it.
  */
-static struct smc_res rsi(uint64_t f, uint64_t a1, uint64_t a2, uint64_t a3,
-                          uint64_t a4)
+/*
+ * The results are stored through @out rather than returned by value.  A
+ * 32-byte struct comes back through an indirect pointer, and at -O0 the
+ * compiler is free to use one of the very registers the SMC returns in while
+ * arranging that -- which silently loses x1.
+ */
+static void rsi(struct smc_res *out, uint64_t f, uint64_t a1, uint64_t a2,
+                uint64_t a3, uint64_t a4)
 {
     register uint64_t x0 __asm__("x0") = f;
     register uint64_t x1 __asm__("x1") = a1;
@@ -59,7 +65,10 @@ static struct smc_res rsi(uint64_t f, uint64_t a1, uint64_t a2, uint64_t a3,
     __asm__ __volatile__("smc #0"
                          : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4)
                          : : "memory");
-    return (struct smc_res){x0, x1, x2, x3};
+    out->a0 = x0;
+    out->a1 = x1;
+    out->a2 = x2;
+    out->a3 = x3;
 }
 
 /* The configuration granule the RMM fills in.  Only the first field is read. */
@@ -76,7 +85,7 @@ int main(void)
     ml_printf("Emulated Arm CCA guest interface test\n");
 
     /* Version: the reply must be an interval containing the one we asked for. */
-    r = rsi(RSI_ABI_VERSION, RSI_ABI_VERSION_1_0, 0, 0, 0);
+    rsi(&r, RSI_ABI_VERSION, RSI_ABI_VERSION_1_0, 0, 0, 0);
     check(r.a0 == RSI_SUCCESS, "RSI_VERSION status");
     check(r.a1 <= RSI_ABI_VERSION_1_0 && r.a2 >= RSI_ABI_VERSION_1_0,
           "RSI_VERSION did not offer 1.0");
@@ -91,7 +100,7 @@ int main(void)
      * for one that wrote a plausible value.
      */
     *(volatile uint64_t *)config = 0xdeadbeefUL;
-    r = rsi(RSI_REALM_CONFIG, (uint64_t)config, 0, 0, 0);
+    rsi(&r, RSI_REALM_CONFIG, (uint64_t)config, 0, 0, 0);
     check(r.a0 == RSI_SUCCESS, "RSI_REALM_CONFIG status");
     check(*(volatile uint64_t *)config != 0xdeadbeefUL,
           "RSI_REALM_CONFIG did not write the granule");
@@ -102,7 +111,7 @@ int main(void)
     ml_printf("IPA width %d, shared bit 0x%lx\n", (int)ipa_bits, shared_mask);
 
     /* An unaligned configuration buffer must be refused rather than accepted. */
-    r = rsi(RSI_REALM_CONFIG, (uint64_t)config + 8, 0, 0, 0);
+    rsi(&r, RSI_REALM_CONFIG, (uint64_t)config + 8, 0, 0, 0);
     check(r.a0 == RSI_ERROR_INPUT, "unaligned RSI_REALM_CONFIG was accepted");
 
     /*
@@ -112,19 +121,19 @@ int main(void)
      */
     base = (uint64_t)window;
     top = base + sizeof(window);
-    r = rsi(RSI_IPA_STATE_SET, base, top, RSI_RIPAS_EMPTY,
+    rsi(&r, RSI_IPA_STATE_SET, base, top, RSI_RIPAS_EMPTY,
             RSI_NO_CHANGE_DESTROYED);
     check(r.a0 == RSI_SUCCESS, "RSI_IPA_STATE_SET status");
     check(r.a1 > base && r.a1 <= top, "RSI_IPA_STATE_SET did not advance");
 
     /* A range that is not granule-aligned, and an empty one, must be refused. */
-    r = rsi(RSI_IPA_STATE_SET, base + 1, top, RSI_RIPAS_EMPTY,
+    rsi(&r, RSI_IPA_STATE_SET, base + 1, top, RSI_RIPAS_EMPTY,
             RSI_NO_CHANGE_DESTROYED);
     check(r.a0 == RSI_ERROR_INPUT, "misaligned RSI_IPA_STATE_SET was accepted");
-    r = rsi(RSI_IPA_STATE_SET, top, base, RSI_RIPAS_EMPTY,
+    rsi(&r, RSI_IPA_STATE_SET, top, base, RSI_RIPAS_EMPTY,
             RSI_NO_CHANGE_DESTROYED);
     check(r.a0 == RSI_ERROR_INPUT, "inverted RSI_IPA_STATE_SET was accepted");
-    r = rsi(RSI_IPA_STATE_SET, base, top, 99, RSI_NO_CHANGE_DESTROYED);
+    rsi(&r, RSI_IPA_STATE_SET, base, top, 99, RSI_NO_CHANGE_DESTROYED);
     check(r.a0 == RSI_ERROR_INPUT, "undefined RIPAS was accepted");
 
     /*
@@ -136,7 +145,7 @@ int main(void)
      */
 
     /* Something in the RSI range we do not implement is refused, not ignored. */
-    r = rsi(RSI_MEASUREMENT_EXTEND, 1, 48, 0, 0);
+    rsi(&r, RSI_MEASUREMENT_EXTEND, 1, 48, 0, 0);
     check(r.a0 == SMCCC_NOT_SUPPORTED,
           "an unimplemented RSI call did not report NOT_SUPPORTED");
 
