@@ -464,6 +464,7 @@ ttb:
 	.space	4096, 0
 
 	.align	12
+	.global ttb_stage2
 ttb_stage2:
 	.space	4096, 0
 

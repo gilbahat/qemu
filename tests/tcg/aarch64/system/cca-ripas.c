@@ -15,9 +15,15 @@
  * keep working costs nothing and looks like success.  Run with
  * -cpu max,x-cca-guest=on,x-cca-ripas=1.
  *
- * This test turns stage-1 translation off first.  That is not a trick to
- * reach the alias: it is how a Realm actually runs, and the harness maps
- * virtual onto physical one-to-one, so nothing moves when the MMU goes away.
+ * This test turns stage-1 translation off first, which is how a Realm is
+ * entered and how one runs until it builds tables of its own.  It is not a
+ * trick to reach the alias: the harness maps virtual onto physical one-to-one,
+ * so nothing moves when the MMU goes away.
+ *
+ * A Realm that has turned translation on reaches the alias through an entry
+ * whose output address carries the bit, which is a different route into the
+ * same code -- get_phys_addr_gpc() runs on the output of stage 1.  That is
+ * cca-stage1.c, and it is the case a real guest exercises.
  */
 
 #include <stdint.h>
