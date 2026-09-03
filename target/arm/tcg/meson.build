@@ -86,6 +86,7 @@ arm_common_user_system_ss.add(when: 'TARGET_AARCH64', if_true: files(
 
 arm_common_system_ss.add(files(
   'cpu32.c',
+  'cca.c',
   'cpregs-at.c',
   'gicv5-cpuif.c',
   'psci.c',

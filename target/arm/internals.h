@@ -714,6 +714,32 @@ bool arm_is_psci_call(ARMCPU *cpu, int excp_type);
 /* Actually handle a PSCI call */
 void arm_handle_psci_call(ARMCPU *cpu);
 
+#if defined(CONFIG_USER_ONLY) || !defined(CONFIG_TCG)
+static inline bool arm_is_cca_call(ARMCPU *cpu, int excp_type)
+{
+    return false;
+}
+#else
+/* Return true if this SMC is an RSI call to the emulated CCA guest interface */
+bool arm_is_cca_call(ARMCPU *cpu, int excp_type);
+#endif
+/* Actually handle an RSI call */
+void arm_handle_cca_call(ARMCPU *cpu);
+
+/**
+ * cca_shared_mask: the IPA bit that selects the unprotected alias
+ *
+ * Zero unless this is an emulated CCA guest.  Inline here rather than in
+ * cca.c because the translation path needs it and is built for
+ * configurations where cca.c is not.
+ */
+static inline uint64_t cca_shared_mask(CPUARMState *env)
+{
+    ARMCPU *cpu = env_archcpu(env);
+
+    return cpu->cca_guest ? 1ULL << (cpu->cca_ipa_bits - 1) : 0;
+}
+
 /**
  * arm_clear_exclusive: clear the exclusive monitor
  * @env: CPU env

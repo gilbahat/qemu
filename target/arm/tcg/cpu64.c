@@ -156,6 +156,16 @@ static bool cpu_arm_get_rme(Object *obj, Error **errp)
     return cpu_isar_feature(aa64_rme, cpu);
 }
 
+static bool cpu_arm_get_cca_guest(Object *obj, Error **errp)
+{
+    return ARM_CPU(obj)->cca_guest;
+}
+
+static void cpu_arm_set_cca_guest(Object *obj, bool value, Error **errp)
+{
+    ARM_CPU(obj)->cca_guest = value;
+}
+
 static void cpu_arm_set_rme(Object *obj, bool value, Error **errp)
 {
     ARMCPU *cpu = ARM_CPU(obj);
@@ -1526,6 +1536,17 @@ void aarch64_max_v9_tcg_initfn(Object *obj)
     /* v9.4: FEAT_RME_GPC2 */
     object_property_add(obj, "x-l0gptsz", "uint32", cpu_max_get_l0gptsz,
                         cpu_max_set_l0gptsz, NULL, NULL);
+
+    /*
+     * Emulated CCA guest interface.  Unrelated to x-rme above: that is the
+     * CPU feature a host needs in order to run Realms, this is the guest's
+     * side of the RSI conversation, serviced in software.
+     */
+    cpu->cca_ipa_bits = 40;
+    object_property_add_bool(obj, "x-cca-guest", cpu_arm_get_cca_guest,
+                             cpu_arm_set_cca_guest);
+    object_property_add_uint8_ptr(obj, "x-cca-ipa-bits", &cpu->cca_ipa_bits,
+                                  OBJ_PROP_FLAG_READWRITE);
 }
 
 static const ARMCPUInfo aarch64_cpus[] = {

@@ -27,6 +27,7 @@
 #include "target/arm/tcg/idau.h"
 #include "qemu/module.h"
 #include "qapi/error.h"
+#include "qemu/error-report.h"
 #include "cpu.h"
 #ifdef CONFIG_TCG
 #include "exec/translation-block.h"
@@ -2396,6 +2397,30 @@ static void arm_cpu_realizefn(DeviceState *dev, Error **errp)
 #ifndef CONFIG_USER_ONLY
     if (tcg_enabled() && cpu_isar_feature(aa64_rme, cpu)) {
         arm_register_el_change_hook(cpu, &gt_rme_post_el_change, 0);
+    }
+
+    if (cpu->cca_guest) {
+        if (!tcg_enabled()) {
+            error_setg(errp, "x-cca-guest emulates the Arm CCA guest interface "
+                       "in TCG; a real Realm is created with "
+                       "-object rme-guest");
+            return;
+        }
+        /*
+         * The guest derives the bit that separates protected from unprotected
+         * addresses as ipa_bits - 1, so a width outside this range leaves it
+         * with no usable split.
+         */
+        if (cpu->cca_ipa_bits < 32 || cpu->cca_ipa_bits > 52) {
+            error_setg(errp, "x-cca-ipa-bits must be between 32 and 52 "
+                       "(got %u)", cpu->cca_ipa_bits);
+            return;
+        }
+        warn_report("x-cca-guest is an EXPERIMENTAL TCG emulation of the Arm "
+                    "CCA *guest* interface. There is no Realm, no memory "
+                    "protection enforced by hardware and NO GENUINE "
+                    "ATTESTATION. Do not rely on it for any security "
+                    "property.");
     }
 #endif
 

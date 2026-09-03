@@ -1057,6 +1057,13 @@ struct ArchCPU {
     /* Realm Management Extension */
     bool kvm_rme;
 
+    /*
+     * Emulated Arm CCA guest interface (TCG only).  Unrelated to kvm_rme
+     * above, which is the host side of a real Realm.
+     */
+    bool cca_guest;
+    uint8_t cca_ipa_bits;
+
     /* Uniprocessor system with MP extensions */
     bool mp_is_up;
 

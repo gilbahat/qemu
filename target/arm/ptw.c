@@ -3952,6 +3952,20 @@ static bool get_phys_addr_gpc(CPUARMState *env, S1Translate *ptw,
         return false;
     }
 
+    /*
+     * The emulated CCA guest interface splits the IPA space in half: the top
+     * bit selects the unprotected alias of a page.  A Realm reaches shared
+     * memory through that alias and hands a device the plain address, so both
+     * have to arrive at the same memory.  Fold the bit away here, after the
+     * walk has produced an output address and before anything consults it.
+     *
+     * This is only the aliasing.  Whether the guest was entitled to use the
+     * alias for that page is a page-state question and is not asked yet.
+     */
+    if (unlikely(env_archcpu(env)->cca_guest)) {
+        result->f.phys_addr &= ~cca_shared_mask(env);
+    }
+
     if (FIELD_EX64(env->cp15.gpccr_el3, GPCCR, GPC)) {
         ARMCPU *cpu = env_archcpu(env);
         MemTxAttrs attrs = {
