@@ -154,6 +154,14 @@ static int find_edu(unsigned *devfn_out)
     return 0;
 }
 
+/*
+ * The PL011's PeriphID0-3, at a fixed address on every virt board.  Each is a
+ * 32-bit register holding one byte, so eight bytes read back as two of them:
+ * 0x11 then 0x10.
+ */
+#define PL011_PERIPH_ID         0x09000fe0UL
+#define PL011_PERIPH_ID_VALUE   0x0000001000000011UL
+
 static uint8_t handed_back[4096] __attribute__((aligned(4096)));
 static uint8_t still_ours[4096] __attribute__((aligned(4096)));
 static uint8_t result[4096] __attribute__((aligned(4096)));
@@ -254,6 +262,29 @@ int main(void)
           "DMA of the buffer did not complete");
     check(*res != PATTERN_SHARED,
           "the device honoured an aliased descriptor address");
+
+    /*
+     * A device reaching another device is not the host reaching into Realm
+     * memory, and only RAM has a page state at all.  Judging MMIO by the
+     * page-state map denies every one of these, because a model that records
+     * what a guest gave back calls everything else still the guest's -- and on
+     * this board the first thing that would be denied is an MSI, which is a
+     * write to the GIC.
+     *
+     * Read the PL011's peripheral identification registers, which every virt
+     * board has at a fixed address and which read back a known value.  Nothing
+     * relinquished them, so before this was distinguished the transfer moved
+     * nothing at all.
+     */
+    *res = 0;
+    check(edu_dma(EDU_DMA_BUF, (uint64_t)result, 8, EDU_DMA_TO_PCI),
+          "DMA of the blanking write did not complete");
+    check(edu_dma(PL011_PERIPH_ID, EDU_DMA_BUF, 8, 0),
+          "DMA from device memory did not complete");
+    check(edu_dma(EDU_DMA_BUF, (uint64_t)result, 8, EDU_DMA_TO_PCI),
+          "DMA of the buffer did not complete");
+    check(*res == PL011_PERIPH_ID_VALUE,
+          "a device could not reach another device's registers");
 
     if (failures) {
         ml_printf("%d failure(s)\n", failures);
