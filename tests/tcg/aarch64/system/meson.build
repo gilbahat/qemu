@@ -100,6 +100,17 @@ tests += {
     'qemu_args': ['-M', cca_machine, '-cpu', cca_cpu + ',x-cca-ripas=1',
                   qemu_base_args],
   },
+  # edu's default DMA mask would clamp the alias bit away before the filter
+  # saw it, so widen it past the bit x-cca-ipa-bits puts the alias at.
+  # highmem-ecam=off keeps ECAM at its low, fixed base so the test can find
+  # it without parsing a device tree.
+  'cca-dma.c': {
+    'cflags': cflags,
+    'qemu_args': ['-M', 'virt,virtualization=on,highmem-ecam=off',
+                  '-cpu', cca_cpu + ',x-cca-ripas=1',
+                  '-device', 'edu,dma_mask=0xffffffffffff',
+                  qemu_base_args],
+  },
 }
 # --- end emulated CCA guest ---
 

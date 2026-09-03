@@ -1,5 +1,8 @@
 arm_common_ss = ss.source_set()
 arm_common_ss.add(when: 'CONFIG_ARM_VIRT', if_true: files('virt.c'))
+# Consults the TCG page-state model, so it only exists where that does.
+arm_common_ss.add(when: ['CONFIG_ARM_VIRT', 'CONFIG_TCG'],
+                  if_true: files('cca-dma.c'))
 arm_common_ss.add(when: 'CONFIG_ACPI', if_true: files('virt-acpi-build.c'))
 arm_common_ss.add(when: 'CONFIG_DIGIC', if_true: files('digic_boards.c'))
 arm_common_ss.add(when: 'CONFIG_EMCRAFT_SF2', if_true: files('msf2-som.c'))
