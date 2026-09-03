@@ -3043,6 +3043,29 @@ static void machvirt_init(MachineState *machine)
 
         pa_bits = arm_pamax(armcpu);
 
+        /*
+         * An emulated CCA guest addresses the top bit of its IPA space to
+         * reach the unprotected alias, so nothing may be *placed* at or above
+         * that bit: a device there is one the guest cannot name, because the
+         * address it would have to use is the address of its own alias.
+         *
+         * This is the reservation virt_kvm_type() makes for a Realm under KVM,
+         * arrived at from the other side -- there it comes off the IPA size the
+         * host allows, here off the width the guest was told to expect. The
+         * throwaway CPU above already carries the property, so the answer is
+         * available at the one moment the memory map is still open.
+         *
+         * Getting it wrong is not loud. With the default 40-bit width the bit
+         * is 512GiB, which is exactly where this board's 64-bit PCIe window
+         * begins, so a Linux Realm assigned a virtio BAR there, mapped it
+         * shared, had the alias folded off by the translation, and reported
+         * that the device "does not have VIRTIO_F_VERSION_1" -- reading zeroes
+         * from an address nothing answers.
+         */
+        if (armcpu->cca_guest && (int)armcpu->cca_ipa_bits - 1 < pa_bits) {
+            pa_bits = armcpu->cca_ipa_bits - 1;
+        }
+
         object_unref(cpuobj);
 
         virt_set_memmap(vms, pa_bits);
