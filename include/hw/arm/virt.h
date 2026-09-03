@@ -177,6 +177,8 @@ struct VirtMachineState {
     bool ras;
     bool mte;
     OnOffAuto dtb_randomness;
+    /* Seeds asked for in create_fdt(), added once the CPUs exist. */
+    bool dtb_randomness_pending;
     bool second_ns_uart_present;
     OnOffAuto acpi;
     VirtGICType gic_version;

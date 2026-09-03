@@ -111,6 +111,10 @@ tests += {
                   '-device', 'edu,dma_mask=0xffffffffffff',
                   qemu_base_args],
   },
+  'cca-attest.c': {
+    'cflags': cflags,
+    'qemu_args': ['-M', cca_machine, '-cpu', cca_cpu, qemu_base_args],
+  },
 }
 # --- end emulated CCA guest ---
 

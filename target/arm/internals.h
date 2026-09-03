@@ -730,6 +730,15 @@ void arm_handle_cca_call(ARMCPU *cpu);
 void arm_cca_init(void);
 
 /**
+ * arm_cca_find_guest_cpu: the first CPU running as an emulated CCA guest.
+ *
+ * NULL if there is none.  A Realm is a property of the machine rather than of
+ * a vCPU, but it is selected with a CPU property, so this is how anything
+ * outside target/arm asks the question.  Only meaningful once the CPUs exist.
+ */
+ARMCPU *arm_cca_find_guest_cpu(void);
+
+/**
  * arm_cca_ipa_permitted: may this access reach @ipa through this half?
  * @ipa: output address, with the alias bit already folded away
  * @shared: true if the access arrived through the unprotected alias

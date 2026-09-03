@@ -127,23 +127,9 @@ static const PCIIOMMUOps cca_dma_iommu_ops = {
     .get_address_space = cca_dma_get_address_space,
 };
 
-static ARMCPU *cca_dma_find_cpu(void)
-{
-    CPUState *cs;
-
-    CPU_FOREACH(cs) {
-        ARMCPU *cpu = ARM_CPU(cs);
-
-        if (cpu->cca_guest) {
-            return cpu;
-        }
-    }
-    return NULL;
-}
-
 void cca_dma_setup(PCIBus *bus)
 {
-    ARMCPU *cpu = cca_dma_find_cpu();
+    ARMCPU *cpu = arm_cca_find_guest_cpu();
     CcaDmaState *s;
 
     if (!cpu || !bus) {

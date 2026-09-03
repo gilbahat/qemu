@@ -87,6 +87,10 @@ if have_block
     # Compiled in directly: it lives in a target-specific library otherwise.
     'test-snp-gcm': [files('../../target/i386/tcg/system/snp-gcm.c'), crypto],
     'test-x86-launch-image': [files('../../hw/i386/x86-launch-image.c')],
+    # cca-token.c builds the Arm CCA attestation token for the emulated guest
+    # interface.  Compiled in directly, as snp-gcm.c is, because it otherwise
+    # lives in a target-specific library.
+    'test-cca-token': [files('../../target/arm/tcg/cca-token.c'), crypto],
     'test-crypto-akcipher': [crypto],
     'test-crypto-secret': [crypto, keyutils],
     'test-crypto-der': [crypto],
