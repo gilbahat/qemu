@@ -10,7 +10,14 @@
  *
  * Run with -cpu max,x-cca-guest=on.  Without it every call below returns
  * SMCCC's "not supported", which is how a Realm-aware guest discovers it is
- * not in a Realm -- checked at the end.
+ * not in a Realm -- and which the version check below tells apart from a
+ * refusal, because they mean different things and a guest acts differently on
+ * each.
+ *
+ * Seeing that for yourself takes -machine virt,virtualization=on as well as
+ * dropping the property: the board picks the SMC conduit for a CCA guest and
+ * HVC otherwise, and an SMC with no conduit and no EL3 is an undefined
+ * instruction rather than a call that gets an answer.
  */
 
 #include <stdint.h>
@@ -19,6 +26,7 @@
 #define RSI_ABI_VERSION             0xc4000190UL
 #define RSI_FEATURES                0xc4000191UL
 #define RSI_REALM_CONFIG            0xc4000196UL
+#define RSI_HOST_CALL               0xc4000199UL
 #define RSI_IPA_STATE_SET           0xc4000197UL
 
 #define RSI_SUCCESS                 0UL
@@ -90,7 +98,18 @@ int main(void)
     check(r.a1 <= RSI_ABI_VERSION_1_0 && r.a2 >= RSI_ABI_VERSION_1_0,
           "RSI_VERSION did not offer 1.0");
     if (r.a0 != RSI_SUCCESS) {
-        ml_printf("FAIL: no RSI here -- was x-cca-guest=on given?\n");
+        /*
+         * Told apart deliberately. NOT_SUPPORTED means there is no RSI at all,
+         * which is how a Realm-aware guest finds out it is not in a Realm and
+         * is a thing to carry on from; any other status means RSI is here and
+         * refused this call, which is not.
+         */
+        if (r.a0 == SMCCC_NOT_SUPPORTED) {
+            ml_printf("FAIL: no RSI here -- was x-cca-guest=on given?\n");
+        } else {
+            ml_printf("FAIL: RSI_VERSION refused 1.0 with status %d\n",
+                      (int)r.a0);
+        }
         return 1;
     }
 
@@ -145,13 +164,41 @@ int main(void)
      */
 
     /*
-     * Something in the RSI range we do not implement is refused, not ignored
-     * -- and not answered by PSCI, which shares the function ID range and
-     * would report a PSCI error for a call that is not one.
+     * RSI_FEATURES reports what the RMM can do. Nothing optional is
+     * implemented here, so the one register reads as zero -- and a guest that
+     * asks for a register beyond it is told so rather than given a zero it
+     * would take for an answer.
+     *
+     * This check used to assert that RSI_FEATURES was NOT_SUPPORTED, which was
+     * true when it was written and is the second time a test in this file has
+     * had to be corrected in that direction. RSI 1.0's whole function range is
+     * now implemented, so there is no unimplemented call left to probe with;
+     * what the dispatch's refusal arm protects is a future ID, not a present
+     * one.
      */
     rsi(&r, RSI_FEATURES, 0, 0, 0, 0);
-    check(r.a0 == SMCCC_NOT_SUPPORTED,
-          "an unimplemented RSI call did not report NOT_SUPPORTED");
+    check(r.a0 == RSI_SUCCESS, "RSI_FEATURES status");
+    check(r.a1 == 0, "RSI_FEATURES claims an optional capability");
+    rsi(&r, RSI_FEATURES, 1, 0, 0, 0);
+    check(r.a0 == RSI_ERROR_INPUT,
+          "RSI_FEATURES answered for a register that does not exist");
+
+    /*
+     * A host call with no host. It is accepted, because every RMM implements
+     * the call and what is absent is a host with an opinion -- and the granule
+     * comes back as the guest wrote it, which is what a host that ignored it
+     * would leave.
+     */
+    *(volatile uint64_t *)config = 0x686f7374UL;
+    rsi(&r, RSI_HOST_CALL, (uint64_t)config, 0, 0, 0);
+    check(r.a0 == RSI_SUCCESS, "RSI_HOST_CALL status");
+    check(*(volatile uint64_t *)config == 0x686f7374UL,
+          "RSI_HOST_CALL disturbed the argument granule");
+
+    /* And the same two refusals the rest of the interface makes. */
+    rsi(&r, RSI_HOST_CALL, (uint64_t)config + 8, 0, 0, 0);
+    check(r.a0 == RSI_ERROR_INPUT,
+          "an unaligned RSI_HOST_CALL structure was accepted");
 
     if (failures) {
         ml_printf("%d failure(s)\n", failures);
