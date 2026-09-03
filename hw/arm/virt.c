@@ -296,6 +296,36 @@ static void create_randomness(MachineState *ms, const char *node)
 }
 
 /*
+ * Add the DTB's random seeds, unless this turned out to be a Realm.
+ *
+ * The seeds are part of what a Realm is measured over, so leaving them in
+ * gives a different Realm Initial Measurement on every boot and nothing to
+ * attest against.  create_fdt() already refuses them to a confidential guest,
+ * which is enough for the KVM path because that is a machine property; the
+ * emulated CCA guest is a CPU property and is not knowable until the CPUs have
+ * been created, which is why this half happens here.
+ *
+ * An explicit dtb-randomness=on is still honoured.  Someone who asks for both
+ * gets what they asked for, and an unstable measurement with it.
+ */
+static void virt_add_dtb_randomness(VirtMachineState *vms)
+{
+    MachineState *ms = MACHINE(vms);
+
+    if (!vms->dtb_randomness_pending) {
+        return;
+    }
+    if (vms->dtb_randomness == ON_OFF_AUTO_AUTO && arm_cca_find_guest_cpu()) {
+        return;
+    }
+
+    create_randomness(ms, "/chosen");
+    if (vms->secure) {
+        create_randomness(ms, "/secure-chosen");
+    }
+}
+
+/*
  * The CPU object always exposes the NS EL2 virt timer IRQ line,
  * but we don't want to advertise it to the guest in the dtb or ACPI
  * table unless it's really going to do something.
@@ -440,17 +470,19 @@ static void create_fdt(VirtMachineState *vms)
      */
     qemu_fdt_setprop(fdt, "/", "dma-coherent", NULL, 0);
 
+    /*
+     * The seeds themselves are added once the CPUs exist, by
+     * virt_add_dtb_randomness().  An emulated CCA guest is selected with a CPU
+     * property and there is no CPU yet, so the question this decides cannot be
+     * fully answered here.
+     */
+    vms->dtb_randomness_pending = dtb_randomness;
+
     /* /chosen must exist for load_dtb to fill in necessary properties later */
     qemu_fdt_add_subnode(fdt, "/chosen");
-    if (dtb_randomness) {
-        create_randomness(ms, "/chosen");
-    }
 
     if (vms->secure) {
         qemu_fdt_add_subnode(fdt, "/secure-chosen");
-        if (dtb_randomness) {
-            create_randomness(ms, "/secure-chosen");
-        }
     }
 
     qemu_fdt_add_subnode(fdt, "/aliases");
@@ -3216,6 +3248,8 @@ static void machvirt_init(MachineState *machine)
         qdev_realize(DEVICE(cpuobj), NULL, &error_fatal);
         object_unref(cpuobj);
     }
+
+    virt_add_dtb_randomness(vms);
 
     /* Now we've created the CPUs we can see if they have the hypvirt timer */
     vms->ns_el2_virt_timer_irq = ns_el2_virt_timer_present() &&

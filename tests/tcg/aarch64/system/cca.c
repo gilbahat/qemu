@@ -17,7 +17,7 @@
 #include <minilib.h>
 
 #define RSI_ABI_VERSION             0xc4000190UL
-#define RSI_MEASUREMENT_EXTEND      0xc4000193UL
+#define RSI_FEATURES                0xc4000191UL
 #define RSI_REALM_CONFIG            0xc4000196UL
 #define RSI_IPA_STATE_SET           0xc4000197UL
 
@@ -144,8 +144,12 @@ int main(void)
      * page-state test sets up its own tables and checks it there.
      */
 
-    /* Something in the RSI range we do not implement is refused, not ignored. */
-    rsi(&r, RSI_MEASUREMENT_EXTEND, 1, 48, 0, 0);
+    /*
+     * Something in the RSI range we do not implement is refused, not ignored
+     * -- and not answered by PSCI, which shares the function ID range and
+     * would report a PSCI error for a call that is not one.
+     */
+    rsi(&r, RSI_FEATURES, 0, 0, 0, 0);
     check(r.a0 == SMCCC_NOT_SUPPORTED,
           "an unimplemented RSI call did not report NOT_SUPPORTED");
 

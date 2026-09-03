@@ -1308,6 +1308,27 @@ static void arm_cpu_initfn(Object *obj)
  * on the CPU type, and is set in the realize fn.
  */
 #ifndef CONFIG_USER_ONLY
+/*
+ * A Realm is one thing, but it is selected with a CPU property, so this is how
+ * anything outside target/arm asks whether it is running one.  It lives here
+ * rather than in tcg/cca.c because callers in hw/arm are built for
+ * configurations that have no TCG at all, where the emulation is absent and
+ * the answer is simply no.
+ */
+ARMCPU *arm_cca_find_guest_cpu(void)
+{
+    CPUState *cs;
+
+    CPU_FOREACH(cs) {
+        ARMCPU *cpu = ARM_CPU(cs);
+
+        if (cpu->cca_guest) {
+            return cpu;
+        }
+    }
+    return NULL;
+}
+
 static const Property arm_cpu_gt_cntfrq_property =
             DEFINE_PROP_UINT64("cntfrq", ARMCPU, gt_cntfrq_hz, 0);
 
@@ -2421,6 +2442,12 @@ static void arm_cpu_realizefn(DeviceState *dev, Error **errp)
                     "protection enforced by hardware and NO GENUINE "
                     "ATTESTATION. Do not rely on it for any security "
                     "property.");
+        /*
+         * Once, however many vCPUs there are: the Realm's measurements and
+         * page states belong to the Realm, and the notifier that measures the
+         * launch image must be registered before anything is loaded.
+         */
+        arm_cca_init();
     }
 #endif
 
