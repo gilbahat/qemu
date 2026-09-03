@@ -37,6 +37,7 @@
  * dispatch below matches on the whole ID rather than the owning entity.
  */
 #define RSI_ABI_VERSION             0xc4000190
+#define RSI_FEATURES                0xc4000191
 #define RSI_MEASUREMENT_READ        0xc4000192
 #define RSI_MEASUREMENT_EXTEND      0xc4000193
 #define RSI_ATTESTATION_TOKEN_INIT  0xc4000194
@@ -44,13 +45,14 @@
 #define RSI_REALM_CONFIG            0xc4000196
 #define RSI_IPA_STATE_SET           0xc4000197
 #define RSI_IPA_STATE_GET           0xc4000198
+#define RSI_HOST_CALL               0xc4000199
 
 /*
- * The last function ID RSI 1.0 defines (RSI_HOST_CALL).  Nothing between here
- * and RSI_ABI_VERSION falls through to PSCI, implemented or not -- see
- * arm_is_cca_call().
+ * The last function ID RSI 1.0 defines.  Nothing between here and
+ * RSI_ABI_VERSION falls through to PSCI -- see arm_is_cca_call() -- and with
+ * RSI_FEATURES and RSI_HOST_CALL below, every one of them is now answered.
  */
-#define RSI_FID_LAST                0xc4000199
+#define RSI_FID_LAST                RSI_HOST_CALL
 
 /*
  * The Arm Architecture calls, which are not RSI and are answered here anyway.
@@ -887,6 +889,82 @@ static uint64_t cca_ipa_state_get(ARMCPU *cpu, uint64_t base, uint64_t top,
     return RSI_SUCCESS;
 }
 
+/*
+ * RSI_FEATURES reports what the RMM can do, as a bitmap per register index.
+ *
+ * Zero, and deliberately so.  The register describes *optional* RMM
+ * capabilities, and this emulation implements none of them; a bitmap invented
+ * from memory of the specification would claim capabilities that nothing here
+ * could honour and nothing here could test.  Zero is the one answer that is
+ * true of what is actually implemented.
+ *
+ * Note this is not where a Realm learns its hash algorithm -- that is the
+ * second field of the RSI_REALM_CONFIG granule, which says SHA-256, and is
+ * what a running Realm reads.  Anyone extending this with the real layout in
+ * front of them should change the value and leave the reasoning.
+ */
+static uint64_t cca_features(ARMCPU *cpu, uint64_t index, uint64_t *value)
+{
+    if (index != 0) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "cca: RSI_FEATURES index %" PRIu64 " is past the only "
+                      "feature register\n", index);
+        return RSI_ERROR_INPUT;
+    }
+    *value = 0;
+    return RSI_SUCCESS;
+}
+
+/*
+ * RSI_HOST_CALL passes a granule of arguments to the Normal-world host, which
+ * is what a Realm uses when it wants something only the host can do.  On
+ * hardware the RMM copies the structure out, exits to the host, and copies
+ * back whatever the host left in it.
+ *
+ * There is no host here.  That is not the same as there being no call: this
+ * is the one RSI function whose result is a *policy* rather than a fact about
+ * the machine, and a host is never obliged to act on it.  So the call is
+ * accepted, the granule is left exactly as the guest wrote it, and the guest
+ * reads back what it passed -- which is precisely what a host that ignored the
+ * call would leave, and is a case a guest has to handle on hardware too.
+ *
+ * Answering NOT_SUPPORTED instead would be the wrong lie.  Every RMM
+ * implements this; what is missing here is a host with an opinion, and a guest
+ * told "not supported" would conclude something false about the interface
+ * rather than something true about the host.
+ *
+ * The contents are not interpreted, so nothing here depends on the structure's
+ * layout.  The granule is probed rather than read in full: a guest passing an
+ * address it does not own is the realistic mistake, and the RMM would refuse
+ * it too.
+ */
+static uint64_t cca_host_call(ARMCPU *cpu, uint64_t addr)
+{
+    uint8_t probe;
+
+    if (addr & (RSI_GRANULE_SIZE - 1)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "cca: RSI_HOST_CALL structure at 0x%" PRIx64 " is not "
+                      "granule-aligned\n", addr);
+        return RSI_ERROR_INPUT;
+    }
+    if (address_space_read(arm_addressspace(CPU(cpu), MEMTXATTRS_UNSPECIFIED),
+                           addr, MEMTXATTRS_UNSPECIFIED, &probe,
+                           sizeof(probe)) != MEMTX_OK) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "cca: RSI_HOST_CALL structure at 0x%" PRIx64 " is not "
+                      "readable\n", addr);
+        return RSI_ERROR_INPUT;
+    }
+
+    warn_report_once("cca: the guest made an RSI host call and there is no "
+                     "host to make it to. The call is accepted and the "
+                     "argument granule is left untouched, which is what a host "
+                     "that ignored it would do; a guest waiting for an answer "
+                     "will not get one.");
+    return RSI_SUCCESS;
+}
+
 void arm_handle_cca_call(ARMCPU *cpu)
 {
     CPUARMState *env = &cpu->env;
@@ -925,6 +1003,18 @@ void arm_handle_cca_call(ARMCPU *cpu)
 
     case RSI_REALM_CONFIG:
         ret = cca_realm_config(cpu, env->xregs[1]);
+        break;
+
+    case RSI_FEATURES: {
+        uint64_t value = 0;
+
+        ret = cca_features(cpu, env->xregs[1], &value);
+        env->xregs[1] = value;
+        break;
+    }
+
+    case RSI_HOST_CALL:
+        ret = cca_host_call(cpu, env->xregs[1]);
         break;
 
     case RSI_MEASUREMENT_READ:
