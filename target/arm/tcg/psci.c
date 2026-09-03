@@ -175,6 +175,22 @@ void arm_handle_psci_call(ARMCPU *cpu)
         helper_wfi(env, 4);
         break;
     case QEMU_PSCI_1_0_FN_PSCI_FEATURES:
+        /*
+         * A Realm-aware guest discovers the SMCCC version through here before
+         * it will use the conduit for anything else -- Linux's
+         * psci_init_smccc() asks about ARM_SMCCC_VERSION and, told no,
+         * settles on 1.0 and never looks for RSI.  The emulated CCA interface
+         * answers that call (see target/arm/tcg/cca.c); this is what lets the
+         * guest find out it may make it.
+         *
+         * Only for a CCA guest.  Every other guest sees exactly what it did
+         * before, because this PSCI implementation is not an SMCCC 1.1 one and
+         * has no business claiming to be.
+         */
+        if (cpu->cca_guest && param[1] == ARM_SMCCC_VERSION_FID) {
+            ret = 0;
+            break;
+        }
         switch (param[1]) {
         case QEMU_PSCI_0_2_FN_PSCI_VERSION:
         case QEMU_PSCI_0_2_FN_MIGRATE_INFO_TYPE:

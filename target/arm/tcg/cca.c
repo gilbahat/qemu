@@ -52,6 +52,29 @@
  */
 #define RSI_FID_LAST                0xc4000199
 
+/*
+ * The Arm Architecture calls, which are not RSI and are answered here anyway.
+ *
+ * A Realm-aware guest does not discover RSI by calling it.  Linux asks for the
+ * SMCCC version first and gives up unless it is 1.1 or later, because that is
+ * what makes the conduit something it may use: arm64_rsi_init() returns
+ * immediately if arm_smccc_1_1_get_conduit() is not SMC, and that helper
+ * answers NONE for SMCCC 1.0.  QEMU's PSCI emulation implements no
+ * ARM_SMCCC_VERSION at all, so the reply is NOT_SUPPORTED, so Linux settles on
+ * 1.0, so it never asks whether it is in a Realm -- and boots to userspace
+ * with the whole interface sitting there unqueried.
+ *
+ * On hardware there is always an RMM under a Realm and it always provides
+ * this, so answering it is part of emulating the environment rather than an
+ * extra.  It is claimed only when x-cca-guest is on; nothing else sees a
+ * different SMCCC version than it did before.
+ *
+ * Claiming 1.1 obliges an implementation to answer ARM_SMCCC_ARCH_FEATURES,
+ * so that is here too, reporting nothing implemented -- which is true, and is
+ * the answer a caller is required to handle.
+ */
+#define ARM_SMCCC_VERSION_1_1       ((1u << 16) | 1u)
+
 #define RSI_SUCCESS                 0
 #define RSI_ERROR_INPUT             1
 #define RSI_ERROR_STATE             2
@@ -552,6 +575,9 @@ bool arm_is_cca_call(ARMCPU *cpu, int excp_type)
      * falling through to the PSCI handler and being reported as a PSCI error.
      */
     fid = cpu->env.xregs[0];
+    if (fid == ARM_SMCCC_VERSION_FID || fid == ARM_SMCCC_ARCH_FEATURES_FID) {
+        return true;
+    }
     return fid >= RSI_ABI_VERSION && fid <= RSI_FID_LAST;
 }
 
@@ -873,6 +899,20 @@ void arm_handle_cca_call(ARMCPU *cpu)
     cca_dma_arm();
 
     switch (env->xregs[0]) {
+    case ARM_SMCCC_VERSION_FID:
+        ret = ARM_SMCCC_VERSION_1_1;
+        break;
+
+    case ARM_SMCCC_ARCH_FEATURES_FID:
+        /*
+         * The two calls above are the two that exist here.  Everything else
+         * is absent, which SMCCC spells NOT_SUPPORTED rather than an error.
+         */
+        ret = (env->xregs[1] == ARM_SMCCC_VERSION_FID ||
+               env->xregs[1] == ARM_SMCCC_ARCH_FEATURES_FID)
+              ? 0 : SMCCC_RET_NOT_SUPPORTED;
+        break;
+
     case RSI_ABI_VERSION:
         /*
          * The reply is the closed interval of versions implemented, which the

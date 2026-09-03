@@ -726,6 +726,15 @@ bool arm_is_cca_call(ARMCPU *cpu, int excp_type);
 /* Actually handle an RSI call */
 void arm_handle_cca_call(ARMCPU *cpu);
 
+/*
+ * Arm Architecture Service calls.  Not RSI, but answered by the emulated CCA
+ * guest interface, because a Realm always has an RMM underneath it that
+ * provides them and a Realm-aware guest checks for SMCCC 1.1 before it will
+ * look for RSI at all.  See target/arm/tcg/cca.c.
+ */
+#define ARM_SMCCC_VERSION_FID       0x80000000
+#define ARM_SMCCC_ARCH_FEATURES_FID 0x80000001
+
 /* Create the CCA state up front, so it exists before the guest runs */
 void arm_cca_init(void);
 
