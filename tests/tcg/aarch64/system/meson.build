@@ -117,6 +117,14 @@ tests += {
     'cflags': cflags,
     'qemu_args': ['-M', cca_machine, '-cpu', cca_cpu, qemu_base_args],
   },
+  # On its own this is the control -- the checks pass because nothing moved.
+  # The test is the same binary with the VM migrated during its spin; see the
+  # file.
+  'cca-migrate.c': {
+    'cflags': cflags,
+    'qemu_args': ['-M', cca_machine, '-cpu', cca_cpu + ',x-cca-ripas=1',
+                  qemu_base_args],
+  },
 }
 # --- end emulated CCA guest ---
 

@@ -26,6 +26,7 @@
 #include "cpu.h"
 #include "internals.h"
 #include "cca-token.h"
+#include "migration/vmstate.h"
 #include "system/memory.h"
 #include "system/reset.h"
 #include "system/runstate.h"
@@ -42,6 +43,7 @@
 #define RSI_ATTESTATION_TOKEN_CONT  0xc4000195
 #define RSI_REALM_CONFIG            0xc4000196
 #define RSI_IPA_STATE_SET           0xc4000197
+#define RSI_IPA_STATE_GET           0xc4000198
 
 /*
  * The last function ID RSI 1.0 defines (RSI_HOST_CALL).  Nothing between here
@@ -132,6 +134,14 @@ typedef struct CcaTcgState {
     bool token_requested;
     GByteArray *token;
     size_t token_off;
+
+    /* Migration scratch; see vmstate_cca_tcg. */
+    uint32_t ripas_count;
+    uint64_t *ripas_gfn;
+    uint8_t *ripas_st;
+    uint32_t token_len;
+    uint8_t *token_bytes;
+    uint32_t token_taken;
 } CcaTcgState;
 
 typedef struct CcaLaunchRegion {
@@ -141,6 +151,118 @@ typedef struct CcaLaunchRegion {
 } CcaLaunchRegion;
 
 static CcaTcgState *cca_state;
+
+/*
+ * Realm-scoped state has to survive migration.
+ *
+ * The measurements above all: a REM that silently reset across a snapshot
+ * would change the attestation token of a running Realm, which is the one
+ * thing it must never do.  The page states go for the same reason they do in
+ * the TDX emulation -- a Realm that has relinquished a range and is then
+ * migrated would find every granule back at the default, and the alias it has
+ * been using since would start faulting under a strict page-state mode.
+ *
+ * A token part-way through being handed over migrates as bytes rather than
+ * being rebuilt on the far side.  Rebuilding would give the same bytes today,
+ * because the token is a function of the challenge and the measurements, but
+ * that is a property of the current builder rather than something the guest's
+ * collection loop should depend on: it has already been told a length, and the
+ * second half must belong to the same document as the first.
+ *
+ * The hash table is flattened into parallel arrays because a GHashTable has no
+ * VMSTATE representation.
+ */
+static int cca_pre_save(void *opaque)
+{
+    CcaTcgState *s = opaque;
+    GHashTableIter it;
+    gpointer k, v;
+    uint32_t i = 0;
+
+    QEMU_LOCK_GUARD(&s->lock);
+
+    s->ripas_count = s->ripas ? g_hash_table_size(s->ripas) : 0;
+    g_free(s->ripas_gfn);
+    g_free(s->ripas_st);
+    s->ripas_gfn = g_new0(uint64_t, s->ripas_count);
+    s->ripas_st = g_new0(uint8_t, s->ripas_count);
+
+    if (s->ripas) {
+        g_hash_table_iter_init(&it, s->ripas);
+        while (g_hash_table_iter_next(&it, &k, &v)) {
+            s->ripas_gfn[i] = GPOINTER_TO_SIZE(k);
+            s->ripas_st[i] = GPOINTER_TO_SIZE(v);
+            i++;
+        }
+    }
+
+    g_free(s->token_bytes);
+    s->token_bytes = NULL;
+    s->token_len = s->token ? s->token->len : 0;
+    s->token_taken = (uint32_t)s->token_off;
+    if (s->token_len) {
+        s->token_bytes = g_memdup2(s->token->data, s->token_len);
+    }
+    return 0;
+}
+
+static int cca_post_load(void *opaque, int version_id)
+{
+    CcaTcgState *s = opaque;
+
+    QEMU_LOCK_GUARD(&s->lock);
+
+    if (!s->ripas) {
+        s->ripas = g_hash_table_new(NULL, NULL);
+    }
+    g_hash_table_remove_all(s->ripas);
+    for (uint32_t i = 0; i < s->ripas_count; i++) {
+        g_hash_table_insert(s->ripas, GSIZE_TO_POINTER(s->ripas_gfn[i]),
+                            GSIZE_TO_POINTER(s->ripas_st[i]));
+    }
+
+    if (s->token) {
+        g_byte_array_free(s->token, TRUE);
+        s->token = NULL;
+    }
+    if (s->token_len) {
+        s->token = g_byte_array_sized_new(s->token_len);
+        g_byte_array_append(s->token, s->token_bytes, s->token_len);
+    }
+    s->token_off = s->token_taken;
+
+    /*
+     * The page states just changed under every cached translation, so nothing
+     * decided against the old ones may be reused.
+     */
+    tlb_flush_all_cpus_synced(first_cpu);
+    return 0;
+}
+
+static const VMStateDescription vmstate_cca_tcg = {
+    .name = "cca-tcg",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .pre_save = cca_pre_save,
+    .post_load = cca_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT8_ARRAY(rim, CcaTcgState, CCA_HASH_LEN),
+        VMSTATE_UINT8_2DARRAY(rem, CcaTcgState, CCA_REM_COUNT, CCA_HASH_LEN),
+        VMSTATE_BOOL(rim_valid, CcaTcgState),
+        VMSTATE_UINT8_ARRAY(challenge, CcaTcgState, CCA_CHALLENGE_LEN),
+        VMSTATE_BOOL(token_requested, CcaTcgState),
+        VMSTATE_UINT32(token_len, CcaTcgState),
+        VMSTATE_UINT32(token_taken, CcaTcgState),
+        VMSTATE_VBUFFER_ALLOC_UINT32(token_bytes, CcaTcgState, 0, NULL,
+                                     token_len),
+        VMSTATE_UINT32(ripas_count, CcaTcgState),
+        VMSTATE_VARRAY_UINT32_ALLOC(ripas_gfn, CcaTcgState, ripas_count, 0,
+                                    vmstate_info_uint64, uint64_t),
+        VMSTATE_VARRAY_UINT32_ALLOC(ripas_st, CcaTcgState, ripas_count, 0,
+                                    vmstate_info_uint8, uint8_t),
+        VMSTATE_END_OF_LIST()
+    }
+};
 
 static CcaTcgState *cca_get_state(void)
 {
@@ -319,6 +441,7 @@ void arm_cca_init(void)
 
     s->rom_load_notifier.notify = cca_rom_load_notify;
     rom_add_load_notifier(&s->rom_load_notifier);
+    vmstate_register(NULL, 0, &vmstate_cca_tcg, s);
     qemu_add_vm_change_state_handler(cca_measure_launch_image, s);
     qemu_register_reset(cca_reset, s);
 }
@@ -328,18 +451,23 @@ static gpointer cca_ripas_key(uint64_t ipa)
     return GSIZE_TO_POINTER(ipa >> 12);
 }
 
+static uint64_t cca_ripas_get_locked(CcaTcgState *s, uint64_t ipa)
+{
+    gpointer v;
+    bool found = s->ripas &&
+                 g_hash_table_lookup_extended(s->ripas, cca_ripas_key(ipa),
+                                              NULL, &v);
+
+    /* Anything never spoken about is RAM, which is how a Realm starts. */
+    return found ? GPOINTER_TO_SIZE(v) : RSI_RIPAS_RAM;
+}
+
 static uint64_t cca_ripas_get(uint64_t ipa)
 {
     CcaTcgState *s = cca_get_state();
-    gpointer v;
-    bool found;
 
     QEMU_LOCK_GUARD(&s->lock);
-    found = s->ripas &&
-            g_hash_table_lookup_extended(s->ripas, cca_ripas_key(ipa),
-                                         NULL, &v);
-    /* Anything never spoken about is RAM, which is how a Realm starts. */
-    return found ? GPOINTER_TO_SIZE(v) : RSI_RIPAS_RAM;
+    return cca_ripas_get_locked(s, ipa);
 }
 
 static void cca_ripas_set(uint64_t ipa, uint64_t ripas)
@@ -693,6 +821,46 @@ static uint64_t cca_attest_token_continue(ARMCPU *cpu, uint64_t addr,
     return RSI_INCOMPLETE;
 }
 
+/*
+ * RSI_IPA_STATE_GET reports the state of the range starting at @base: the
+ * value, and how far it holds.  A guest uses it to discover what it was given
+ * rather than to remember what it asked for, which is how Linux decides what
+ * to accept at boot -- and it is the one RSI call a Linux Realm makes that
+ * this emulation did not answer.
+ *
+ * The answer is a run, so this scans.  Sparse state means almost every scan
+ * runs to the end of the range and finds RAM, which is the common case and the
+ * cheapest one; the lock is taken once for the whole scan rather than per
+ * granule, because a guest asking about its whole memory map at boot is
+ * exactly what this is for.  Answering the entire range in one call is
+ * permitted -- the reply is capped at @top, not at some quantum of work -- and
+ * a guest is required to loop on it regardless.
+ */
+static uint64_t cca_ipa_state_get(ARMCPU *cpu, uint64_t base, uint64_t top,
+                                  uint64_t *new_top, uint64_t *ripas)
+{
+    CcaTcgState *s = cca_get_state();
+    uint64_t ipa;
+
+    if ((base & (RSI_GRANULE_SIZE - 1)) || (top & (RSI_GRANULE_SIZE - 1)) ||
+        top <= base) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "cca: RSI_IPA_STATE_GET range 0x%" PRIx64 "-0x%" PRIx64
+                      " is not a non-empty granule-aligned range\n", base, top);
+        return RSI_ERROR_INPUT;
+    }
+
+    QEMU_LOCK_GUARD(&s->lock);
+    *ripas = cca_ripas_get_locked(s, base);
+    for (ipa = base + RSI_GRANULE_SIZE; ipa < top; ipa += RSI_GRANULE_SIZE) {
+        if (cca_ripas_get_locked(s, ipa) != *ripas) {
+            break;
+        }
+    }
+    *new_top = ipa;
+    return RSI_SUCCESS;
+}
+
 void arm_handle_cca_call(ARMCPU *cpu)
 {
     CPUARMState *env = &cpu->env;
@@ -741,6 +909,17 @@ void arm_handle_cca_call(ARMCPU *cpu)
         ret = cca_attest_token_continue(cpu, env->xregs[1], env->xregs[2],
                                         env->xregs[3], &written);
         env->xregs[1] = written;
+        break;
+    }
+
+    case RSI_IPA_STATE_GET: {
+        uint64_t top = env->xregs[2];
+        uint64_t ripas = RSI_RIPAS_RAM;
+
+        ret = cca_ipa_state_get(cpu, env->xregs[1], env->xregs[2], &top,
+                                &ripas);
+        env->xregs[1] = top;
+        env->xregs[2] = ripas;
         break;
     }
 
