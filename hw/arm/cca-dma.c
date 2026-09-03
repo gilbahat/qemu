@@ -54,6 +54,20 @@ void cca_dma_arm(void)
     }
 }
 
+/* Is this address backed by guest RAM, as opposed to a device? */
+static bool cca_dma_addr_is_ram(hwaddr ipa)
+{
+    MemoryRegion *mr;
+    hwaddr xlat, len = 1;
+    bool is_ram;
+
+    RCU_READ_LOCK_GUARD();
+    mr = address_space_translate(&address_space_memory, ipa, &xlat, &len,
+                                 false, MEMTXATTRS_UNSPECIFIED);
+    is_ram = memory_region_is_ram(mr);
+    return is_ram;
+}
+
 static IOMMUTLBEntry cca_dma_translate(IOMMUMemoryRegion *iommu_mr, hwaddr addr,
                                        IOMMUAccessFlags flag, int iommu_idx)
 {
@@ -91,6 +105,23 @@ static IOMMUTLBEntry cca_dma_translate(IOMMUMemoryRegion *iommu_mr, hwaddr addr,
         qemu_log_mask(LOG_GUEST_ERROR,
                       "cca: DMA denied, 0x%" HWADDR_PRIx " carries the "
                       "unprotected alias\n", addr);
+        return ret;
+    }
+
+    /*
+     * Only RAM has a page state. A device writing to another device -- which
+     * on this board means an MSI doorbell, a write to the GIC -- is not the
+     * host reaching into Realm memory, and the RIPAS map has nothing to say
+     * about an address that was never the Realm's to hand back.
+     *
+     * Judging it anyway denies every MSI, because MMIO is RAM by default in a
+     * model that only tracks what a guest relinquished. A Linux Realm hits
+     * this on its first interrupt; a polling guest never does, which is why it
+     * took a second guest to find.
+     */
+    if (!cca_dma_addr_is_ram(ipa)) {
+        ret.translated_addr = ipa;
+        ret.perm = IOMMU_RW;
         return ret;
     }
 
