@@ -736,6 +736,9 @@ void arm_cca_init(void);
  */
 bool arm_cca_ipa_permitted(CPUARMState *env, uint64_t ipa, bool shared);
 
+/* Has the Realm handed this granule back, so a device may reach it? */
+bool arm_cca_gpa_is_shared(CPUARMState *env, uint64_t ipa);
+
 /**
  * cca_shared_mask: the IPA bit that selects the unprotected alias
  *

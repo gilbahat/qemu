@@ -37,6 +37,7 @@
 #include "hw/core/sysbus.h"
 #include "hw/arm/boot.h"
 #include "hw/arm/virt.h"
+#include "hw/arm/cca-dma.h"
 #include "hw/arm/machines-qom.h"
 #include "hw/block/flash.h"
 #include "hw/display/ramfb.h"
@@ -3327,6 +3328,14 @@ static void machvirt_init(MachineState *machine)
     }
 
     kvm_arm_rme_init_gpa_space(vms->highest_gpa, vms->bus);
+#ifdef CONFIG_TCG
+    /*
+     * The emulated CCA guest's filter. Both claim the bus IOMMU, but only one
+     * can be in use: the above is driven by -object rme-guest under KVM, this
+     * by the x-cca-guest CPU property under TCG.
+     */
+    cca_dma_setup(vms->bus);
+#endif
 
     vms->bootinfo.ram_size = machine->ram_size;
     vms->bootinfo.board_id = -1;

@@ -19,6 +19,7 @@
 #include "qemu/log.h"
 #include "qemu/lockable.h"
 #include "exec/cputlb.h"
+#include "hw/arm/cca-dma.h"
 #include "cpu.h"
 #include "internals.h"
 #include "system/memory.h"
@@ -167,6 +168,18 @@ bool arm_cca_ipa_permitted(CPUARMState *env, uint64_t ipa, bool shared)
     return true;
 }
 
+bool arm_cca_gpa_is_shared(CPUARMState *env, uint64_t ipa)
+{
+    /*
+     * With no page-state model there is nothing to ask, and a filter that
+     * refused everything would simply stop every device.
+     */
+    if (env_archcpu(env)->cca_ripas == CCA_RIPAS_MODE_OFF) {
+        return true;
+    }
+    return cca_ripas_get(ipa) == RSI_RIPAS_EMPTY;
+}
+
 bool arm_is_cca_call(ARMCPU *cpu, int excp_type)
 {
     uint64_t fid;
@@ -268,6 +281,12 @@ void arm_handle_cca_call(ARMCPU *cpu)
 {
     CPUARMState *env = &cpu->env;
     uint64_t ret;
+
+    /*
+     * The guest has proved it knows where it is, so device DMA is now
+     * something it is responsible for getting right.
+     */
+    cca_dma_arm();
 
     switch (env->xregs[0]) {
     case RSI_ABI_VERSION:

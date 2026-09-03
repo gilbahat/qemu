@@ -91,6 +91,13 @@ cca-ripas: cca-ripas.c $(LINK_SCRIPT) vector_log_el1_boot.o $(MINILIB_OBJS)
 QEMU_CCA_MACHINE=-machine virt,virtualization=on -cpu max,x-cca-guest=on
 run-cca: QEMU_OPTS=$(QEMU_CCA_MACHINE) $(QEMU_BASE_ARGS) -kernel
 run-cca-ripas: QEMU_OPTS=$(QEMU_CCA_MACHINE),x-cca-ripas=1 $(QEMU_BASE_ARGS) -kernel
+# edu's default DMA mask would clamp the alias bit away before the filter saw
+# it, so widen it past the bit x-cca-ipa-bits puts the alias at.
+# highmem-ecam=off keeps ECAM at its low, fixed base so the test can find it
+# without parsing a device tree.
+run-cca-dma: QEMU_OPTS=-machine virt,virtualization=on,highmem-ecam=off \
+	-cpu max,x-cca-guest=on,x-cca-ripas=1 -display none \
+	-device edu,dma_mask=0xffffffffffff $(QEMU_BASE_ARGS) -kernel
 
 # gpc tests need EL3 and RME
 QEMU_EL3_MACHINE=-machine virt,virtualization=on,secure=on,gic-version=3 -cpu max,x-rme=on
