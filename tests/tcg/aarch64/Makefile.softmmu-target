@@ -87,8 +87,10 @@ vector_log_el1_boot.o: $(CRT_PATH)/boot.S
 cca-ripas: cca-ripas.c $(LINK_SCRIPT) vector_log_el1_boot.o $(MINILIB_OBJS)
 	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) $< -o $@ $(LDFLAGS) vector_log_el1_boot.o
 
-# the CCA guest interface is serviced in software; a Realm guest runs at EL1
-QEMU_CCA_MACHINE=-machine virt,virtualization=on -cpu max,x-cca-guest=on
+# The CCA guest interface is serviced in software.  No virtualization=on: a
+# Realm runs at EL1, and the machine now picks the SMC conduit an emulated CCA
+# guest needs on its own, which is the arrangement worth testing.
+QEMU_CCA_MACHINE=-machine virt -cpu max,x-cca-guest=on
 run-cca: QEMU_OPTS=$(QEMU_CCA_MACHINE) $(QEMU_BASE_ARGS) -kernel
 run-cca-ripas: QEMU_OPTS=$(QEMU_CCA_MACHINE),x-cca-ripas=1 $(QEMU_BASE_ARGS) -kernel
 run-cca-attest: QEMU_OPTS=$(QEMU_CCA_MACHINE) $(QEMU_BASE_ARGS) -kernel
@@ -96,7 +98,7 @@ run-cca-attest: QEMU_OPTS=$(QEMU_CCA_MACHINE) $(QEMU_BASE_ARGS) -kernel
 # it, so widen it past the bit x-cca-ipa-bits puts the alias at.
 # highmem-ecam=off keeps ECAM at its low, fixed base so the test can find it
 # without parsing a device tree.
-run-cca-dma: QEMU_OPTS=-machine virt,virtualization=on,highmem-ecam=off \
+run-cca-dma: QEMU_OPTS=-machine virt,highmem-ecam=off \
 	-cpu max,x-cca-guest=on,x-cca-ripas=1 -display none \
 	-device edu,dma_mask=0xffffffffffff $(QEMU_BASE_ARGS) -kernel
 

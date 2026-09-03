@@ -308,6 +308,27 @@ static void create_randomness(MachineState *ms, const char *node)
  * An explicit dtb-randomness=on is still honoured.  Someone who asks for both
  * gets what they asked for, and an unstable measurement with it.
  */
+/*
+ * A Realm reaches the RMM with SMC, so an emulated CCA guest has to as well --
+ * both for RSI and for the PSCI calls that share the function ID range.  The
+ * conduit is chosen above for a confidential guest for exactly this reason
+ * ("Realm guests must also use SMC"), but that test is a machine property and
+ * this one is a CPU property, so it cannot be answered until the CPUs exist.
+ *
+ * Only HVC is upgraded.  A machine booting real firmware has the conduit
+ * disabled deliberately, and that is not this function's business.
+ *
+ * This runs before arm_load_kernel(), which is what puts the conduit on the
+ * CPUs and writes the matching method into the DTB's PSCI node.
+ */
+static void virt_cca_guest_psci_conduit(VirtMachineState *vms)
+{
+    if (vms->psci_conduit == QEMU_PSCI_CONDUIT_HVC &&
+        arm_cca_find_guest_cpu()) {
+        vms->psci_conduit = QEMU_PSCI_CONDUIT_SMC;
+    }
+}
+
 static void virt_add_dtb_randomness(VirtMachineState *vms)
 {
     MachineState *ms = MACHINE(vms);
@@ -3250,6 +3271,7 @@ static void machvirt_init(MachineState *machine)
     }
 
     virt_add_dtb_randomness(vms);
+    virt_cca_guest_psci_conduit(vms);
 
     /* Now we've created the CPUs we can see if they have the hypvirt timer */
     vms->ns_el2_virt_timer_irq = ns_el2_virt_timer_present() &&
