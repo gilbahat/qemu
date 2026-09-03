@@ -72,6 +72,13 @@ tests += {
                   '-semihosting-config', 'enable=on,arg=2',
                   qemu_base_args]
   },
+  # the CCA guest interface is serviced in software; a Realm guest runs at EL1
+  'cca.c': {
+    'cflags': cflags,
+    'qemu_args': ['-M', 'virt,virtualization=on',
+                  '-cpu', 'max,x-cca-guest=on',
+                  qemu_base_args]
+  },
   'wfxt.c': {
     'cflags': cflags,
     'qemu_args': ['-M', 'virt,virtualization=on,gic-version=2',
