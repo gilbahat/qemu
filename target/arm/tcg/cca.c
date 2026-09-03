@@ -17,6 +17,8 @@
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "qemu/lockable.h"
+#include "exec/cputlb.h"
 #include "cpu.h"
 #include "internals.h"
 #include "system/memory.h"
@@ -54,6 +56,116 @@
 #define RSI_ACCEPT                  0
 
 #define RSI_GRANULE_SIZE            4096
+
+/* x-cca-ripas: how much of the page-state model is enforced. */
+#define CCA_RIPAS_MODE_OFF          0
+#define CCA_RIPAS_MODE_LAZY         1
+#define CCA_RIPAS_MODE_STRICT       2
+
+/*
+ * Realm IPA state, as much of it as a guest can observe.
+ *
+ * A Realm's protected memory is RAM until the guest hands a range back with
+ * RSI_IPA_STATE_SET(EMPTY), which is how it makes room to use the unprotected
+ * alias of those pages instead.  Only granules whose state differs from the
+ * default are stored, so there is nothing to size against guest RAM and
+ * nothing to grow when memory is hotplugged.
+ */
+typedef struct CcaTcgState {
+    QemuMutex lock;
+    GHashTable *ripas;
+} CcaTcgState;
+
+static CcaTcgState *cca_state;
+
+static CcaTcgState *cca_get_state(void)
+{
+    if (!cca_state) {
+        cca_state = g_new0(CcaTcgState, 1);
+        qemu_mutex_init(&cca_state->lock);
+    }
+    return cca_state;
+}
+
+void arm_cca_init(void)
+{
+    cca_get_state();
+}
+
+static gpointer cca_ripas_key(uint64_t ipa)
+{
+    return GSIZE_TO_POINTER(ipa >> 12);
+}
+
+static uint64_t cca_ripas_get(uint64_t ipa)
+{
+    CcaTcgState *s = cca_get_state();
+    gpointer v;
+    bool found;
+
+    QEMU_LOCK_GUARD(&s->lock);
+    found = s->ripas &&
+            g_hash_table_lookup_extended(s->ripas, cca_ripas_key(ipa),
+                                         NULL, &v);
+    /* Anything never spoken about is RAM, which is how a Realm starts. */
+    return found ? GPOINTER_TO_SIZE(v) : RSI_RIPAS_RAM;
+}
+
+static void cca_ripas_set(uint64_t ipa, uint64_t ripas)
+{
+    CcaTcgState *s = cca_get_state();
+
+    QEMU_LOCK_GUARD(&s->lock);
+    if (!s->ripas) {
+        s->ripas = g_hash_table_new(NULL, NULL);
+    }
+    g_hash_table_insert(s->ripas, cca_ripas_key(ipa),
+                        GSIZE_TO_POINTER(ripas));
+}
+
+/*
+ * Is this access allowed, given which half of the address space it came
+ * through?  @ipa has already had the alias bit folded away.
+ *
+ * Two things can be wrong, and they are opposite mistakes:
+ *
+ *  - reaching a granule through the *protected* view after handing it back.
+ *    A real RMM has taken that mapping away; here it would silently keep
+ *    working, and a guest that leaves a pointer behind would never find out.
+ *
+ *  - reaching a granule through the *unprotected alias* without handing it
+ *    back first.  On hardware nothing is mapped there until the host maps it,
+ *    so the access goes nowhere.  Only strict mode says so, because a guest
+ *    may legitimately touch the alias of a device window it never owned.
+ */
+bool arm_cca_ipa_permitted(CPUARMState *env, uint64_t ipa, bool shared)
+{
+    ARMCPU *cpu = env_archcpu(env);
+    uint64_t ripas;
+
+    if (!cpu->cca_guest || cpu->cca_ripas == CCA_RIPAS_MODE_OFF) {
+        return true;
+    }
+
+    ripas = cca_ripas_get(ipa);
+
+    if (!shared && ripas == RSI_RIPAS_EMPTY) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "cca: protected access to 0x%" PRIx64 ", which the "
+                      "Realm handed back with RSI_IPA_STATE_SET\n", ipa);
+        return false;
+    }
+
+    if (shared && ripas != RSI_RIPAS_EMPTY &&
+        cpu->cca_ripas == CCA_RIPAS_MODE_STRICT) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "cca: access through the unprotected alias of 0x%"
+                      PRIx64 ", which the Realm has not handed back\n", ipa);
+        return false;
+    }
+
+    return true;
+}
 
 bool arm_is_cca_call(ARMCPU *cpu, int excp_type)
 {
@@ -131,6 +243,20 @@ static uint64_t cca_ipa_state_set(ARMCPU *cpu, uint64_t base, uint64_t top,
                       "cca: RSI_IPA_STATE_SET asks for RIPAS %" PRIu64
                       ", which is not a defined value\n", ripas);
         return RSI_ERROR_INPUT;
+    }
+
+    for (uint64_t ipa = base; ipa < top; ipa += RSI_GRANULE_SIZE) {
+        cca_ripas_set(ipa, ripas);
+    }
+
+    /*
+     * Handing a range back takes access away, so anything already cached for
+     * it has to go.  A transition the other way only adds access and cannot
+     * leave a stale entry behind, which is worth keeping in mind before making
+     * this unconditional: a guest claiming memory does it a granule at a time.
+     */
+    if (ripas != RSI_RIPAS_RAM) {
+        tlb_flush(CPU(cpu));
     }
 
     *new_base = top;

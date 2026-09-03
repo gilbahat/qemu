@@ -726,6 +726,16 @@ bool arm_is_cca_call(ARMCPU *cpu, int excp_type);
 /* Actually handle an RSI call */
 void arm_handle_cca_call(ARMCPU *cpu);
 
+/* Create the CCA state up front, so it exists before the guest runs */
+void arm_cca_init(void);
+
+/**
+ * arm_cca_ipa_permitted: may this access reach @ipa through this half?
+ * @ipa: output address, with the alias bit already folded away
+ * @shared: true if the access arrived through the unprotected alias
+ */
+bool arm_cca_ipa_permitted(CPUARMState *env, uint64_t ipa, bool shared);
+
 /**
  * cca_shared_mask: the IPA bit that selects the unprotected alias
  *

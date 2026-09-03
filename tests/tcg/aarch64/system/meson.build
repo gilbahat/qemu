@@ -72,13 +72,6 @@ tests += {
                   '-semihosting-config', 'enable=on,arg=2',
                   qemu_base_args]
   },
-  # the CCA guest interface is serviced in software; a Realm guest runs at EL1
-  'cca.c': {
-    'cflags': cflags,
-    'qemu_args': ['-M', 'virt,virtualization=on',
-                  '-cpu', 'max,x-cca-guest=on',
-                  qemu_base_args]
-  },
   'wfxt.c': {
     'cflags': cflags,
     'qemu_args': ['-M', 'virt,virtualization=on,gic-version=2',
@@ -87,6 +80,28 @@ tests += {
                   qemu_base_args]
   },
 }
+
+# --- emulated CCA guest ---
+# the CCA guest interface is serviced in software; a Realm guest runs at EL1
+cca_machine = 'virt,virtualization=on'
+cca_cpu = 'max,x-cca-guest=on'
+# Tests that provoke the faults they are testing need a vector table that
+# records and returns rather than the default one that stops.  boot.S is built
+# as part of each test, so the define reaches it.
+cca_log_cflags = [cflags, '-DLOGGING_VECTOR_TABLE_EL1']
+
+tests += {
+  'cca.c': {
+    'cflags': cflags,
+    'qemu_args': ['-M', cca_machine, '-cpu', cca_cpu, qemu_base_args],
+  },
+  'cca-ripas.c': {
+    'cflags': cca_log_cflags,
+    'qemu_args': ['-M', cca_machine, '-cpu', cca_cpu + ',x-cca-ripas=1',
+                  qemu_base_args],
+  },
+}
+# --- end emulated CCA guest ---
 
 tests += {
   'pauth-3.c': {
