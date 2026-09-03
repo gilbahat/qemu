@@ -125,6 +125,12 @@ tests += {
     'qemu_args': ['-M', cca_machine, '-cpu', cca_cpu + ',x-cca-ripas=1',
                   qemu_base_args],
   },
+  # cca-stage1 provokes a fault too, and keeps the harness's MMU on to do it.
+  'cca-stage1.c': {
+    'cflags': cca_log_cflags,
+    'qemu_args': ['-M', cca_machine, '-cpu', cca_cpu + ',x-cca-ripas=1',
+                  qemu_base_args],
+  },
 }
 # --- end emulated CCA guest ---
 
