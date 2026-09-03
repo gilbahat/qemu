@@ -581,6 +581,11 @@ void kvm_arm_add_vcpu_properties(ARMCPU *cpu)
                                     "Valid values are 0.1, 0.2, 1.0, 1.1, 1.2, 1.3");
 }
 
+int kvm_arm_vm_type(MachineState *ms)
+{
+    return ms->cgs ? KVM_VM_TYPE_ARM_REALM : KVM_VM_TYPE_ARM_NORMAL;
+}
+
 int kvm_arm_get_max_vm_ipa_size(MachineState *ms, bool *fixed_ipa)
 {
     KVMState *s = KVM_STATE(ms->accelerator);

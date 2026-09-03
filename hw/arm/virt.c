@@ -97,7 +97,6 @@
 #include "qemu/guest-random.h"
 #include "hw/watchdog/sbsa_gwdt.h"
 
-#include <linux/kvm.h>
 
 static GlobalProperty arm_virt_compat_defaults[] = {
     { TYPE_VIRTIO_IOMMU_PCI, "aw-bits", "48" },
@@ -4134,7 +4133,7 @@ static int virt_kvm_type(MachineState *ms, const char *type_str)
     bool fixed_ipa;
     int vm_type;
 
-    vm_type = (ms->cgs ? KVM_VM_TYPE_ARM_REALM : KVM_VM_TYPE_ARM_NORMAL);
+    vm_type = kvm_arm_vm_type(ms);
 
     if (vm_type) {
         /*
