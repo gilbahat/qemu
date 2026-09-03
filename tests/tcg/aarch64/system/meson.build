@@ -82,8 +82,10 @@ tests += {
 }
 
 # --- emulated CCA guest ---
-# the CCA guest interface is serviced in software; a Realm guest runs at EL1
-cca_machine = 'virt,virtualization=on'
+# The CCA guest interface is serviced in software.  No virtualization=on: a
+# Realm runs at EL1, and the machine now picks the SMC conduit an emulated CCA
+# guest needs on its own, which is the arrangement worth testing.
+cca_machine = 'virt'
 cca_cpu = 'max,x-cca-guest=on'
 # Tests that provoke the faults they are testing need a vector table that
 # records and returns rather than the default one that stops.  boot.S is built
@@ -106,7 +108,7 @@ tests += {
   # it without parsing a device tree.
   'cca-dma.c': {
     'cflags': cflags,
-    'qemu_args': ['-M', 'virt,virtualization=on,highmem-ecam=off',
+    'qemu_args': ['-M', 'virt,highmem-ecam=off',
                   '-cpu', cca_cpu + ',x-cca-ripas=1',
                   '-device', 'edu,dma_mask=0xffffffffffff',
                   qemu_base_args],
