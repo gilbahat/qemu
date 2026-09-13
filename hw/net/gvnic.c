@@ -65,6 +65,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(GvnicState, GVNIC)
 #define GVNIC_DEVICE_STATUS_RESET   (1u << 1)
 #define GVNIC_DEVICE_STATUS_LINK_UP (1u << 2)
 
+#define GVNIC_MSIX_VECTORS      8
+
 /* BAR2, the doorbells: an array of big-endian words, one per queue index. */
 #define GVNIC_BAR2_SIZE         0x1000
 #define GVNIC_MAX_QUEUES        16
@@ -263,9 +265,16 @@ static uint32_t gvnic_describe_device(GvnicState *s, const uint8_t *cmd)
     return GVNIC_ADMINQ_PASSED;
 }
 
+/*
+ * Offsets below are into the whole 64-byte command, so every field of a
+ * command's own structure sits 8 bytes further along than its declaration
+ * suggests: opcode and status come first. Getting that wrong is silent --
+ * queue_format lives at 40, and reading 36 finds ntfy_blk_msix_base_idx,
+ * which is a perfectly plausible zero.
+ */
 static uint32_t gvnic_configure_resources(GvnicState *s, const uint8_t *cmd)
 {
-    uint8_t format = cmd[36];
+    uint8_t format = cmd[40];
 
     if (format != GVNIC_GQI_QPL_FORMAT) {
         qemu_log_mask(LOG_GUEST_ERROR,
@@ -881,12 +890,18 @@ static void gvnic_realize(PCIDevice *pci_dev, Error **errp)
      * MSI-X, on its own BAR. Solo5 will never enable it -- every driver in
      * that tree polls -- but the Linux and FreeBSD drivers require it, and
      * they are the oracle this model is judged against.
+     *
+     * They want one vector for management plus one per queue pair, and refuse
+     * to probe with fewer: "gve needs at least 3 MSI-x vectors, but only has
+     * 2" is what two got. Eight leaves room for the driver to ask for more
+     * queues than this model creates.
      */
-    if (msix_init_exclusive_bar(pci_dev, 2, 4, &local_err) < 0) {
+    if (msix_init_exclusive_bar(pci_dev, GVNIC_MSIX_VECTORS, 4,
+                                &local_err) < 0) {
         error_propagate(errp, local_err);
         return;
     }
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < GVNIC_MSIX_VECTORS; i++) {
         msix_vector_use(pci_dev, i);
     }
 
