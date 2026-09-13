@@ -70,6 +70,20 @@ OBJECT_DECLARE_SIMPLE_TYPE(GvnicState, GVNIC)
 /* BAR2, the doorbells: an array of big-endian words, one per queue index. */
 #define GVNIC_BAR2_SIZE         0x1000
 #define GVNIC_MAX_QUEUES        16
+/*
+ * BAR2 is one flat array of 4-byte doorbells, and queue doorbells are not the
+ * only things in it: every notification block owns one too, used to
+ * acknowledge and mask its interrupt. Both sets are assigned by the device --
+ * the guest reads back where they landed -- so they must not overlap, and the
+ * device is the only party in a position to keep them apart.
+ */
+#define GVNIC_DB_SLOTS          (GVNIC_BAR2_SIZE / 4)
+#define GVNIC_MAX_NTFY          32
+
+/* Values the guest writes to a notification block's doorbell. */
+#define GVNIC_IRQ_ACK           (1u << 31)
+#define GVNIC_IRQ_MASK          (1u << 30)
+#define GVNIC_IRQ_EVENT         (1u << 29)
 
 /* Admin queue. */
 #define GVNIC_ADMINQ_CMD_SIZE   64
@@ -129,6 +143,7 @@ typedef struct GvnicQueue {
     uint32_t ring_size;
     uint32_t db_index;
     uint32_t counter_index;
+    uint32_t ntfy_id;           /* notification block, hence MSI-X vector */
     uint32_t head;              /* device's position in the ring */
     uint8_t seqno;              /* rx: the 1..7 sequence the driver expects */
 } GvnicQueue;
@@ -154,13 +169,16 @@ struct GvnicState {
     uint8_t driver_version;
 
     /* Doorbells, as written to BAR2. */
-    uint32_t doorbell[GVNIC_MAX_QUEUES];
+    uint32_t doorbell[GVNIC_DB_SLOTS];
 
     /* Configured by CONFIGURE_DEVICE_RESOURCES. */
     bool resources_configured;
     uint64_t counter_array;
     uint32_t num_counters;
     uint8_t queue_format;
+    uint32_t num_ntfy;          /* notification blocks, each owning a doorbell */
+    uint32_t ntfy_msix_base;    /* MSI-X vector of notification block 0 */
+    bool ntfy_masked[GVNIC_MAX_NTFY];
 
     GvnicQpl qpl[GVNIC_MAX_QPLS];
     GvnicQueue tx;
@@ -170,7 +188,25 @@ struct GvnicState {
     uint16_t mtu;
     uint16_t tx_queue_entries;
     uint16_t rx_queue_entries;
+    uint16_t tx_pages_per_qpl;
 };
+
+/*
+ * Temporary tracing, hard-capped.
+ *
+ * The doorbell is rung continuously by a busy guest, so an unbounded trace on
+ * it does not produce a log, it produces a full filesystem. This one stops
+ * after GVNIC_TRACE_MAX lines, which is enough to see how a datapath starts
+ * and cannot cost anything if it never stops.
+ */
+#define GVNIC_TRACE_MAX 200
+static int gvnic_trace_left = GVNIC_TRACE_MAX;
+#define GVNIC_TRACE(fmt, ...) do { \
+    if (gvnic_trace_left > 0) { \
+        gvnic_trace_left--; \
+        qemu_log_mask(LOG_UNIMP, "gvnic: " fmt "\n", ## __VA_ARGS__); \
+    } \
+} while (0)
 
 static void gvnic_reset_state(GvnicState *s);
 static void gvnic_tx_run(GvnicState *s);
@@ -250,6 +286,15 @@ static uint32_t gvnic_describe_device(GvnicState *s, const uint8_t *cmd)
     stw_be_p(d + 14, 1);                    /* default_num_queues */
     stw_be_p(d + 16, s->mtu);
     stw_be_p(d + 18, 1);                    /* counters */
+    /*
+     * tx_pages_per_qpl, and worth a note because the two references disagree
+     * about this field: FreeBSD's struct calls offset 20 "reserved2" and
+     * Linux calls it tx_pages_per_qpl and sizes its transmit FIFO from it.
+     * Leaving it zero is not benign -- Linux then vmaps a zero-page FIFO,
+     * which fails, and reports "Failed to vmap fifo" with -ENOMEM, an error
+     * that says nothing about where the zero came from.
+     */
+    stw_be_p(d + 20, s->tx_pages_per_qpl);
     stw_be_p(d + 22, s->rx_queue_entries);  /* rx_pages_per_qpl */
     memcpy(d + 24, s->conf.macaddr.a, 6);
     stw_be_p(d + 30, 1);                    /* num_device_options */
@@ -284,10 +329,41 @@ static uint32_t gvnic_configure_resources(GvnicState *s, const uint8_t *cmd)
         return GVNIC_ADMINQ_ERR_INVALID_ARGUMENT;
     }
 
+    uint64_t irq_db_addr = ldq_be_p(cmd + 16);
+    uint32_t num_irq_dbs = ldl_be_p(cmd + 28);
+    uint32_t irq_db_stride = ldl_be_p(cmd + 32);
+
+    if (num_irq_dbs > GVNIC_MAX_NTFY ||
+        num_irq_dbs + GVNIC_MAX_QUEUES > GVNIC_DB_SLOTS) {
+        return GVNIC_ADMINQ_ERR_INVALID_ARGUMENT;
+    }
+
     s->counter_array = ldq_be_p(cmd + 8);
     s->num_counters = ldl_be_p(cmd + 24);
+    s->num_ntfy = num_irq_dbs;
+    s->ntfy_msix_base = ldl_be_p(cmd + 36);
+    memset(s->ntfy_masked, 0, sizeof(s->ntfy_masked));
+
+    /*
+     * Notification block i acknowledges through doorbell slot i, and the
+     * queues are pushed up above them by gvnic_queue_db_index(). The guest
+     * allocated this array and left it zeroed; a device that leaves it that
+     * way sends every interrupt acknowledgement into queue 0's doorbell,
+     * where it is read as a wild descriptor count -- GVE_IRQ_ACK|GVE_IRQ_EVENT
+     * decodes as a request to transmit 0xa0000000 descriptors.
+     */
+    for (uint32_t i = 0; i < num_irq_dbs; i++) {
+        uint32_t be = cpu_to_be32(i);
+
+        pci_dma_write(PCI_DEVICE(s), irq_db_addr + (uint64_t)i * irq_db_stride,
+                      &be, 4);
+    }
+
     s->queue_format = format;
     s->resources_configured = true;
+    GVNIC_TRACE("configure: counters@0x%" PRIx64 " n=%u ntfy=%u stride=%u "
+                "msix_base=%u format=%u", s->counter_array, s->num_counters,
+                num_irq_dbs, irq_db_stride, s->ntfy_msix_base, format);
     return GVNIC_ADMINQ_PASSED;
 }
 
@@ -299,7 +375,19 @@ static uint32_t gvnic_register_page_list(GvnicState *s, const uint8_t *cmd)
     uint64_t page_size = ldq_be_p(cmd + 24);
     GvnicQpl *qpl = NULL;
 
-    if (num_pages == 0 || num_pages > GVNIC_MAX_QPL_PAGES || page_size == 0) {
+    /*
+     * page_size is younger than the structure that carries it. Linux 6.1
+     * memsets the command and fills only the id, the count and the list
+     * address, so a device that insists on a non-zero page size refuses a
+     * perfectly good registration from any driver of that vintage -- and
+     * says only "failed to register queue page list 0" while doing it.
+     * Zero means the host page size, which is the only value anything has
+     * ever used here.
+     */
+    if (page_size == 0) {
+        page_size = 4096;
+    }
+    if (num_pages == 0 || num_pages > GVNIC_MAX_QPL_PAGES) {
         return GVNIC_ADMINQ_ERR_INVALID_ARGUMENT;
     }
     if (gvnic_qpl_find(s, id) != NULL) {
@@ -344,6 +432,11 @@ static uint32_t gvnic_unregister_page_list(GvnicState *s, const uint8_t *cmd)
  * doorbell slot and which counter belong to this queue. Both drivers read
  * those back rather than assuming, so they have to be written.
  */
+static uint32_t gvnic_queue_db_index(GvnicState *s, uint32_t which)
+{
+    return s->num_ntfy + which;
+}
+
 static void gvnic_publish_queue_resources(GvnicState *s, GvnicQueue *q)
 {
     uint8_t res[64];
@@ -365,6 +458,7 @@ static uint32_t gvnic_create_tx_queue(GvnicState *s, const uint8_t *cmd)
     q->resources_addr = ldq_be_p(cmd + 16);
     q->desc_ring_addr = ldq_be_p(cmd + 24);
     q->qpl_id = ldl_be_p(cmd + 32);
+    /* ntfy_id sits at 36 for tx and at 20 for rx; the structures differ. */
     q->ring_size = lduw_be_p(cmd + 48);
     if (q->ring_size == 0) {
         q->ring_size = s->tx_queue_entries;
@@ -372,7 +466,8 @@ static uint32_t gvnic_create_tx_queue(GvnicState *s, const uint8_t *cmd)
     if (gvnic_qpl_find(s, q->qpl_id) == NULL) {
         return GVNIC_ADMINQ_ERR_INVALID_ARGUMENT;
     }
-    q->db_index = 0;
+    q->ntfy_id = ldl_be_p(cmd + 36);
+    q->db_index = gvnic_queue_db_index(s, 0);
     q->counter_index = 0;
     q->head = 0;
     q->active = true;
@@ -399,7 +494,8 @@ static uint32_t gvnic_create_rx_queue(GvnicState *s, const uint8_t *cmd)
     if (gvnic_qpl_find(s, q->qpl_id) == NULL) {
         return GVNIC_ADMINQ_ERR_INVALID_ARGUMENT;
     }
-    q->db_index = 1;
+    q->ntfy_id = ldl_be_p(cmd + 20);
+    q->db_index = gvnic_queue_db_index(s, 1);
     q->counter_index = 0;
     q->head = 0;
     /* The sequence number the driver expects first is 1, not 0. */
@@ -591,7 +687,7 @@ static uint64_t gvnic_bar2_read(void *opaque, hwaddr addr, unsigned size)
     GvnicState *s = opaque;
     unsigned idx = addr / 4;
 
-    if (idx >= GVNIC_MAX_QUEUES) {
+    if (idx >= GVNIC_DB_SLOTS) {
         return 0;
     }
     return bswap32(s->doorbell[idx]);
@@ -603,10 +699,24 @@ static void gvnic_bar2_write(void *opaque, hwaddr addr, uint64_t val,
     GvnicState *s = opaque;
     unsigned idx = addr / 4;
 
-    if (idx >= GVNIC_MAX_QUEUES) {
+    if (idx >= GVNIC_DB_SLOTS) {
         return;
     }
     s->doorbell[idx] = bswap32((uint32_t)val);
+
+    if (idx < s->num_ntfy) {
+        /*
+         * A notification block's doorbell, not a queue's: a set of flags
+         * acknowledging the interrupt and saying whether the guest wants the
+         * next one. Nothing here is a descriptor count.
+         */
+        s->ntfy_masked[idx] = (s->doorbell[idx] & GVNIC_IRQ_MASK) != 0;
+        GVNIC_TRACE("irq db[%u] = 0x%x (%s)", idx, s->doorbell[idx],
+                    s->ntfy_masked[idx] ? "masked" : "unmasked");
+        return;
+    }
+    GVNIC_TRACE("doorbell addr=0x%" HWADDR_PRIx " size=%u raw=0x%" PRIx64
+                " -> [%u]=%u", addr, size, val, idx, s->doorbell[idx]);
 
     if (s->tx.active && idx == s->tx.db_index) {
         gvnic_tx_run(s);
@@ -623,6 +733,23 @@ static const MemoryRegionOps gvnic_bar2_ops = {
     .endianness = DEVICE_LITTLE_ENDIAN,
     .impl = { .min_access_size = 4, .max_access_size = 4 },
 };
+
+/*
+ * Vector 0 is the management interrupt; the queues' vectors start at the base
+ * the driver chose in CONFIGURE_DEVICE_RESOURCES, indexed by the notification
+ * block the queue was created against.
+ */
+static void gvnic_raise_irq(GvnicState *s, GvnicQueue *q)
+{
+    uint32_t vector = s->ntfy_msix_base + q->ntfy_id;
+
+    if (q->ntfy_id < GVNIC_MAX_NTFY && s->ntfy_masked[q->ntfy_id]) {
+        return;
+    }
+    if (msix_enabled(PCI_DEVICE(s)) && vector < GVNIC_MSIX_VECTORS) {
+        msix_notify(PCI_DEVICE(s), vector);
+    }
+}
 
 /*
  * Transmit.
@@ -652,8 +779,11 @@ static void gvnic_tx_bump_counter(GvnicState *s, uint32_t done)
         return;
     }
     be = cpu_to_be32(done);
+    GVNIC_TRACE("tx counter[%u] <- %u at 0x%" PRIx64, s->tx.counter_index,
+                done, s->counter_array + s->tx.counter_index * 4);
     pci_dma_write(PCI_DEVICE(s), s->counter_array + s->tx.counter_index * 4,
                   &be, 4);
+    gvnic_raise_irq(s, &s->tx);
 }
 
 static void gvnic_tx_run(GvnicState *s)
@@ -667,10 +797,22 @@ static void gvnic_tx_run(GvnicState *s)
     }
     qpl = gvnic_qpl_find(s, q->qpl_id);
     if (qpl == NULL) {
+        GVNIC_TRACE("tx has no qpl %u", q->qpl_id);
         return;
     }
+    if (q->head != target) {
+        GVNIC_TRACE("tx_run head=%u target=%u ring=%u", q->head, target,
+                    q->ring_size);
+    }
 
-    while (q->head != target) {
+    /*
+     * At most one ring's worth per doorbell. The guest supplies `target` and
+     * a wild value -- whether from a driver bug or deliberately -- would
+     * otherwise spin this loop billions of times inside a device write, which
+     * is a hang QEMU cannot be talked out of.
+     */
+    for (uint32_t budget = q->ring_size; budget > 0 && q->head != target;
+         budget--) {
         uint8_t frame[GVNIC_MAX_FRAME];
         uint8_t desc[GVNIC_TX_DESC_SIZE];
         uint32_t slot = q->head % q->ring_size;
@@ -730,6 +872,8 @@ static void gvnic_tx_run(GvnicState *s)
             q->head++;
         }
 
+        GVNIC_TRACE("tx desc type=0x%02x cnt=%u total=%u got=%u",
+                    type, cnt, total, got);
         if (got > 0) {
             qemu_send_packet(qemu_get_queue(s->nic), frame, got);
         }
@@ -751,13 +895,31 @@ static void gvnic_tx_run(GvnicState *s)
 #define GVNIC_RX_DESC_SIZE      64
 #define GVNIC_RX_DATA_SLOT_SIZE 8
 #define GVNIC_RX_PAD            2
-#define GVNIC_RXF_NO_CSUM       0x0008  /* flags live above the sequence */
+/*
+ * struct gve_rx_desc is 64 bytes and its last four are the two that matter:
+ * 48 bytes of padding, rss_hash, mss, reserved, hdr_len, hdr_off, csum, then
+ * len at 60 and flags_seq at 62. Writing them two bytes early lands len in
+ * csum and flags_seq in len, so the driver reads its sequence number out of
+ * the two bytes nobody wrote, finds zero, and concludes the device has not
+ * produced a packet -- forever, and silently.
+ */
+#define GVNIC_RXD_LEN_OFF       60
+#define GVNIC_RXD_FLAGS_SEQ_OFF 62
 
 static bool gvnic_can_receive(NetClientState *nc)
 {
     GvnicState *s = qemu_get_nic_opaque(nc);
 
-    return s->rx.active && (s->device_status & GVNIC_DEVICE_STATUS_LINK_UP);
+    if (!s->rx.active || !(s->device_status & GVNIC_DEVICE_STATUS_LINK_UP)) {
+        return false;
+    }
+    /*
+     * The RX doorbell is a cumulative count of buffers the guest has posted.
+     * Writing past it would overwrite descriptors it has not read and reuse
+     * buffers it still owns, so refuse the packet instead and let QEMU
+     * re-offer it once the guest rings again.
+     */
+    return s->doorbell[s->rx.db_index] - s->rx.head > 0;
 }
 
 static ssize_t gvnic_receive(NetClientState *nc, const uint8_t *buf,
@@ -810,9 +972,18 @@ static ssize_t gvnic_receive(NetClientState *nc, const uint8_t *buf,
     }
 
     memset(desc, 0, sizeof(desc));
-    stw_be_p(desc + 58, (uint16_t)size);        /* len */
-    flags_seq = (uint16_t)(q->seqno & 0x7) | GVNIC_RXF_NO_CSUM;
-    stw_be_p(desc + 60, flags_seq);
+    /* len covers the padding: the driver subtracts GVE_RX_PAD from it. */
+    stw_be_p(desc + GVNIC_RXD_LEN_OFF, (uint16_t)(size + GVNIC_RX_PAD));
+    /*
+     * Sequence number only. The remaining flags are offload hints -- IPV4,
+     * TCP, UDP and the csum field -- and a device that claims none leaves
+     * both drivers to checksum in software, which is correct and slow rather
+     * than fast and wrong.
+     */
+    flags_seq = (uint16_t)(q->seqno & 0x7);
+    stw_be_p(desc + GVNIC_RXD_FLAGS_SEQ_OFF, flags_seq);
+    GVNIC_TRACE("rx slot=%u qpl_off=0x%" PRIx64 " len=%zu seq=%u",
+                slot, slot_off, size, q->seqno & 0x7);
 
     pci_dma_write(PCI_DEVICE(s),
                   q->desc_ring_addr + (uint64_t)slot * GVNIC_RX_DESC_SIZE,
@@ -824,9 +995,7 @@ static ssize_t gvnic_receive(NetClientState *nc, const uint8_t *buf,
         q->seqno = 1;   /* the sequence is 1..7; zero means "not written" */
     }
 
-    if (msix_enabled(PCI_DEVICE(s))) {
-        msix_notify(PCI_DEVICE(s), 0);
-    }
+    gvnic_raise_irq(s, &s->rx);
     return size;
 }
 
@@ -944,6 +1113,7 @@ static const Property gvnic_properties[] = {
     DEFINE_PROP_UINT16("mtu", GvnicState, mtu, 1460),
     DEFINE_PROP_UINT16("tx-queue-entries", GvnicState, tx_queue_entries, 256),
     DEFINE_PROP_UINT16("rx-queue-entries", GvnicState, rx_queue_entries, 256),
+    DEFINE_PROP_UINT16("tx-pages-per-qpl", GvnicState, tx_pages_per_qpl, 128),
 };
 
 static void gvnic_class_init(ObjectClass *klass, const void *data)
