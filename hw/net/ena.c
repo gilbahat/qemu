@@ -24,6 +24,7 @@
 #include "qemu/units.h"
 #include "hw/pci/pci_device.h"
 #include "hw/pci/msix.h"
+#include "hw/pci/pcie.h"
 #include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "net/net.h"
@@ -54,7 +55,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(EnaState, ENA)
  * transmit doorbell, so the layout is stated once, here.
  */
 #define ENA_REG_BAR                 0
-#define ENA_MSIX_BAR                4
+/*
+ * Real ENA puts the MSI-X table either in BAR0 beside the registers or in
+ * BAR1 -- FreeBSD's driver says exactly that where it looks the table up --
+ * so BAR1 it is. The register BAR is therefore 32-bit, leaving BAR1 free,
+ * and BAR2 stays clear for the LLQ window a later model will want.
+ */
+#define ENA_MSIX_BAR                1
 #define ENA_REG_BAR_SIZE            0x2000
 #define ENA_SQ_DB_BASE              0x1000
 #define ENA_CQ_DB_BASE              0x1400
@@ -144,6 +151,7 @@ struct EnaState {
     uint32_t aenq_enabled_groups;
     uint32_t mtu;
     bool link_up_sent;
+    bool firmware_bus_master;
 
     /* Basic statistics, which the drivers poll for. */
     uint64_t tx_bytes, tx_pkts, rx_bytes, rx_pkts, rx_drops;
@@ -179,6 +187,12 @@ static void ena_mmio_resp_write(EnaState *s, uint16_t req_id, uint16_t off,
                       "published\n");
         return;
     }
+
+    ENA_TRACE("reg read off=0x%x seq=%u -> 0x%x  resp@0x%" PRIx64
+              " pci_command=0x%04x%s", off, req_id, val, addr,
+              pci_get_word(PCI_DEVICE(s)->config + PCI_COMMAND),
+              (pci_get_word(PCI_DEVICE(s)->config + PCI_COMMAND) &
+               PCI_COMMAND_MASTER) ? "" : " (BUS MASTER OFF -- DMA DROPPED)");
 
     resp.reg_off = cpu_to_le16(off);
     resp.reg_val = cpu_to_le32(val);
@@ -275,7 +289,8 @@ static void ena_reset_state(EnaState *s)
  * Async events. The ring is the guest's; the device owns the tail and must
  * not run more than a ring ahead of the head doorbell the guest writes back.
  */
-static void ena_aenq_post(EnaState *s, uint16_t group, uint16_t syndrome)
+static bool ena_aenq_post(EnaState *s, uint16_t group, uint16_t syndrome,
+                          uint32_t inline_w0)
 {
     uint64_t base = (uint64_t)s->aenq_base_lo | ((uint64_t)s->aenq_base_hi << 32);
     uint16_t depth = s->aenq_caps & ENA_REGS_AENQ_CAPS_AENQ_DEPTH_MASK;
@@ -283,15 +298,19 @@ static void ena_aenq_post(EnaState *s, uint16_t group, uint16_t syndrome)
     uint16_t slot;
 
     if (base == 0 || depth == 0) {
-        return;
+        ENA_TRACE("aenq not ready for group %u (base=0x%" PRIx64 " depth=%u)",
+                  group, base, depth);
+        return false;
     }
     if (!(s->aenq_enabled_groups & BIT(group))) {
-        return;
+        ENA_TRACE("aenq group %u not enabled (0x%x)", group,
+                  s->aenq_enabled_groups);
+        return false;
     }
     if ((uint16_t)(s->aenq_tail - s->aenq_head) >= depth) {
         qemu_log_mask(LOG_GUEST_ERROR, "ena: aenq full, event %u dropped\n",
                       group);
-        return;
+        return false;
     }
 
     slot = s->aenq_tail & (depth - 1);
@@ -300,11 +319,18 @@ static void ena_aenq_post(EnaState *s, uint16_t group, uint16_t syndrome)
     e.aenq_common_desc.syndrome = cpu_to_le16(syndrome);
     e.aenq_common_desc.flags = s->aenq_phase &
         ENA_ADMIN_AENQ_COMMON_DESC_PHASE_MASK;
+    /*
+     * The first word after the common descriptor, which each group defines
+     * for itself -- for a link change it is the one that says whether the
+     * link came up or went down. An event that carries nothing here is a
+     * perfectly well-formed announcement that the link is still down.
+     */
+    e.inline_data_w4[0] = cpu_to_le32(inline_w0);
 
     pci_dma_write(PCI_DEVICE(s), base + (uint64_t)slot * sizeof(e), &e,
                   sizeof(e));
-    ENA_TRACE("aenq[%u] group=%u syndrome=%u phase=%u", slot, group, syndrome,
-              s->aenq_phase);
+    ENA_TRACE("aenq[%u] group=%u syndrome=%u w0=0x%x phase=%u", slot, group,
+              syndrome, inline_w0, s->aenq_phase);
 
     s->aenq_tail++;
     if ((s->aenq_tail & (depth - 1)) == 0) {
@@ -313,15 +339,24 @@ static void ena_aenq_post(EnaState *s, uint16_t group, uint16_t syndrome)
     if (msix_enabled(PCI_DEVICE(s))) {
         msix_notify(PCI_DEVICE(s), 0);
     }
+    return true;
 }
 
+/*
+ * Say the link is up, once, as soon as there is somewhere to say it. The
+ * latch belongs to the event actually reaching the guest and not to the
+ * attempt: the first attempts come before the guest has published an async
+ * event queue or asked for link events, and a latch set on those would eat
+ * the only announcement the guest was ever going to get -- leaving a device
+ * that works perfectly and an interface that never comes up.
+ */
 static void ena_link_up(EnaState *s)
 {
     if (s->link_up_sent) {
         return;
     }
-    s->link_up_sent = true;
-    ena_aenq_post(s, ENA_ADMIN_LINK_CHANGE, 1);
+    s->link_up_sent = ena_aenq_post(s, ENA_ADMIN_LINK_CHANGE, 0,
+                                    ENA_ADMIN_AENQ_LINK_CHANGE_DESC_LINK_STATUS_MASK);
 }
 
 /* ------------------------------------------------------------- features */
@@ -459,6 +494,8 @@ static uint8_t ena_set_feature(EnaState *s, const struct ena_admin_set_feat_cmd 
     case ENA_ADMIN_AENQ_CONFIG:
         s->aenq_enabled_groups = le32_to_cpu(cmd->u.aenq.enabled_groups);
         ENA_TRACE("aenq groups enabled 0x%x", s->aenq_enabled_groups);
+        /* Now that the guest wants events, tell it about the link. */
+        ena_link_up(s);
         return ENA_ADMIN_SUCCESS;
     case ENA_ADMIN_HOST_ATTR_CONFIG:
         /* The guest describes itself. Nothing here needs to know. */
@@ -1137,6 +1174,34 @@ static NetClientInfo net_ena_info = {
     .link_status_changed = ena_set_link_status,
 };
 
+/*
+ * EC2's firmware leaves bus mastering enabled on the ENA function, and at
+ * least one production driver depends on that: FreeBSD's ena(4) never calls
+ * pci_enable_busmaster() anywhere in its sources, so under a firmware that
+ * leaves the bit clear -- SeaBIOS and EDK2 both do, correctly, since it is
+ * the OS's job -- the device is unable to answer a single register read. The
+ * failure is silent and total: every readless read returns the driver's own
+ * poison value and it reports a timeout against a device that is working.
+ *
+ * Honouring the bit is the correct emulation and this model does. This
+ * property exists only so that such a driver can be run as an oracle here,
+ * and it is off by default: a guest that wants DMA should ask for it.
+ */
+static void ena_config_write(PCIDevice *d, uint32_t addr, uint32_t val, int l)
+{
+    EnaState *s = ENA(d);
+    uint16_t cmd;
+
+    pci_default_write_config(d, addr, val, l);
+    if (!s->firmware_bus_master || !ranges_overlap(addr, l, PCI_COMMAND, 2)) {
+        return;
+    }
+    cmd = pci_get_word(d->config + PCI_COMMAND);
+    if (!(cmd & PCI_COMMAND_MASTER)) {
+        pci_default_write_config(d, PCI_COMMAND, cmd | PCI_COMMAND_MASTER, 2);
+    }
+}
+
 static void ena_reset(DeviceState *dev)
 {
     EnaState *s = ENA(dev);
@@ -1161,6 +1226,18 @@ static void ena_realize(PCIDevice *pci_dev, Error **errp)
                           "ena-regs", ENA_REG_BAR_SIZE);
     pci_register_bar(pci_dev, ENA_REG_BAR, PCI_BASE_ADDRESS_SPACE_MEMORY,
                      &s->reg_bar);
+
+    /*
+     * A real ENA is a PCI Express virtual function, and saying so is not
+     * cosmetic: FreeBSD refuses MSI-X outright on a machine where it has
+     * found neither a PCI Express nor a PCI-X chipset, so a device that
+     * presents itself as conventional PCI can be denied interrupts for a
+     * reason that has nothing to do with the device.
+     */
+    if (pcie_endpoint_cap_init(pci_dev, 0xa0) < 0) {
+        error_setg(errp, "failed to initialise the PCI Express capability");
+        return;
+    }
 
     if (msix_init_exclusive_bar(pci_dev, ENA_MSIX_VECTORS, ENA_MSIX_BAR,
                                 errp) < 0) {
@@ -1199,6 +1276,8 @@ static const VMStateDescription vmstate_ena = {
 
 static const Property ena_properties[] = {
     DEFINE_NIC_PROPERTIES(EnaState, conf),
+    DEFINE_PROP_BOOL("firmware-bus-master", EnaState, firmware_bus_master,
+                     false),
 };
 
 static void ena_class_init(ObjectClass *klass, const void *data)
@@ -1208,6 +1287,7 @@ static void ena_class_init(ObjectClass *klass, const void *data)
 
     k->realize = ena_realize;
     k->exit = ena_exit;
+    k->config_write = ena_config_write;
     k->vendor_id = PCI_VENDOR_ID_AMAZON;
     k->device_id = PCI_DEV_ID_ENA_VF;
     k->class_id = PCI_CLASS_NETWORK_ETHERNET;
@@ -1227,7 +1307,7 @@ static const TypeInfo ena_types[] = {
         .instance_size = sizeof(EnaState),
         .class_init    = ena_class_init,
         .interfaces    = (const InterfaceInfo[]) {
-            { INTERFACE_CONVENTIONAL_PCI_DEVICE },
+            { INTERFACE_PCIE_DEVICE },
             { },
         },
     },
