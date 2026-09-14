@@ -27,6 +27,7 @@
 #include "hw/pci/pcie.h"
 #include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
+#include "system/memory.h"
 #include "net/net.h"
 #include "system/dma.h"
 
@@ -67,6 +68,19 @@ OBJECT_DECLARE_SIMPLE_TYPE(EnaState, ENA)
 #define ENA_CQ_DB_BASE              0x1400
 #define ENA_CQ_UNMASK_BASE          0x1800
 #define ENA_CQ_NUMA_BASE            0x1c00
+
+/*
+ * The LLQ window. A transmit queue in device-memory placement has its
+ * descriptor ring here rather than in guest RAM: the guest writes whole
+ * entries across the bus and the device reads them back out of this BAR,
+ * which is why it is plain RAM rather than an io region -- there is nothing
+ * to do on the write, and the doorbell is what says an entry is ready.
+ */
+#define ENA_MEM_BAR                 2
+#define ENA_LLQ_QUEUE_SIZE          (256 * KiB)     /* 1024 * 256B entries */
+#define ENA_LLQ_BAR_SIZE            (ENA_LLQ_QUEUE_SIZE * ENA_MAX_QUEUES)
+#define ENA_LLQ_MAX_DEPTH           1024
+#define ENA_TX_DESC_SIZE            ((uint32_t)sizeof(struct ena_eth_io_tx_desc))
 
 #define ENA_MAX_QUEUES              8
 #define ENA_MSIX_VECTORS            8
@@ -111,6 +125,8 @@ typedef struct EnaQueue {
 
     /* Submission queues. */
     uint8_t direction;
+    uint8_t placement;          /* HOST, or DEV for a low-latency queue */
+    uint64_t llq_offset;        /* where in the LLQ window this ring lives */
     uint16_t cq_idx;
     uint16_t tail;              /* last doorbell the guest wrote */
 
@@ -123,6 +139,8 @@ struct EnaState {
     PCIDevice parent_obj;
 
     MemoryRegion reg_bar;
+    MemoryRegion llq_bar;
+    uint8_t *llq_mem;
     NICState *nic;
     NICConf conf;
 
@@ -149,6 +167,11 @@ struct EnaState {
     EnaQueue cq[ENA_MAX_QUEUES];
 
     uint32_t aenq_enabled_groups;
+    /* What the guest chose during LLQ negotiation. */
+    uint16_t llq_entry_size;            /* bytes: 128, 192 or 256 */
+    uint16_t llq_descs_before_header;
+    uint16_t llq_stride_ctrl;
+    uint16_t llq_header_location;
     uint32_t mtu;
     bool link_up_sent;
     bool firmware_bus_master;
@@ -271,6 +294,10 @@ static void ena_reset_state(EnaState *s)
     s->acq_base_lo = s->acq_base_hi = 0;
     s->aenq_base_lo = s->aenq_base_hi = 0;
     s->aenq_enabled_groups = 0;
+    s->llq_entry_size = 0;
+    s->llq_descs_before_header = 0;
+    s->llq_stride_ctrl = 0;
+    s->llq_header_location = 0;
     s->link_up_sent = false;
     s->mtu = ENA_MAX_MTU;
     ena_queues_reset(s);
@@ -364,17 +391,13 @@ static void ena_link_up(EnaState *s)
 static uint32_t ena_supported_features(void)
 {
     /*
-     * LLQ is deliberately absent. With no LLQ feature advertised the HAL's
-     * ena_set_queues_placement_policy() falls back to host memory, which is
-     * the policy this model implements; claiming LLQ and then not honouring
-     * it would be the expensive kind of wrong.
-     *
-     * RSS is absent for the same reason -- one receive queue, no indirection
+     * RSS is absent deliberately -- one receive queue, and no indirection
      * table to get wrong.
      */
     return BIT(ENA_ADMIN_DEVICE_ATTRIBUTES) |
            BIT(ENA_ADMIN_MAX_QUEUES_NUM) |
            BIT(ENA_ADMIN_MAX_QUEUES_EXT) |
+           BIT(ENA_ADMIN_LLQ) |
            BIT(ENA_ADMIN_STATELESS_OFFLOAD_CONFIG) |
            BIT(ENA_ADMIN_MTU) |
            BIT(ENA_ADMIN_AENQ_CONFIG) |
@@ -463,6 +486,42 @@ static uint8_t ena_get_feature(EnaState *s, const struct ena_admin_get_feat_cmd 
         d->flags = cpu_to_le32(ENA_ADMIN_GET_FEATURE_LINK_DESC_DUPLEX_MASK);
         return ENA_ADMIN_SUCCESS;
     }
+    case ENA_ADMIN_LLQ: {
+        struct ena_admin_feature_llq_desc *d = &resp->u.llq;
+
+        d->max_llq_num = cpu_to_le32(ENA_MAX_QUEUES);
+        d->max_llq_depth = cpu_to_le32(ENA_LLQ_MAX_DEPTH);
+        /*
+         * Inline header only. The alternative, a separate header ring, forces
+         * 16-byte entries and a second window to maintain, and no driver asks
+         * for it by preference.
+         */
+        d->header_location_ctrl_supported = cpu_to_le16(ENA_ADMIN_INLINE_HEADER);
+        d->entry_size_ctrl_supported =
+            cpu_to_le16(ENA_ADMIN_LIST_ENTRY_SIZE_128B |
+                        ENA_ADMIN_LIST_ENTRY_SIZE_256B);
+        d->entry_size_recommended = ENA_ADMIN_LIST_ENTRY_SIZE_128B;
+        d->desc_num_before_header_supported =
+            cpu_to_le16(ENA_ADMIN_LLQ_NUM_DESCS_BEFORE_HEADER_1 |
+                        ENA_ADMIN_LLQ_NUM_DESCS_BEFORE_HEADER_2 |
+                        ENA_ADMIN_LLQ_NUM_DESCS_BEFORE_HEADER_4 |
+                        ENA_ADMIN_LLQ_NUM_DESCS_BEFORE_HEADER_8);
+        d->descriptors_stride_ctrl_supported =
+            cpu_to_le16(ENA_ADMIN_SINGLE_DESC_PER_ENTRY |
+                        ENA_ADMIN_MULTIPLE_DESCS_PER_ENTRY);
+        d->feature_version = ENA_ADMIN_LLQ_FEATURE_VERSION_1;
+        /*
+         * Equal to max_llq_depth, so a driver choosing 256-byte entries is
+         * not told to halve its transmit ring.
+         */
+        d->max_wide_llq_depth = cpu_to_le32(ENA_LLQ_MAX_DEPTH);
+        /* No acceleration flags: no meta caching to disable, no burst limit. */
+        d->accel_mode.u.get.supported_flags = 0;
+        d->accel_mode.u.get.max_tx_burst_size = 0;
+        ENA_TRACE("get_feature llq: entry sizes 128|256, descs before header "
+                  "1|2|4|8, inline header");
+        return ENA_ADMIN_SUCCESS;
+    }
     case ENA_ADMIN_STATELESS_OFFLOAD_CONFIG:
         /* No offloads claimed: the guest checksums and segments in software. */
         memset(&resp->u, 0, sizeof(resp->u));
@@ -497,6 +556,40 @@ static uint8_t ena_set_feature(EnaState *s, const struct ena_admin_set_feat_cmd 
         /* Now that the guest wants events, tell it about the link. */
         ena_link_up(s);
         return ENA_ADMIN_SUCCESS;
+    case ENA_ADMIN_LLQ: {
+        static const uint16_t entry_bytes[] = {
+            [ENA_ADMIN_LIST_ENTRY_SIZE_128B] = 128,
+            [ENA_ADMIN_LIST_ENTRY_SIZE_192B] = 192,
+            [ENA_ADMIN_LIST_ENTRY_SIZE_256B] = 256,
+        };
+        uint16_t size_ctrl = le16_to_cpu(cmd->u.llq.entry_size_ctrl_enabled);
+        uint16_t location = le16_to_cpu(cmd->u.llq.header_location_ctrl_enabled);
+        uint16_t descs = le16_to_cpu(cmd->u.llq.desc_num_before_header_enabled);
+        uint16_t stride = le16_to_cpu(cmd->u.llq.descriptors_stride_ctrl_enabled);
+
+        if (size_ctrl >= ARRAY_SIZE(entry_bytes) ||
+            entry_bytes[size_ctrl] == 0) {
+            return ENA_ADMIN_ILLEGAL_PARAMETER;
+        }
+        if (location != ENA_ADMIN_INLINE_HEADER) {
+            return ENA_ADMIN_ILLEGAL_PARAMETER;
+        }
+        /*
+         * The header sits after this many descriptors, so it has to leave
+         * room for itself inside one entry.
+         */
+        if (descs == 0 ||
+            (uint32_t)descs * ENA_TX_DESC_SIZE >= entry_bytes[size_ctrl]) {
+            return ENA_ADMIN_ILLEGAL_PARAMETER;
+        }
+        s->llq_entry_size = entry_bytes[size_ctrl];
+        s->llq_descs_before_header = descs;
+        s->llq_stride_ctrl = stride;
+        s->llq_header_location = location;
+        ENA_TRACE("llq configured: entry=%uB descs_before_header=%u stride=%u",
+                  s->llq_entry_size, descs, stride);
+        return ENA_ADMIN_SUCCESS;
+    }
     case ENA_ADMIN_HOST_ATTR_CONFIG:
         /* The guest describes itself. Nothing here needs to know. */
         return ENA_ADMIN_SUCCESS;
@@ -576,12 +669,23 @@ static uint8_t ena_create_sq(EnaState *s, const struct ena_admin_aq_create_sq_cm
     if (dir != ENA_SQ_DIRECTION_TX && dir != ENA_SQ_DIRECTION_RX) {
         return ENA_ADMIN_ILLEGAL_PARAMETER;
     }
-    if (policy != ENA_ADMIN_PLACEMENT_POLICY_HOST) {
+    if (policy != ENA_ADMIN_PLACEMENT_POLICY_HOST &&
+        policy != ENA_ADMIN_PLACEMENT_POLICY_DEV) {
         qemu_log_mask(LOG_GUEST_ERROR,
-                      "ena: placement policy %u requested; this model "
-                      "implements host memory (%u) only\n",
-                      policy, ENA_ADMIN_PLACEMENT_POLICY_HOST);
-        return ENA_ADMIN_UNSUPPORTED_OPCODE;
+                      "ena: unknown placement policy %u\n", policy);
+        return ENA_ADMIN_ILLEGAL_PARAMETER;
+    }
+    if (policy == ENA_ADMIN_PLACEMENT_POLICY_DEV) {
+        /*
+         * A low-latency queue is transmit-only, and it cannot be created
+         * before the guest has said how it intends to lay the window out.
+         */
+        if (dir != ENA_SQ_DIRECTION_TX || s->llq_entry_size == 0) {
+            return ENA_ADMIN_ILLEGAL_PARAMETER;
+        }
+        if ((uint64_t)depth * s->llq_entry_size > ENA_LLQ_QUEUE_SIZE) {
+            return ENA_ADMIN_ILLEGAL_PARAMETER;
+        }
     }
     if (cq_idx >= ENA_MAX_QUEUES || !s->cq[cq_idx].active) {
         return ENA_ADMIN_ILLEGAL_PARAMETER;
@@ -603,17 +707,28 @@ static uint8_t ena_create_sq(EnaState *s, const struct ena_admin_aq_create_sq_cm
     q->tail = 0;
     q->phase = 1;
     q->direction = dir;
+    q->placement = policy;
     q->cq_idx = cq_idx;
     q->entry_size = (dir == ENA_SQ_DIRECTION_TX) ?
-        sizeof(struct ena_eth_io_tx_desc) : sizeof(struct ena_eth_io_rx_desc);
+        ENA_TX_DESC_SIZE : sizeof(struct ena_eth_io_rx_desc);
+    q->llq_offset = (uint64_t)idx * ENA_LLQ_QUEUE_SIZE;
 
     resp->sq_idx = cpu_to_le16(idx);
     resp->sq_doorbell_offset = cpu_to_le32(ENA_SQ_DB_BASE + idx * 4);
-    resp->llq_descriptors_offset = 0;
+    /*
+     * Where in the memory BAR this queue's entries live. Like the doorbell
+     * offsets, the device chooses it and the guest reads it back.
+     */
+    resp->llq_descriptors_offset =
+        (policy == ENA_ADMIN_PLACEMENT_POLICY_DEV) ?
+        cpu_to_le32(q->llq_offset) : 0;
     resp->llq_headers_offset = 0;
 
-    ENA_TRACE("create sq %u dir=%s depth=%u cq=%u base=0x%" PRIx64, idx,
-              dir == ENA_SQ_DIRECTION_TX ? "tx" : "rx", depth, cq_idx, q->base);
+    ENA_TRACE("create sq %u dir=%s depth=%u cq=%u %s=0x%" PRIx64, idx,
+              dir == ENA_SQ_DIRECTION_TX ? "tx" : "rx", depth, cq_idx,
+              policy == ENA_ADMIN_PLACEMENT_POLICY_DEV ? "llq" : "base",
+              policy == ENA_ADMIN_PLACEMENT_POLICY_DEV ? q->llq_offset
+                                                       : q->base);
 
     if (dir == ENA_SQ_DIRECTION_RX) {
         qemu_flush_queued_packets(qemu_get_queue(s->nic));
@@ -840,6 +955,127 @@ static void ena_tx_complete(EnaState *s, EnaQueue *sq, uint16_t req_id)
 }
 
 /*
+ * Transmit from a low-latency queue.
+ *
+ * The ring is in the device's own memory window and the guest writes whole
+ * entries into it, so the unit of the doorbell here is an entry, not a
+ * descriptor. Inside an entry the layout is the one the guest asked for
+ * during negotiation: descriptors from offset zero, and -- in the entry that
+ * begins a packet -- the packet's own header immediately after
+ * descs_before_header of them. An entry that continues a packet carries
+ * descriptors and no header.
+ *
+ * Only the header travels in device memory. Everything after it is still
+ * fetched from guest RAM through the descriptors, which is what makes this
+ * worth doing: the small write that used to cost a round trip is pushed
+ * across the bus with the descriptor that describes it.
+ */
+static const uint8_t *ena_llq_entry(EnaState *s, EnaQueue *sq, uint16_t pos)
+{
+    uint64_t off = sq->llq_offset +
+        (uint64_t)(pos & (sq->depth - 1)) * s->llq_entry_size;
+
+    return s->llq_mem + off;
+}
+
+static unsigned ena_llq_descs_per_entry(EnaState *s)
+{
+    if (s->llq_stride_ctrl == ENA_ADMIN_SINGLE_DESC_PER_ENTRY) {
+        return 1;
+    }
+    return s->llq_entry_size / ENA_TX_DESC_SIZE;
+}
+
+static void ena_tx_run_llq(EnaState *s, EnaQueue *sq)
+{
+    uint8_t frame[ENA_MAX_FRAME];
+
+    if (s->llq_entry_size == 0) {
+        return;
+    }
+
+    for (uint32_t budget = sq->depth; budget > 0 && sq->head != sq->tail;
+         budget--) {
+        uint32_t got = 0;
+        uint16_t req_id = 0;
+        bool first_entry = true, started = false, last = false;
+
+        while (sq->head != sq->tail && !last) {
+            const uint8_t *entry = ena_llq_entry(s, sq, sq->head);
+            unsigned ndesc = first_entry ? s->llq_descs_before_header
+                                         : ena_llq_descs_per_entry(s);
+
+            sq->head++;
+
+            for (unsigned i = 0; i < ndesc && !last; i++) {
+                struct ena_eth_io_tx_desc d;
+                uint32_t len_ctrl, meta_ctrl, hi;
+                uint64_t addr;
+                uint16_t seg_len;
+
+                memcpy(&d, entry + i * ENA_TX_DESC_SIZE, sizeof(d));
+                len_ctrl = le32_to_cpu(d.len_ctrl);
+                meta_ctrl = le32_to_cpu(d.meta_ctrl);
+                hi = le32_to_cpu(d.buff_addr_hi_hdr_sz);
+
+                if (len_ctrl & ENA_ETH_IO_TX_DESC_META_DESC_MASK) {
+                    continue;   /* offload hints, which this model has none of */
+                }
+                if (!started) {
+                    uint16_t hdr_len =
+                        (hi & ENA_ETH_IO_TX_DESC_HEADER_LENGTH_MASK) >>
+                        ENA_ETH_IO_TX_DESC_HEADER_LENGTH_SHIFT;
+                    uint32_t hdr_off =
+                        s->llq_descs_before_header * ENA_TX_DESC_SIZE;
+
+                    req_id = ((len_ctrl & ENA_ETH_IO_TX_DESC_REQ_ID_HI_MASK) >>
+                              ENA_ETH_IO_TX_DESC_REQ_ID_HI_SHIFT) << 10;
+                    req_id |= (meta_ctrl & ENA_ETH_IO_TX_DESC_REQ_ID_LO_MASK) >>
+                              ENA_ETH_IO_TX_DESC_REQ_ID_LO_SHIFT;
+
+                    if (hdr_len > 0) {
+                        if (hdr_off + hdr_len > s->llq_entry_size) {
+                            qemu_log_mask(LOG_GUEST_ERROR,
+                                          "ena: inline header of %u bytes at "
+                                          "%u does not fit a %u-byte entry\n",
+                                          hdr_len, hdr_off, s->llq_entry_size);
+                            return;
+                        }
+                        memcpy(frame, entry + hdr_off, hdr_len);
+                        got = hdr_len;
+                    }
+                    started = true;
+                }
+                last = (len_ctrl & ENA_ETH_IO_TX_DESC_LAST_MASK) != 0;
+
+                seg_len = len_ctrl & ENA_ETH_IO_TX_DESC_LENGTH_MASK;
+                addr = (uint64_t)le32_to_cpu(d.buff_addr_lo) |
+                       ((uint64_t)(hi &
+                           ~ENA_ETH_IO_TX_DESC_HEADER_LENGTH_MASK) << 32);
+                if (seg_len == 0 || got + seg_len > sizeof(frame)) {
+                    continue;
+                }
+                pci_dma_read(PCI_DEVICE(s), addr, frame + got, seg_len);
+                got += seg_len;
+            }
+            first_entry = false;
+        }
+
+        if (!last) {
+            /* The packet runs into entries the guest has not posted yet. */
+            break;
+        }
+        ENA_TRACE("tx llq req_id=%u len=%u", req_id, got);
+        if (got > 0) {
+            qemu_send_packet(qemu_get_queue(s->nic), frame, got);
+            s->tx_bytes += got;
+            s->tx_pkts++;
+        }
+        ena_tx_complete(s, sq, req_id);
+    }
+}
+
+/*
  * A packet is a run of descriptors from the one with FIRST set to the one
  * with LAST set; each carries a segment. In host placement the buffer
  * address is an ordinary guest address rather than an offset into anything.
@@ -1040,7 +1276,12 @@ static void ena_bar0_write(void *opaque, hwaddr addr, uint64_t val,
             if (idx < ENA_MAX_QUEUES && s->sq[idx].active) {
                 s->sq[idx].tail = (uint16_t)v;
                 if (s->sq[idx].direction == ENA_SQ_DIRECTION_TX) {
-                    ena_tx_run(s, &s->sq[idx]);
+                    if (s->sq[idx].placement ==
+                        ENA_ADMIN_PLACEMENT_POLICY_DEV) {
+                        ena_tx_run_llq(s, &s->sq[idx]);
+                    } else {
+                        ena_tx_run(s, &s->sq[idx]);
+                    }
                 } else {
                     qemu_flush_queued_packets(qemu_get_queue(s->nic));
                 }
@@ -1238,6 +1479,16 @@ static void ena_realize(PCIDevice *pci_dev, Error **errp)
         error_setg(errp, "failed to initialise the PCI Express capability");
         return;
     }
+
+    if (!memory_region_init_ram(&s->llq_bar, OBJECT(s), "ena-llq",
+                                ENA_LLQ_BAR_SIZE, errp)) {
+        return;
+    }
+    s->llq_mem = memory_region_get_ram_ptr(&s->llq_bar);
+    pci_register_bar(pci_dev, ENA_MEM_BAR,
+                     PCI_BASE_ADDRESS_SPACE_MEMORY |
+                     PCI_BASE_ADDRESS_MEM_TYPE_64 |
+                     PCI_BASE_ADDRESS_MEM_PREFETCH, &s->llq_bar);
 
     if (msix_init_exclusive_bar(pci_dev, ENA_MSIX_VECTORS, ENA_MSIX_BAR,
                                 errp) < 0) {
