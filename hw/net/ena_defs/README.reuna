@@ -1,0 +1,29 @@
+These five headers are Amazon's, copied verbatim and not edited.
+
+  Source:  FreeBSD src, sys/contrib/ena-com/ena_defs/
+  Fetched: 2026-09-14 from raw.githubusercontent.com/freebsd/freebsd-src/main
+  Licence: BSD-3-Clause, Copyright (c) 2015-2023 Amazon.com, Inc.
+
+The same files, byte for byte, are in DPDK's drivers/net/ena/base/ena_defs/
+and in amzn-drivers' kernel/fbsd/ena/ena-com/, all BSD-3-Clause. They are
+machine-generated from Amazon's internal ABI description, which is exactly
+why they are used as they are rather than transcribed into constants of our
+own: every offset, every bit position and every enumerator in the device
+interface lives here, and each one retyped by hand is a chance to be wrong
+in a way that produces no error.
+
+That is not a hypothetical. The gVNIC model in this tree was written from
+hand-copied offsets and had four of them wrong -- a field read four bytes
+early that found a plausible zero, a receive descriptor's length and
+sequence written two bytes early so that the driver read its sequence
+number out of bytes nobody had written and concluded, silently and forever,
+that no packet had ever arrived. ENA has a worse trap of the same kind
+waiting: a transmit descriptor's req_id is split across two fields, six bits
+in one and ten in another.
+
+To update, refetch the whole directory from one of the three sources above
+and change nothing. Anything this model needs that the headers do not
+provide belongs in ena.c.
+
+BSD-3-Clause sources are compatible with QEMU's GPL-2.0-or-later; the
+combined work is GPL, and these files keep their own notices.

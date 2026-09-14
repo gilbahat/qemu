@@ -167,3 +167,8 @@ config CAN_FLEXCAN
     bool
     depends on IMX
     select CAN_BUS
+
+config ENA
+    bool
+    default y if PCI_DEVICES
+    depends on PCI
