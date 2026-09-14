@@ -72,3 +72,5 @@ if have_hmp
 endif
 
 subdir('can')
+
+system_ss.add(when: 'CONFIG_ENA', if_true: files('ena.c'))
