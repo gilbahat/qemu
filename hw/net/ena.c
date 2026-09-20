@@ -1196,6 +1196,23 @@ static ssize_t ena_receive(NetClientState *nc, const uint8_t *buf, size_t size)
     pci_dma_read(PCI_DEVICE(s), sq->base + (uint64_t)slot * sizeof(d), &d,
                  sizeof(d));
 
+    /*
+     * The phase bit, which says whether this position holds a descriptor the
+     * driver has published on this lap or last lap's leftovers. A real
+     * adapter refuses to consume the latter and so does this.
+     *
+     * Not checking it is a way for a model to be kinder than the device, and
+     * this one was: a driver that wrote each descriptor at the position of
+     * the buffer it was recycling rather than at the ring's tail left a
+     * correct-looking descriptor at every position -- the stale one names a
+     * different buffer, but every buffer is the same size and the driver
+     * finds its data through req_id, so the packets kept flowing here and
+     * stopped dead on hardware after exactly one trip around the ring.
+     */
+    if ((d.ctrl & ENA_ETH_IO_RX_DESC_PHASE_MASK) != sq->phase) {
+        return 0;
+    }
+
     buf_len = le16_to_cpu(d.length);
     req_id = le16_to_cpu(d.req_id);
     addr = (uint64_t)le32_to_cpu(d.buff_addr_lo) |
@@ -1213,6 +1230,9 @@ static ssize_t ena_receive(NetClientState *nc, const uint8_t *buf, size_t size)
 
     pci_dma_write(PCI_DEVICE(s), addr, buf, size);
     sq->head++;
+    if ((sq->head & (sq->depth - 1)) == 0) {
+        sq->phase = !sq->phase;
+    }
 
     status = ENA_ETH_IO_RX_CDESC_BASE_FIRST_MASK |
              ENA_ETH_IO_RX_CDESC_BASE_LAST_MASK |
