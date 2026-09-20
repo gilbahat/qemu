@@ -65,7 +65,16 @@ OBJECT_DECLARE_SIMPLE_TYPE(GvnicState, GVNIC)
 #define GVNIC_DEVICE_STATUS_RESET   (1u << 1)
 #define GVNIC_DEVICE_STATUS_LINK_UP (1u << 2)
 
+/* What the guest writes to DRIVER_STATUS to say it is running. */
+#define GVNIC_DRIVER_STATUS_RUN     (1u << 0)
+
 #define GVNIC_MSIX_VECTORS      8
+
+/* The largest frame this model will assemble or deliver. */
+#define GVNIC_MAX_FRAME         (16 * 1024)
+
+/* How many distinct guest addresses the differential trace will name. */
+#define GVNIC_SYMS_MAX 64
 
 /* BAR2, the doorbells: an array of big-endian words, one per queue index. */
 #define GVNIC_BAR2_SIZE         0x1000
@@ -107,9 +116,17 @@ enum {
 };
 
 /* Admin command status, as the driver polls for it. */
+/*
+ * Status codes, which are gRPC's canonical codes counted down from
+ * 0xffffffff. The two this model returns had the wrong values: 0xFFFFFFF8 is
+ * NOT_FOUND and 0xFFFFFFF2 is CANCELLED, so a guest that printed what it was
+ * told was told something that happened to be adjacent to the truth. A
+ * driver author reading "NOT_FOUND" looks for a missing resource; the model
+ * meant "you asked wrongly".
+ */
 #define GVNIC_ADMINQ_PASSED                 0x1
-#define GVNIC_ADMINQ_ERR_INVALID_ARGUMENT   0xFFFFFFF8
-#define GVNIC_ADMINQ_ERR_UNIMPLEMENTED      0xFFFFFFF2
+#define GVNIC_ADMINQ_ERR_INVALID_ARGUMENT   0xFFFFFFF7
+#define GVNIC_ADMINQ_ERR_UNIMPLEMENTED      0xFFFFFFFE
 
 /* Device option ids, as they appear in the DESCRIBE_DEVICE reply. */
 #define GVNIC_DEV_OPT_ID_GQI_QPL            0x3
@@ -145,6 +162,7 @@ typedef struct GvnicQueue {
     uint32_t counter_index;
     uint32_t ntfy_id;           /* notification block, hence MSI-X vector */
     uint32_t head;              /* device's position in the ring */
+    uint16_t buffer_size;       /* rx: what the guest said a slot may hold */
     uint8_t seqno;              /* rx: the 1..7 sequence the driver expects */
 } GvnicQueue;
 
@@ -184,6 +202,13 @@ struct GvnicState {
     GvnicQueue tx;
     GvnicQueue rx;
 
+    /* Differential trace. */
+    char *trace_path;
+    FILE *tf;
+    int nsyms;
+    uint64_t sym_addr[GVNIC_SYMS_MAX];
+    char sym_name[GVNIC_SYMS_MAX][8];
+
     /* Properties. */
     uint16_t mtu;
     uint16_t tx_queue_entries;
@@ -210,6 +235,188 @@ static int gvnic_trace_left = GVNIC_TRACE_MAX;
 
 static void gvnic_reset_state(GvnicState *s);
 static void gvnic_tx_run(GvnicState *s);
+
+/* ---------------------------------------------------- differential trace */
+
+/*
+ * A trace meant to be diffed against another guest's, not read on its own.
+ *
+ * Google publishes no gVNIC specification, so the only way to settle what a
+ * field means is to look at what a driver written by the people who designed
+ * the device puts in it. That driver is available and runs against this
+ * model; what was missing was a way to capture what it does in a form that
+ * can be compared, line by line, with what another driver does.
+ *
+ * Two things make the output comparable across guests that share nothing:
+ *
+ *   - **No addresses.** Every guest address is replaced by a symbol assigned
+ *     in first-seen order, @A1, @A2 and so on. Two drivers that hand the
+ *     device the same *shape* of thing then produce the same text, even
+ *     though one is Linux at 0x7f... and the other a unikernel at 0x1000...
+ *
+ *   - **No timestamps and no counters that only measure the host.** A line
+ *     appears when the guest causes it and says only what the guest said.
+ *
+ * Each admin command is dumped twice: once as raw big-endian words, which is
+ * what settles a field's *width* when the two drivers disagree about it, and
+ * once decoded. Where a field's width is itself in question the decode prints
+ * both readings rather than choosing, because choosing is the bug being
+ * looked for.
+ *
+ * Enabled with -device gvnic,trace=FILE. Off, it costs a branch.
+ */
+static const char *gvnic_sym(GvnicState *s, uint64_t addr)
+{
+    if (addr == 0) {
+        return "0";
+    }
+    for (int i = 0; i < s->nsyms; i++) {
+        if (s->sym_addr[i] == addr) {
+            return s->sym_name[i];
+        }
+    }
+    if (s->nsyms < GVNIC_SYMS_MAX) {
+        int i = s->nsyms++;
+        s->sym_addr[i] = addr;
+        snprintf(s->sym_name[i], sizeof(s->sym_name[i]), "@A%d", i + 1);
+        return s->sym_name[i];
+    }
+    return "@A?";
+}
+
+static void G_GNUC_PRINTF(2, 3) gvnic_tr(GvnicState *s, const char *fmt, ...)
+{
+    va_list ap;
+
+    if (s->tf == NULL) {
+        return;
+    }
+    va_start(ap, fmt);
+    vfprintf(s->tf, fmt, ap);
+    va_end(ap);
+    fputc('\n', s->tf);
+    fflush(s->tf);
+}
+
+static const char *gvnic_opcode_name(uint32_t op)
+{
+    switch (op) {
+    case GVNIC_ADMINQ_DESCRIBE_DEVICE:              return "DESCRIBE_DEVICE";
+    case GVNIC_ADMINQ_CONFIGURE_DEVICE_RESOURCES:   return "CONFIGURE_RESOURCES";
+    case GVNIC_ADMINQ_REGISTER_PAGE_LIST:           return "REGISTER_PAGE_LIST";
+    case GVNIC_ADMINQ_UNREGISTER_PAGE_LIST:         return "UNREGISTER_PAGE_LIST";
+    case GVNIC_ADMINQ_CREATE_TX_QUEUE:              return "CREATE_TX_QUEUE";
+    case GVNIC_ADMINQ_CREATE_RX_QUEUE:              return "CREATE_RX_QUEUE";
+    case GVNIC_ADMINQ_DESTROY_TX_QUEUE:             return "DESTROY_TX_QUEUE";
+    case GVNIC_ADMINQ_DESTROY_RX_QUEUE:             return "DESTROY_RX_QUEUE";
+    case GVNIC_ADMINQ_DECONFIGURE_DEVICE_RESOURCES: return "DECONFIGURE_RESOURCES";
+    case GVNIC_ADMINQ_SET_DRIVER_PARAMETER:         return "SET_DRIVER_PARAMETER";
+    case GVNIC_ADMINQ_REPORT_STATS:                 return "REPORT_STATS";
+    case GVNIC_ADMINQ_REPORT_LINK_SPEED:            return "REPORT_LINK_SPEED";
+    case GVNIC_ADMINQ_GET_PTYPE_MAP:                return "GET_PTYPE_MAP";
+    case GVNIC_ADMINQ_VERIFY_DRIVER_COMPATIBILITY:  return "VERIFY_DRIVER_COMPAT";
+    default:                                        return "UNKNOWN";
+    }
+}
+
+/*
+ * The raw command as sixteen big-endian words. Word 1 is the status, which
+ * the device fills in, so it is printed as -- : it is not something the
+ * driver said and two drivers must not be made to differ over it.
+ */
+static void gvnic_trace_raw(GvnicState *s, const uint8_t *cmd)
+{
+    char line[16 * 9 + 8];
+    int n = 0;
+
+    for (int i = 0; i < 16; i++) {
+        if (i == 1) {
+            n += snprintf(line + n, sizeof(line) - n, "-------- ");
+        } else {
+            n += snprintf(line + n, sizeof(line) - n, "%08x ",
+                          ldl_be_p(cmd + i * 4));
+        }
+    }
+    gvnic_tr(s, "  raw %s", line);
+}
+
+static void gvnic_trace_adminq(GvnicState *s, const uint8_t *cmd,
+                               uint32_t status)
+{
+    uint32_t op = ldl_be_p(cmd);
+
+    if (s->tf == NULL) {
+        return;
+    }
+    gvnic_tr(s, "ADMINQ %s(0x%x) status=%s", gvnic_opcode_name(op), op,
+             status == GVNIC_ADMINQ_PASSED ? "PASSED" : "REFUSED");
+    gvnic_trace_raw(s, cmd);
+
+    switch (op) {
+    case GVNIC_ADMINQ_DESCRIBE_DEVICE:
+        gvnic_tr(s, "  desc=%s version=%u avail_len=%u",
+                 gvnic_sym(s, ldq_be_p(cmd + 8)), ldl_be_p(cmd + 16),
+                 ldl_be_p(cmd + 20));
+        break;
+    case GVNIC_ADMINQ_CONFIGURE_DEVICE_RESOURCES:
+        gvnic_tr(s, "  counters=%s irq_db=%s num_counters=%u num_irq_dbs=%u "
+                    "irq_db_stride=%u ntfy_msix_base=%u queue_format=%u",
+                 gvnic_sym(s, ldq_be_p(cmd + 8)),
+                 gvnic_sym(s, ldq_be_p(cmd + 16)),
+                 ldl_be_p(cmd + 24), ldl_be_p(cmd + 28), ldl_be_p(cmd + 32),
+                 ldl_be_p(cmd + 36), cmd[40]);
+        break;
+    case GVNIC_ADMINQ_REGISTER_PAGE_LIST:
+        gvnic_tr(s, "  qpl_id=%u num_pages=%u list=%s page_size=%" PRIu64,
+                 ldl_be_p(cmd + 8), ldl_be_p(cmd + 12),
+                 gvnic_sym(s, ldq_be_p(cmd + 16)), ldq_be_p(cmd + 24));
+        break;
+    case GVNIC_ADMINQ_UNREGISTER_PAGE_LIST:
+        gvnic_tr(s, "  qpl_id=%u", ldl_be_p(cmd + 8));
+        break;
+    case GVNIC_ADMINQ_CREATE_TX_QUEUE:
+        /*
+         * tx_ring_size is sixteen bits at 48 and packet_format the sixteen
+         * after it; both readings are printed because a driver that writes a
+         * 32-bit value there puts the number in the half this does not read.
+         */
+        gvnic_tr(s, "  queue_id=%u res=%s ring=%s qpl_id=%u ntfy_id=%u "
+                    "comp_ring=%s ring_size16=%u packet_format16=%u "
+                    "[word48=0x%08x]",
+                 ldl_be_p(cmd + 8), gvnic_sym(s, ldq_be_p(cmd + 16)),
+                 gvnic_sym(s, ldq_be_p(cmd + 24)), ldl_be_p(cmd + 32),
+                 ldl_be_p(cmd + 36), gvnic_sym(s, ldq_be_p(cmd + 40)),
+                 lduw_be_p(cmd + 48), lduw_be_p(cmd + 50),
+                 ldl_be_p(cmd + 48));
+        break;
+    case GVNIC_ADMINQ_CREATE_RX_QUEUE:
+        /*
+         * And the same question at 52, which is the one that matters most:
+         * if rx_ring_size is 32 bits there, a driver writing sixteen puts the
+         * ring size in the high half and the device reads zero.
+         */
+        gvnic_tr(s, "  queue_id=%u index=%u ntfy_id=%u res=%s desc_ring=%s "
+                    "data_ring=%s qpl_id=%u ring_size=%u packet_buffer_size=%u "
+                    "[word52=0x%08x word56=0x%08x]",
+                 ldl_be_p(cmd + 8), ldl_be_p(cmd + 12), ldl_be_p(cmd + 20),
+                 gvnic_sym(s, ldq_be_p(cmd + 24)),
+                 gvnic_sym(s, ldq_be_p(cmd + 32)),
+                 gvnic_sym(s, ldq_be_p(cmd + 40)), ldl_be_p(cmd + 48),
+                 lduw_be_p(cmd + 52), lduw_be_p(cmd + 54),
+                 ldl_be_p(cmd + 52), ldl_be_p(cmd + 56));
+        break;
+    case GVNIC_ADMINQ_DESTROY_TX_QUEUE:
+    case GVNIC_ADMINQ_DESTROY_RX_QUEUE:
+        gvnic_tr(s, "  queue_id=%u", ldl_be_p(cmd + 8));
+        break;
+    case GVNIC_ADMINQ_VERIFY_DRIVER_COMPATIBILITY:
+        gvnic_tr(s, "  driver_info=%s len=%u",
+                 gvnic_sym(s, ldq_be_p(cmd + 16)), ldl_be_p(cmd + 8));
+        break;
+    default:
+        break;
+    }
+}
 
 /*
  * A QPL is an ordered list of pages and a descriptor addresses it by byte
@@ -409,6 +616,10 @@ static uint32_t gvnic_register_page_list(GvnicState *s, const uint8_t *cmd)
         pci_dma_read(PCI_DEVICE(s), list_addr + i * 8, &be, 8);
         qpl->pages[i] = be64_to_cpu(be);
     }
+    gvnic_tr(s, "  QPL id=%u pages=%u page_size=%" PRIu64 " first=%s last=%s",
+             id, num_pages, page_size, gvnic_sym(s, qpl->pages[0]),
+             gvnic_sym(s, qpl->pages[num_pages - 1]));
+
     qpl->id = id;
     qpl->num_pages = num_pages;
     qpl->page_size = page_size;
@@ -447,6 +658,35 @@ static void gvnic_publish_queue_resources(GvnicState *s, GvnicQueue *q)
     pci_dma_write(PCI_DEVICE(s), q->resources_addr, res, sizeof(res));
 }
 
+/*
+ * Ring sizes, judged the way a real adapter judges them.
+ *
+ * Zero means "your choice", which is what Linux sends and so must stay valid.
+ * Anything else is checked, and checked strictly: a real device refuses a
+ * 64-entry transmit ring with INVALID_ARGUMENT and accepts 256, so there is a
+ * minimum somewhere in between that this model previously did not have at
+ * all. It took whatever it was given, which is how a driver that asked for 64
+ * passed every local test and was refused by the first instance it met.
+ *
+ * GVNIC_RING_MIN is 256 because that is the smallest size observed to be
+ * accepted; the true threshold is somewhere in (64, 256] and untested. Being
+ * stricter than the device is the safe direction for a fixture -- a guest
+ * that satisfies this satisfies hardware -- and being more permissive is
+ * precisely the failure this model has already made once.
+ */
+#define GVNIC_RING_MIN 256
+
+static bool gvnic_ring_size_ok(uint32_t size, uint16_t advertised)
+{
+    if (size == 0) {
+        return true;            /* the device's own default */
+    }
+    if (size < GVNIC_RING_MIN || size > advertised) {
+        return false;
+    }
+    return (size & (size - 1)) == 0;
+}
+
 static uint32_t gvnic_create_tx_queue(GvnicState *s, const uint8_t *cmd)
 {
     GvnicQueue *q = &s->tx;
@@ -459,7 +699,15 @@ static uint32_t gvnic_create_tx_queue(GvnicState *s, const uint8_t *cmd)
     q->desc_ring_addr = ldq_be_p(cmd + 24);
     q->qpl_id = ldl_be_p(cmd + 32);
     /* ntfy_id sits at 36 for tx and at 20 for rx; the structures differ. */
+    /* Sixteen bits here -- and thirty-two in the receive command. */
     q->ring_size = lduw_be_p(cmd + 48);
+    if (!gvnic_ring_size_ok(q->ring_size, s->tx_queue_entries)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "gvnic: transmit ring of %u entries refused; the device "
+                      "advertised %u and will not go below %u\n",
+                      q->ring_size, s->tx_queue_entries, GVNIC_RING_MIN);
+        return GVNIC_ADMINQ_ERR_INVALID_ARGUMENT;
+    }
     if (q->ring_size == 0) {
         q->ring_size = s->tx_queue_entries;
     }
@@ -487,7 +735,32 @@ static uint32_t gvnic_create_rx_queue(GvnicState *s, const uint8_t *cmd)
     q->desc_ring_addr = ldq_be_p(cmd + 32);
     q->data_ring_addr = ldq_be_p(cmd + 40);
     q->qpl_id = ldl_be_p(cmd + 48);
+    /* Sixteen bits, as in the transmit command; the buffer size follows it. */
     q->ring_size = lduw_be_p(cmd + 52);
+    q->buffer_size = lduw_be_p(cmd + 54);
+    /*
+     * A receive queue whose buffers hold nothing is not a queue, and a model
+     * that never read this field could not say so: a driver that omitted it
+     * entirely looked exactly like one that sent 2048, right up until it met
+     * an adapter that reported success and then never wrote a descriptor.
+     */
+    if (q->buffer_size == 0) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "gvnic: receive queue created with packet_buffer_size 0 "
+                      "at command offset 54; the device has been asked for "
+                      "buffers that hold nothing\n");
+        return GVNIC_ADMINQ_ERR_INVALID_ARGUMENT;
+    }
+    if (q->buffer_size > GVNIC_MAX_FRAME) {
+        return GVNIC_ADMINQ_ERR_INVALID_ARGUMENT;
+    }
+    if (!gvnic_ring_size_ok(q->ring_size, s->rx_queue_entries)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "gvnic: receive ring of %u entries refused; the device "
+                      "advertised %u and will not go below %u\n",
+                      q->ring_size, s->rx_queue_entries, GVNIC_RING_MIN);
+        return GVNIC_ADMINQ_ERR_INVALID_ARGUMENT;
+    }
     if (q->ring_size == 0) {
         q->ring_size = s->rx_queue_entries;
     }
@@ -578,6 +851,7 @@ static void gvnic_adminq_run(GvnicState *s)
 
         pci_dma_read(PCI_DEVICE(s), addr, cmd, sizeof(cmd));
         status = gvnic_adminq_execute(s, cmd);
+        gvnic_trace_adminq(s, cmd, status);
         stl_be_p(cmd + 4, status);
         pci_dma_write(PCI_DEVICE(s), addr + 4, cmd + 4, 4);
 
@@ -638,6 +912,16 @@ static void gvnic_bar0_write(void *opaque, hwaddr addr, uint64_t val,
     switch (addr) {
     case GVNIC_REG_DRIVER_STATUS:
         s->driver_status = v;
+        /*
+         * The base-address path says "run" here rather than by writing a page
+         * frame number, so this is where that path leaves reset -- and where
+         * clearing it puts the device back into it.
+         */
+        if (v & GVNIC_DRIVER_STATUS_RUN) {
+            s->device_status &= ~GVNIC_DEVICE_STATUS_RESET;
+        } else {
+            gvnic_reset_state(s);
+        }
         break;
     case GVNIC_REG_ADMINQ_PFN:
         /*
@@ -652,6 +936,8 @@ static void gvnic_bar0_write(void *opaque, hwaddr addr, uint64_t val,
             s->adminq_base_hi = (uint32_t)(((uint64_t)v << 12) >> 32);
             s->adminq_base_lo = (uint32_t)((uint64_t)v << 12);
             s->adminq_length = GVNIC_BAR0_SIZE;
+            /* Out of reset: the guest has given it somewhere to work. */
+            s->device_status &= ~GVNIC_DEVICE_STATUS_RESET;
         }
         break;
     case GVNIC_REG_ADMINQ_DOORBELL:
@@ -703,6 +989,12 @@ static void gvnic_bar2_write(void *opaque, hwaddr addr, uint64_t val,
         return;
     }
     s->doorbell[idx] = bswap32((uint32_t)val);
+
+    gvnic_tr(s, "DOORBELL %s[%u] = %u",
+             idx < s->num_ntfy ? "ntfy" :
+             (s->tx.active && idx == s->tx.db_index) ? "tx" :
+             (s->rx.active && idx == s->rx.db_index) ? "rx" : "?",
+             idx, s->doorbell[idx]);
 
     if (idx < s->num_ntfy) {
         /*
@@ -769,7 +1061,6 @@ static void gvnic_raise_irq(GvnicState *s, GvnicQueue *q)
 #define GVNIC_TXD_MTD           0x30
 
 #define GVNIC_TX_DESC_SIZE      16
-#define GVNIC_MAX_FRAME         (16 * 1024)
 
 static void gvnic_tx_bump_counter(GvnicState *s, uint32_t done)
 {
@@ -856,6 +1147,9 @@ static void gvnic_tx_run(GvnicState *s)
                          desc, sizeof(desc));
             seg_len = lduw_be_p(desc + 6);
             seg_addr = ldq_be_p(desc + 8);
+            gvnic_tr(s, "  TXSEG i=%u slot=%u type=0x%02x seg_len=%u "
+                        "qpl_off=0x%" PRIx64, i, slot, desc[0], seg_len,
+                     seg_addr);
 
             if (got + seg_len <= total &&
                 !gvnic_qpl_rw(s, qpl, seg_addr, frame + got, seg_len, false)) {
@@ -874,6 +1168,8 @@ static void gvnic_tx_run(GvnicState *s)
 
         GVNIC_TRACE("tx desc type=0x%02x cnt=%u total=%u got=%u",
                     type, cnt, total, got);
+        gvnic_tr(s, "TX slot=%u type=0x%02x cnt=%u total=%u got=%u",
+                 (unsigned)(q->head % q->ring_size), type, cnt, total, got);
         if (got > 0) {
             qemu_send_packet(qemu_get_queue(s->nic), frame, got);
         }
@@ -937,7 +1233,13 @@ static ssize_t gvnic_receive(NetClientState *nc, const uint8_t *buf,
     if (!q->active || q->ring_size == 0) {
         return -1;
     }
-    if (size + GVNIC_RX_PAD > GVNIC_MAX_FRAME) {
+    if (size + GVNIC_RX_PAD > GVNIC_MAX_FRAME ||
+        (q->buffer_size != 0 && size + GVNIC_RX_PAD > q->buffer_size)) {
+        /*
+         * Longer than the guest said a slot may hold. Dropped rather than
+         * written short, because a device that overruns the size it was given
+         * is a worse thing to model than one that loses a packet.
+         */
         return size;    /* dropped, but accepted from the network */
     }
     qpl = gvnic_qpl_find(s, q->qpl_id);
@@ -989,6 +1291,9 @@ static ssize_t gvnic_receive(NetClientState *nc, const uint8_t *buf,
                   q->desc_ring_addr + (uint64_t)slot * GVNIC_RX_DESC_SIZE,
                   desc, sizeof(desc));
 
+    gvnic_tr(s, "RX slot=%u qpl_off=0x%" PRIx64 " len=%zu seq=%u",
+             slot, slot_off, size, q->seqno & 0x7);
+
     q->head++;
     q->seqno++;
     if ((q->seqno & 0x7) == 0) {
@@ -1022,7 +1327,21 @@ static void gvnic_reset_state(GvnicState *s)
     memset(s->qpl, 0, sizeof(s->qpl));
     memset(&s->tx, 0, sizeof(s->tx));
     memset(&s->rx, 0, sizeof(s->rx));
-    s->device_status = GVNIC_DEVICE_STATUS_LINK_UP;
+    /*
+     * In reset, and saying so. A real adapter raises DEVICE_STATUS_RESET when
+     * it has let go of its admin queue and clears it once a new one is
+     * established, and a driver is entitled to wait for that -- waiting on
+     * ADMINQ_PFN alone returns instantly on a device that was never set up,
+     * which is not the same question and is how a guest ends up configuring
+     * resources on a device that has not reset.
+     *
+     * This model left the bit clear forever, so a driver that waits for it
+     * waits for its whole timeout against a device that is perfectly ready.
+     * Being less like the device than the device is costs as much as being
+     * more permissive than it.
+     */
+    s->device_status = GVNIC_DEVICE_STATUS_RESET |
+                       GVNIC_DEVICE_STATUS_LINK_UP;
 }
 
 static void gvnic_reset(DeviceState *dev)
@@ -1074,6 +1393,15 @@ static void gvnic_realize(PCIDevice *pci_dev, Error **errp)
         msix_vector_use(pci_dev, i);
     }
 
+    if (s->trace_path != NULL) {
+        s->tf = fopen(s->trace_path, "w");
+        if (s->tf == NULL) {
+            error_setg_errno(errp, errno, "gvnic: cannot open trace file %s",
+                             s->trace_path);
+            return;
+        }
+    }
+
     qemu_macaddr_default_if_unset(&s->conf.macaddr);
     s->nic = qemu_new_nic(&net_gvnic_info, &s->conf,
                           object_get_typename(OBJECT(s)), pci_dev->qdev.id,
@@ -1089,6 +1417,10 @@ static void gvnic_uninit(PCIDevice *pci_dev)
 
     qemu_del_nic(s->nic);
     msix_uninit_exclusive_bar(pci_dev);
+    if (s->tf != NULL) {
+        fclose(s->tf);
+        s->tf = NULL;
+    }
 }
 
 static const VMStateDescription vmstate_gvnic = {
@@ -1114,6 +1446,7 @@ static const Property gvnic_properties[] = {
     DEFINE_PROP_UINT16("tx-queue-entries", GvnicState, tx_queue_entries, 256),
     DEFINE_PROP_UINT16("rx-queue-entries", GvnicState, rx_queue_entries, 256),
     DEFINE_PROP_UINT16("tx-pages-per-qpl", GvnicState, tx_pages_per_qpl, 128),
+    DEFINE_PROP_STRING("trace", GvnicState, trace_path),
 };
 
 static void gvnic_class_init(ObjectClass *klass, const void *data)
