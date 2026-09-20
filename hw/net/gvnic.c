@@ -871,11 +871,20 @@ static uint64_t gvnic_bar0_read(void *opaque, hwaddr addr, unsigned size)
     case GVNIC_REG_DRIVER_STATUS:
         v = s->driver_status;
         break;
+    /*
+     * How many queues the device has room for, which is not how many it
+     * creates. Reporting one of each was convenient and wrong in a way that
+     * hid a whole class of bug: queue page list ids live in one namespace
+     * split at max_tx_queues, so a device advertising one transmit queue
+     * makes "receive's first page list" and "id 1" the same number, and a
+     * driver that hardcodes 1 is indistinguishable from one that computes it.
+     * A real adapter advertises considerably more.
+     */
     case GVNIC_REG_MAX_TX_QUEUES:
-        v = 1;
+        v = GVNIC_MAX_QUEUES;
         break;
     case GVNIC_REG_MAX_RX_QUEUES:
-        v = 1;
+        v = GVNIC_MAX_QUEUES;
         break;
     case GVNIC_REG_ADMINQ_PFN:
         v = s->adminq_pfn;
@@ -903,11 +912,46 @@ static uint64_t gvnic_bar0_read(void *opaque, hwaddr addr, unsigned size)
     return size == 4 ? bswap32(v) : v;
 }
 
+static const char *gvnic_reg_name(hwaddr addr)
+{
+    switch (addr) {
+    case GVNIC_REG_DEVICE_STATUS:   return "DEVICE_STATUS";
+    case GVNIC_REG_DRIVER_STATUS:   return "DRIVER_STATUS";
+    case GVNIC_REG_ADMINQ_PFN:      return "ADMINQ_PFN";
+    case GVNIC_REG_ADMINQ_DOORBELL: return "ADMINQ_DOORBELL";
+    case GVNIC_REG_ADMINQ_BASE_HI:  return "ADMINQ_BASE_HI";
+    case GVNIC_REG_ADMINQ_BASE_LO:  return "ADMINQ_BASE_LO";
+    case GVNIC_REG_ADMINQ_LENGTH:   return "ADMINQ_LENGTH";
+    case GVNIC_REG_DRIVER_VERSION:  return "DRIVER_VERSION";
+    default:                        return "?";
+    }
+}
+
 static void gvnic_bar0_write(void *opaque, hwaddr addr, uint64_t val,
                              unsigned size)
 {
     GvnicState *s = opaque;
     uint32_t v = size == 4 ? bswap32((uint32_t)val) : (uint32_t)val;
+
+    /*
+     * Register writes, not only admin commands.
+     *
+     * The first version of this trace covered the admin queue and the
+     * doorbells and stopped there, on the reasoning that the registers are a
+     * handful of well-understood words. That reasoning hid the one register a
+     * driver writes that is not a number: DRIVER_VERSION, which Google's
+     * driver fills a byte at a time with a version string before it does
+     * anything else. A trace that does not show it cannot show that another
+     * driver never wrote it.
+     */
+    if (addr == GVNIC_REG_DRIVER_VERSION) {
+        gvnic_tr(s, "REG %s <- '%c' (0x%02x)", gvnic_reg_name(addr),
+                 isprint((int)(uint8_t)val) ? (int)(uint8_t)val : '.',
+                 (unsigned)(uint8_t)val);
+    } else {
+        gvnic_tr(s, "REG %s(0x%02x) <- 0x%08x", gvnic_reg_name(addr),
+                 (unsigned)addr, v);
+    }
 
     switch (addr) {
     case GVNIC_REG_DRIVER_STATUS:
