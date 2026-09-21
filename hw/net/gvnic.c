@@ -28,6 +28,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/range.h"
 #include "qemu/units.h"
 #include "hw/pci/pci_device.h"
 #include "hw/pci/msix.h"
@@ -235,6 +236,8 @@ static int gvnic_trace_left = GVNIC_TRACE_MAX;
 
 static void gvnic_reset_state(GvnicState *s);
 static void gvnic_tx_run(GvnicState *s);
+static void gvnic_config_write(PCIDevice *dev, uint32_t addr,
+                               uint32_t val, int len);
 
 /* ---------------------------------------------------- differential trace */
 
@@ -1399,7 +1402,7 @@ static void gvnic_realize(PCIDevice *pci_dev, Error **errp)
     Error *local_err = NULL;
 
     pci_dev->config[PCI_INTERRUPT_PIN] = 0;
-    pci_dev->config_write = pci_default_write_config;
+    pci_dev->config_write = gvnic_config_write;
 
     memory_region_init_io(&s->bar0, OBJECT(s), &gvnic_bar0_ops, s,
                           "gvnic-regs", GVNIC_BAR0_SIZE);
@@ -1455,6 +1458,54 @@ static void gvnic_realize(PCIDevice *pci_dev, Error **errp)
     gvnic_reset_state(s);
 }
 
+/*
+ * Configuration writes, because two of them are fatal to a running device and
+ * this model used to absorb both in silence.
+ *
+ * Sizing a BAR is not a read. The architected method clears
+ * PCI_COMMAND_MEMORY, writes 0xffffffff over the base address, reads the mask
+ * back and restores both -- which is entirely safe on a device that has not
+ * been started, and is how every PCI enumerator in the world discovers a
+ * region's size.
+ *
+ * A gVNIC that is already running does not survive it. Withdraw its memory
+ * decode and overwrite its register base and it resets: admin queue page
+ * frame number back to zero, event counter back to zero, every queue
+ * forgotten -- within a quarter of a second, with no error anywhere and the
+ * link still reading up.
+ *
+ * A guest that sized these BARs after bringing the device up therefore saw
+ * every admin command succeed in tens of microseconds and then nothing ever
+ * happen again: no transmit completion, no receive descriptor, no statistics
+ * report. It cost a long time to find, because the model let it pass and a
+ * real instance did not.
+ */
+static void gvnic_config_write(PCIDevice *dev, uint32_t addr, uint32_t val,
+                               int len)
+{
+    GvnicState *s = GVNIC(dev);
+    bool running = (s->adminq_base_lo | s->adminq_base_hi) != 0;
+    uint16_t before = pci_get_word(dev->config + PCI_COMMAND);
+    uint16_t after;
+
+    pci_default_write_config(dev, addr, val, len);
+
+    if (!running) {
+        return;
+    }
+
+    after = pci_get_word(dev->config + PCI_COMMAND);
+    if (((before & PCI_COMMAND_MEMORY) && !(after & PCI_COMMAND_MEMORY)) ||
+        ranges_overlap(addr, len, PCI_BASE_ADDRESS_0, 24)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "gvnic: the guest withdrew memory decode or rewrote a "
+                      "BAR while the device was running; a real adapter "
+                      "resets here, and so does this. Size the BARs before "
+                      "starting the device\n");
+        gvnic_reset_state(s);
+    }
+}
+
 static void gvnic_uninit(PCIDevice *pci_dev)
 {
     GvnicState *s = GVNIC(pci_dev);
@@ -1500,6 +1551,7 @@ static void gvnic_class_init(ObjectClass *klass, const void *data)
 
     k->realize = gvnic_realize;
     k->exit = gvnic_uninit;
+    k->config_write = gvnic_config_write;
     k->vendor_id = PCI_VENDOR_ID_GOOGLE;
     k->device_id = PCI_DEVICE_ID_GVNIC;
     k->revision = 0;
