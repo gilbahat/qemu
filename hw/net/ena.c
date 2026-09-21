@@ -1451,9 +1451,48 @@ static NetClientInfo net_ena_info = {
 static void ena_config_write(PCIDevice *d, uint32_t addr, uint32_t val, int l)
 {
     EnaState *s = ENA(d);
+    bool running = (s->aq_base_lo | s->aq_base_hi) != 0;
+    uint16_t before = pci_get_word(d->config + PCI_COMMAND);
     uint16_t cmd;
 
     pci_default_write_config(d, addr, val, l);
+
+    /*
+     * Sizing a BAR on a device that is already running, which this model
+     * refuses even though a real ENA does not.
+     *
+     * The architected way to learn a BAR's size is to clear
+     * PCI_COMMAND_MEMORY, write 0xffffffff over the base address, read the
+     * mask back and restore both. On a device that has not been started that
+     * is harmless. On one that has, it withdraws the decode and overwrites
+     * the register base underneath a live driver.
+     *
+     * A real ENA tolerates it: bindings/ec2 sized its BARs after attaching
+     * for months and passed 20,000 pings on EC2 doing so. A real gVNIC does
+     * not -- it resets within a quarter of a second, silently, which cost a
+     * great deal of time to find precisely because hw/net/gvnic.c used to
+     * absorb it too.
+     *
+     * So this is deliberate strictness rather than emulation of observed
+     * behaviour, and it is worth being clear about which. That tolerance was
+     * measured on two instance types against one firmware; it is not a
+     * contract Amazon offers, and a driver that depends on it is depending on
+     * something nobody promised. Refusing here means a guest that satisfies
+     * this model satisfies the stricter device as well.
+     */
+    if (running &&
+        (((before & PCI_COMMAND_MEMORY) &&
+          !(pci_get_word(d->config + PCI_COMMAND) & PCI_COMMAND_MEMORY)) ||
+         ranges_overlap(addr, l, PCI_BASE_ADDRESS_0, 24))) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "ena: the guest withdrew memory decode or rewrote a BAR "
+                      "while the device was running. Real ENA tolerates this "
+                      "and this model does not, on purpose: size the BARs "
+                      "before starting the device\n");
+        ena_reset_state(s);
+        return;
+    }
+
     if (!s->firmware_bus_master || !ranges_overlap(addr, l, PCI_COMMAND, 2)) {
         return;
     }
