@@ -18,6 +18,12 @@
 #include "hw/virtio/virtio-nsm.h"
 #include "hw/virtio/cbor-helpers.h"
 #include "standard-headers/linux/virtio_ids.h"
+#ifdef CONFIG_GNUTLS
+#include <gnutls/gnutls.h>
+#include <gnutls/abstract.h>
+#include <gnutls/crypto.h>
+#include <gnutls/x509.h>
+#endif
 
 #define NSM_REQUEST_MAX_SIZE      0x1000
 #define NSM_RESPONSE_BUF_SIZE     0x3000
@@ -1039,7 +1045,7 @@ static enum NSMResponseTypes get_nsm_attestation_req(uint8_t *req, size_t len,
     return r;
 }
 
-static bool add_protected_header_to_cose(cbor_item_t *cose)
+static bool add_protected_header_to_cose(cbor_item_t *cose, bool signing)
 {
     cbor_item_t *map = NULL;
     cbor_item_t *key = NULL;
@@ -1063,8 +1069,11 @@ static bool add_protected_header_to_cose(cbor_item_t *cose)
         goto cleanup;
     }
     cbor_mark_negint(value);
-    /* we don't actually sign the data, so we use -1 as the 'alg' value */
-    cbor_set_uint8(value, 0);
+    /*
+     * Signing: ES384 (-35, encoded as negative integer 34).  Unsigned, -1,
+     * which names no algorithm, as upstream does.
+     */
+    cbor_set_uint8(value, signing ? 34 : 0);
 
     if (!qemu_cbor_map_add(map, key, value)) {
         goto cleanup;
@@ -1120,28 +1129,34 @@ static bool add_unprotected_header_to_cose(cbor_item_t *cose)
     return false;
 }
 
-static bool add_ca_bundle_to_payload(cbor_item_t *map)
+static bool add_ca_bundle_to_payload(VirtIONSM *vnsm, cbor_item_t *map)
 {
     cbor_item_t *key_cbor = NULL;
     cbor_item_t *value_cbor = NULL;
     cbor_item_t *bs = NULL;
     uint8_t zero[64] = {0};
+    guint n = vnsm->cabundle ? vnsm->cabundle->len : 0;
 
     key_cbor = cbor_build_string("cabundle");
     if (!key_cbor) {
         goto cleanup;
     }
-    value_cbor = cbor_new_definite_array(1);
+    value_cbor = cbor_new_definite_array(n ? n : 1);
     if (!value_cbor) {
         goto cleanup;
     }
-    bs = cbor_build_bytestring(zero, 64);
-    if (!bs) {
-        goto cleanup;
-    }
-    if (!qemu_cbor_array_push(value_cbor, bs)) {
-        cbor_decref(&bs);
-        goto cleanup;
+    for (guint i = 0; i < (n ? n : 1); i++) {
+        GByteArray *der = n ? g_ptr_array_index(vnsm->cabundle, i) : NULL;
+
+        bs = der ? cbor_build_bytestring(der->data, der->len)
+                 : cbor_build_bytestring(zero, 64);
+        if (!bs) {
+            goto cleanup;
+        }
+        if (!qemu_cbor_array_push(value_cbor, bs)) {
+            cbor_decref(&bs);
+            goto cleanup;
+        }
     }
     if (!qemu_cbor_map_add(map, key_cbor, value_cbor)) {
         goto cleanup;
@@ -1208,10 +1223,17 @@ static bool add_payload_to_cose(cbor_item_t *cose, VirtIONSM *vnsm,
             goto cleanup;
         }
     }
-    if (!qemu_cbor_add_bytestring_to_map(root, "certificate", zero, 64)) {
+    if (vnsm->certificate) {
+        if (!qemu_cbor_add_bytestring_to_map(root, "certificate",
+                                             vnsm->certificate->data,
+                                             vnsm->certificate->len)) {
+            goto cleanup;
+        }
+    } else if (!qemu_cbor_add_bytestring_to_map(root, "certificate", zero,
+                                                64)) {
         goto cleanup;
     }
-    if (!add_ca_bundle_to_payload(root)) {
+    if (!add_ca_bundle_to_payload(vnsm, root)) {
         goto cleanup;
     }
 
@@ -1268,13 +1290,273 @@ static bool add_payload_to_cose(cbor_item_t *cose, VirtIONSM *vnsm,
     return r;
 }
 
-static bool add_signature_to_cose(cbor_item_t *cose)
+/*
+ * Signing
+ *
+ * Upstream's device signs nothing: certificate, cabundle and signature are all
+ * zeros, so no verifier can tell its documents from anyone's.  Given a key and
+ * a certificate chain (signing-key, certificate, cabundle), this one signs the
+ * way the Nitro Security Module does -- COSE_Sign1, ES384, the leaf in the
+ * payload's "certificate" and its chain root first in "cabundle" -- so a
+ * relying party can verify it exactly as it verifies AWS's, against whatever
+ * root it is configured to trust.
+ *
+ * What that proves is only as good as who holds the key.  Here it is a lab
+ * key on the host running the emulator, which can also read and alter the
+ * enclave.  A relying party should trust such a root for identity and never
+ * for isolation, and a document signed by one is never AWS's.
+ */
+#ifdef CONFIG_GNUTLS
+static bool nsm_read_file(const char *path, gnutls_datum_t *out, Error **errp)
+{
+    gchar *contents;
+    gsize len;
+    GError *gerr = NULL;
+
+    if (!g_file_get_contents(path, &contents, &len, &gerr)) {
+        error_setg(errp, "virtio-nsm: reading %s: %s", path, gerr->message);
+        g_error_free(gerr);
+        return false;
+    }
+    out->data = (unsigned char *)contents;
+    out->size = len;
+    return true;
+}
+
+/* Every certificate in a PEM file, as DER, in file order. */
+static GPtrArray *nsm_load_certs(const char *path, Error **errp)
+{
+    gnutls_datum_t pem = { 0 };
+    gnutls_x509_crt_t *crts = NULL;
+    unsigned int n = 0;
+    GPtrArray *out = NULL;
+    int ret;
+
+    if (!nsm_read_file(path, &pem, errp)) {
+        return NULL;
+    }
+    ret = gnutls_x509_crt_list_import2(&crts, &n, &pem, GNUTLS_X509_FMT_PEM,
+                                       0);
+    g_free(pem.data);
+    if (ret < 0 || n == 0) {
+        error_setg(errp, "virtio-nsm: %s holds no PEM certificate: %s", path,
+                   ret < 0 ? gnutls_strerror(ret) : "empty");
+        return NULL;
+    }
+
+    out = g_ptr_array_new_with_free_func((GDestroyNotify)g_byte_array_unref);
+    for (unsigned int i = 0; i < n; i++) {
+        gnutls_datum_t der = { 0 };
+
+        ret = gnutls_x509_crt_export2(crts[i], GNUTLS_X509_FMT_DER, &der);
+        if (ret < 0) {
+            error_setg(errp, "virtio-nsm: exporting certificate %u of %s: %s",
+                       i, path, gnutls_strerror(ret));
+            g_ptr_array_unref(out);
+            out = NULL;
+            break;
+        }
+        g_ptr_array_add(out, g_byte_array_append(g_byte_array_new(),
+                                                 der.data, der.size));
+        gnutls_free(der.data);
+    }
+    for (unsigned int i = 0; i < n; i++) {
+        gnutls_x509_crt_deinit(crts[i]);
+    }
+    gnutls_free(crts);
+    return out;
+}
+
+static bool nsm_load_signer(VirtIONSM *vnsm, Error **errp)
+{
+    gnutls_datum_t pem = { 0 };
+    gnutls_privkey_t key = NULL;
+    gnutls_ecc_curve_t curve;
+    GPtrArray *leaf;
+    int ret;
+
+    if (!vnsm->signing_key_path && !vnsm->certificate_path &&
+        !vnsm->cabundle_path) {
+        return true;
+    }
+    if (!vnsm->signing_key_path || !vnsm->certificate_path) {
+        error_setg(errp, "virtio-nsm: signing needs both 'signing-key' and "
+                   "'certificate'");
+        return false;
+    }
+
+    if (!nsm_read_file(vnsm->signing_key_path, &pem, errp)) {
+        return false;
+    }
+    ret = gnutls_privkey_init(&key);
+    if (ret >= 0) {
+        ret = gnutls_privkey_import_x509_raw(key, &pem, GNUTLS_X509_FMT_PEM,
+                                             NULL, 0);
+    }
+    g_free(pem.data);
+    if (ret < 0) {
+        error_setg(errp, "virtio-nsm: loading %s: %s", vnsm->signing_key_path,
+                   gnutls_strerror(ret));
+        goto fail;
+    }
+    /* NSM signs ES384, and a verifier pins it; any other key is a mistake. */
+    if (gnutls_privkey_get_pk_algorithm(key, NULL) != GNUTLS_PK_ECDSA ||
+        gnutls_privkey_export_ecc_raw(key, &curve, NULL, NULL, NULL) < 0 ||
+        curve != GNUTLS_ECC_CURVE_SECP384R1) {
+        error_setg(errp, "virtio-nsm: %s is not a P-384 ECDSA key",
+                   vnsm->signing_key_path);
+        goto fail;
+    }
+
+    leaf = nsm_load_certs(vnsm->certificate_path, errp);
+    if (!leaf) {
+        goto fail;
+    }
+    if (leaf->len != 1) {
+        error_setg(errp, "virtio-nsm: %s must hold exactly the signing "
+                   "certificate; its chain goes in 'cabundle'",
+                   vnsm->certificate_path);
+        g_ptr_array_unref(leaf);
+        goto fail;
+    }
+    vnsm->certificate = g_byte_array_ref(g_ptr_array_index(leaf, 0));
+    g_ptr_array_unref(leaf);
+
+    if (vnsm->cabundle_path) {
+        vnsm->cabundle = nsm_load_certs(vnsm->cabundle_path, errp);
+        if (!vnsm->cabundle) {
+            goto fail;
+        }
+    } else {
+        vnsm->cabundle = g_ptr_array_new_with_free_func(
+            (GDestroyNotify)g_byte_array_unref);
+    }
+
+    vnsm->signing_key = key;
+    return true;
+
+fail:
+    if (key) {
+        gnutls_privkey_deinit(key);
+    }
+    return false;
+}
+
+static void nsm_free_signer(VirtIONSM *vnsm)
+{
+    if (vnsm->signing_key) {
+        gnutls_privkey_deinit(vnsm->signing_key);
+        vnsm->signing_key = NULL;
+    }
+    g_clear_pointer(&vnsm->certificate, g_byte_array_unref);
+    g_clear_pointer(&vnsm->cabundle, g_ptr_array_unref);
+}
+
+/* Left-pad a big-endian integer to exactly @width bytes. */
+static bool nsm_fixed_width(const gnutls_datum_t *in, uint8_t *out,
+                            size_t width)
+{
+    const unsigned char *p = in->data;
+    size_t n = in->size;
+
+    while (n > width && *p == 0) {
+        p++;
+        n--;
+    }
+    if (n > width) {
+        return false;
+    }
+    memset(out, 0, width - n);
+    memcpy(out + width - n, p, n);
+    return true;
+}
+
+/*
+ * ES384 over Sig_structure = ["Signature1", protected, h'', payload], as COSE
+ * carries it: r || s, 48 bytes each.
+ */
+static bool nsm_sign(VirtIONSM *vnsm, cbor_item_t *cose, uint8_t sig[96])
+{
+    cbor_item_t *protected = cbor_array_get(cose, 0);
+    cbor_item_t *payload = cbor_array_get(cose, 2);
+    cbor_item_t *structure = cbor_new_definite_array(4);
+    gnutls_datum_t data = { 0 }, der = { 0 }, r = { 0 }, s = { 0 };
+    size_t buf_len = 32768;
+    g_autofree uint8_t *buf = g_malloc(buf_len);
+    bool ok = false;
+
+    if (!protected || !payload || !structure) {
+        goto out;
+    }
+    if (!qemu_cbor_array_push(structure, cbor_build_string("Signature1")) ||
+        !qemu_cbor_array_push(structure, cbor_incref(protected)) ||
+        !qemu_cbor_array_push(structure, cbor_new_definite_bytestring()) ||
+        !qemu_cbor_array_push(structure, cbor_incref(payload))) {
+        goto out;
+    }
+    data.size = cbor_serialize(structure, buf, buf_len);
+    if (data.size == 0) {
+        goto out;
+    }
+    data.data = buf;
+
+    if (gnutls_privkey_sign_data2(vnsm->signing_key, GNUTLS_SIGN_ECDSA_SHA384,
+                                  0, &data, &der) < 0 ||
+        gnutls_decode_rs_value(&der, &r, &s) < 0) {
+        goto out;
+    }
+    ok = nsm_fixed_width(&r, sig, 48) && nsm_fixed_width(&s, sig + 48, 48);
+
+out:
+    gnutls_free(der.data);
+    gnutls_free(r.data);
+    gnutls_free(s.data);
+    if (structure) {
+        cbor_decref(&structure);
+    }
+    if (protected) {
+        cbor_decref(&protected);
+    }
+    if (payload) {
+        cbor_decref(&payload);
+    }
+    return ok;
+}
+#else
+static bool nsm_load_signer(VirtIONSM *vnsm, Error **errp)
+{
+    if (vnsm->signing_key_path || vnsm->certificate_path ||
+        vnsm->cabundle_path) {
+        error_setg(errp, "virtio-nsm: signing needs QEMU built with gnutls");
+        return false;
+    }
+    return true;
+}
+
+static void nsm_free_signer(VirtIONSM *vnsm)
+{
+}
+
+static bool nsm_sign(VirtIONSM *vnsm, cbor_item_t *cose, uint8_t sig[96])
+{
+    return false;
+}
+#endif
+
+static bool add_signature_to_cose(VirtIONSM *vnsm, cbor_item_t *cose)
 {
     cbor_item_t *bs = NULL;
-    uint8_t zero[64] = {0};
+    uint8_t sig[96] = {0};
 
-    /* we don't actually sign the data, so we just put 64 zero bytes */
-    bs = cbor_build_bytestring(zero, 64);
+    if (vnsm->signing_key) {
+        if (!nsm_sign(vnsm, cose, sig)) {
+            goto cleanup;
+        }
+        bs = cbor_build_bytestring(sig, sizeof(sig));
+    } else {
+        /* unsigned: 64 zero bytes, as upstream */
+        bs = cbor_build_bytestring(sig, 64);
+    }
     if (!bs) {
         goto cleanup;
     }
@@ -1380,7 +1662,7 @@ static bool handle_attestation(VirtIONSM *vnsm, struct iovec *request,
     if (!cose) {
         goto err;
     }
-    if (!add_protected_header_to_cose(cose)) {
+    if (!add_protected_header_to_cose(cose, vnsm->signing_key != NULL)) {
         goto err;
     }
     if (!add_unprotected_header_to_cose(cose)) {
@@ -1389,7 +1671,7 @@ static bool handle_attestation(VirtIONSM *vnsm, struct iovec *request,
     if (!add_payload_to_cose(cose, vnsm, nsm_req)) {
         goto err;
     }
-    if (!add_signature_to_cose(cose)) {
+    if (!add_signature_to_cose(vnsm, cose)) {
         goto err;
     }
 
@@ -1658,6 +1940,10 @@ static void virtio_nsm_device_realize(DeviceState *dev, Error **errp)
     vnsm->extend_pcr = extend_pcr;
     vnsm->lock_pcr = lock_pcr;
 
+    if (!nsm_load_signer(vnsm, errp)) {
+        return;
+    }
+
     virtio_init(vdev, VIRTIO_ID_NITRO_SEC_MOD, 0);
 
     vnsm->vq = virtio_add_queue(vdev, 2, handle_input);
@@ -1666,6 +1952,8 @@ static void virtio_nsm_device_realize(DeviceState *dev, Error **errp)
 static void virtio_nsm_device_unrealize(DeviceState *dev)
 {
     VirtIODevice *vdev = VIRTIO_DEVICE(dev);
+
+    nsm_free_signer(VIRTIO_NSM(dev));
 
     virtio_del_queue(vdev, 0);
     virtio_cleanup(vdev);
@@ -1706,6 +1994,9 @@ static const VMStateDescription vmstate_virtio_nsm = {
 
 static const Property virtio_nsm_properties[] = {
     DEFINE_PROP_STRING("module-id", VirtIONSM, module_id),
+    DEFINE_PROP_STRING("signing-key", VirtIONSM, signing_key_path),
+    DEFINE_PROP_STRING("certificate", VirtIONSM, certificate_path),
+    DEFINE_PROP_STRING("cabundle", VirtIONSM, cabundle_path),
 };
 
 static void virtio_nsm_class_init(ObjectClass *klass, const void *data)

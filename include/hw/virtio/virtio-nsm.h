@@ -42,6 +42,18 @@ struct VirtIONSM {
     uint8_t version_minor;
     uint8_t version_patch;
 
+    /*
+     * Lab signing (see virtio-nsm.c, "Signing").  Paths are properties; the
+     * rest is loaded from them at realize.  Unset, documents are unsigned as
+     * upstream's are.
+     */
+    char *signing_key_path;
+    char *certificate_path;
+    char *cabundle_path;
+    void *signing_key;              /* gnutls_privkey_t */
+    GByteArray *certificate;        /* DER */
+    GPtrArray *cabundle;            /* of GByteArray, DER, root first */
+
     bool (*extend_pcr)(VirtIONSM *vnsm, int ind, uint8_t *data, uint16_t len);
     void (*lock_pcr)(VirtIONSM *vnsm, int ind);
 };
