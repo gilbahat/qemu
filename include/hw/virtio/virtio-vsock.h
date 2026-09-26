@@ -66,6 +66,11 @@ typedef enum {
 
 typedef struct VirtIOVSockConn VirtIOVSockConn;
 
+typedef struct VirtIOVSockPortMap {
+    uint32_t guest_port;
+    uint32_t host_port;
+} VirtIOVSockPortMap;
+
 /* A packet queued for delivery to the guest through the rx virtqueue. */
 typedef struct VirtIOVSockPkt {
     struct virtio_vsock_hdr hdr;    /* host byte order; converted on delivery */
@@ -78,7 +83,8 @@ typedef struct VirtIOVSockPkt {
 /* One host-side listener, bound to the guest port it forwards to. */
 typedef struct VirtIOVSockListener {
     VirtIOVSock *vsock;
-    uint32_t port;
+    uint32_t port;                  /* the guest port calls are delivered to */
+    uint32_t host_port;             /* the host port listened on */
     QIONetListener *listener;
 } VirtIOVSockListener;
 
@@ -136,7 +142,11 @@ struct VirtIOVSock {
     uint64_t guest_cid;
     char *path;                     /* hybrid AF_UNIX backend */
     uint32_t forward_cid;           /* AF_VSOCK backend */
-    char *forward_listen;           /* '+'-separated host->guest ports */
+    char *forward_listen;           /* '+'-separated PORT or HOST:GUEST */
+    char *forward_connect;          /* '+'-separated GUEST:HOST */
+
+    VirtIOVSockPortMap *connect_map;
+    size_t nconnect_map;
 
     bool hybrid;                    /* path set: Firecracker hybrid protocol */
     bool started;

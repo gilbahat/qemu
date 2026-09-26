@@ -536,6 +536,57 @@ static SocketAddress *virtio_vsock_host_addr(VirtIOVSock *s, uint32_t port,
     return addr;
 }
 
+/*
+ * The host port a guest's call to @guest_port goes to.  forward-connect maps
+ * "guest:host" pairs so a guest whose ports are fixed -- baked into a measured
+ * image -- can reach host ports chosen at launch; an unmapped port goes to
+ * the same port on the host.
+ */
+static uint32_t virtio_vsock_connect_port(VirtIOVSock *s, uint32_t guest_port)
+{
+    size_t i;
+
+    for (i = 0; i < s->nconnect_map; i++) {
+        if (s->connect_map[i].guest_port == guest_port) {
+            return s->connect_map[i].host_port;
+        }
+    }
+
+    return guest_port;
+}
+
+/*
+ * Parse one "port" or "a:b" element of a forward-listen/forward-connect list.
+ * A single port maps to itself.
+ */
+static bool virtio_vsock_parse_pair(const char *prop, const char *elem,
+                                    uint32_t *first, uint32_t *second,
+                                    Error **errp)
+{
+    g_auto(GStrv) halves = g_strsplit(elem, ":", 3);
+    guint n = g_strv_length(halves);
+    uint64_t v[2];
+    guint i;
+
+    if (n < 1 || n > 2) {
+        goto bad;
+    }
+    for (i = 0; i < n; i++) {
+        if (qemu_strtou64(halves[i], NULL, 10, &v[i]) < 0 ||
+            v[i] == 0 || v[i] > UINT32_MAX) {
+            goto bad;
+        }
+    }
+    *first = v[0];
+    *second = n == 2 ? v[1] : v[0];
+    return true;
+
+bad:
+    error_setg(errp, "virtio-vsock: invalid %s element '%s' (want PORT or "
+               "PORT:PORT)", prop, elem);
+    return false;
+}
+
 /* ------------------------------------------------------------------ */
 /* Guest -> host: the tx virtqueue                                     */
 /* ------------------------------------------------------------------ */
@@ -574,7 +625,8 @@ static void virtio_vsock_connect_done(QIOTask *task, gpointer opaque)
 
     if (s->hybrid) {
         g_autofree char *line =
-            g_strdup_printf("CONNECT %u\n", conn->host_port);
+            g_strdup_printf("CONNECT %u\n",
+                            virtio_vsock_connect_port(s, conn->host_port));
 
         if (qio_channel_write_all(QIO_CHANNEL(conn->sioc), line, strlen(line),
                                   &err) < 0) {
@@ -623,7 +675,8 @@ static void virtio_vsock_do_connect(VirtIOVSock *s,
         goto reject;
     }
 
-    addr = virtio_vsock_host_addr(s, hdr->dst_port, false);
+    addr = virtio_vsock_host_addr(s, virtio_vsock_connect_port(s, hdr->dst_port),
+                                  false);
     sioc = qio_channel_socket_new();
 
     conn = virtio_vsock_conn_new(s, hdr->src_port, hdr->dst_port, sioc);
@@ -940,6 +993,11 @@ static bool virtio_vsock_listen(VirtIOVSock *s, Error **errp)
         return true;
     }
 
+    /*
+     * Each element is PORT, or HOST:GUEST to listen on one host port and
+     * deliver to a different guest port -- the launcher's port allocation
+     * meeting a guest whose listening port is fixed in its image.
+     */
     ports = g_strsplit(s->forward_listen, "+", -1);
     s->nlisteners = g_strv_length(ports);
     s->listeners = g_new0(VirtIOVSockListener *, s->nlisteners);
@@ -947,30 +1005,54 @@ static bool virtio_vsock_listen(VirtIOVSock *s, Error **errp)
     for (i = 0; i < s->nlisteners; i++) {
         g_autoptr(SocketAddress) addr = NULL;
         VirtIOVSockListener *l;
-        uint64_t port;
+        uint32_t host_port, guest_port;
 
-        if (qemu_strtou64(ports[i], NULL, 10, &port) < 0 ||
-            port == 0 || port > UINT32_MAX) {
-            error_setg(errp, "virtio-vsock: invalid forward-listen port '%s'",
-                       ports[i]);
+        if (!virtio_vsock_parse_pair("forward-listen", ports[i], &host_port,
+                                     &guest_port, errp)) {
             return false;
         }
 
         l = g_new0(VirtIOVSockListener, 1);
         l->vsock = s;
-        l->port = port;
+        l->port = guest_port;
+        l->host_port = host_port;
         l->listener = qio_net_listener_new();
         s->listeners[i] = l;
 
         qio_net_listener_set_name(l->listener, "virtio-vsock-listen");
 
-        addr = virtio_vsock_host_addr(s, l->port, true);
+        addr = virtio_vsock_host_addr(s, l->host_port, true);
         if (qio_net_listener_open_sync(l->listener, addr, 1, errp) < 0) {
             return false;
         }
 
         qio_net_listener_set_client_func(l->listener, virtio_vsock_accept,
                                          l, NULL);
+    }
+
+    return true;
+}
+
+/* forward-connect: '+'-separated GUEST:HOST pairs for guest-initiated calls. */
+static bool virtio_vsock_parse_connect_map(VirtIOVSock *s, Error **errp)
+{
+    g_auto(GStrv) pairs = NULL;
+    size_t i;
+
+    if (!s->forward_connect || !*s->forward_connect) {
+        return true;
+    }
+
+    pairs = g_strsplit(s->forward_connect, "+", -1);
+    s->nconnect_map = g_strv_length(pairs);
+    s->connect_map = g_new0(VirtIOVSockPortMap, s->nconnect_map);
+
+    for (i = 0; i < s->nconnect_map; i++) {
+        if (!virtio_vsock_parse_pair("forward-connect", pairs[i],
+                                     &s->connect_map[i].guest_port,
+                                     &s->connect_map[i].host_port, errp)) {
+            return false;
+        }
     }
 
     return true;
@@ -1094,6 +1176,10 @@ static void virtio_vsock_device_realize(DeviceState *dev, Error **errp)
     }
     s->hybrid = s->path != NULL;
 
+    if (!virtio_vsock_parse_connect_map(s, errp)) {
+        return;
+    }
+
     virtio_init(vdev, VIRTIO_ID_VSOCK, sizeof(struct virtio_vsock_config));
 
     s->recv_vq = virtio_add_queue(vdev, VIRTIO_VSOCK_QUEUE_SIZE,
@@ -1121,6 +1207,9 @@ static void virtio_vsock_device_unrealize(DeviceState *dev)
     s->accept_timer = NULL;
     g_hash_table_unref(s->conns);
     s->conns = NULL;
+    g_free(s->connect_map);
+    s->connect_map = NULL;
+    s->nconnect_map = 0;
 
     virtio_delete_queue(s->recv_vq);
     virtio_delete_queue(s->trans_vq);
@@ -1138,6 +1227,7 @@ static const Property virtio_vsock_properties[] = {
     DEFINE_PROP_STRING("path", VirtIOVSock, path),
     DEFINE_PROP_UINT32("forward-cid", VirtIOVSock, forward_cid, 0),
     DEFINE_PROP_STRING("forward-listen", VirtIOVSock, forward_listen),
+    DEFINE_PROP_STRING("forward-connect", VirtIOVSock, forward_connect),
 };
 
 static void virtio_vsock_class_init(ObjectClass *klass, const void *data)

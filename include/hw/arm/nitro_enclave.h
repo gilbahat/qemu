@@ -24,6 +24,8 @@
 #define NITRO_ENCLAVE_VSOCK_PATH "vsock-path"
 #define NITRO_ENCLAVE_VSOCK_CID "vsock-cid"
 #define NITRO_ENCLAVE_VSOCK_LISTEN "vsock-listen"
+#define NITRO_ENCLAVE_VSOCK_FORWARD_CID "vsock-forward-cid"
+#define NITRO_ENCLAVE_VSOCK_CONNECT "vsock-connect"
 #define NITRO_ENCLAVE_ID    "id"
 #define NITRO_ENCLAVE_PARENT_ROLE "parent-role"
 #define NITRO_ENCLAVE_PARENT_ID "parent-id"
@@ -44,8 +46,12 @@ struct NitroEnclaveMachineState {
     char *vsock_path;
     /* CID given to the built-in virtio-vsock device */
     uint32_t vsock_cid;
-    /* '+'-separated host->guest ports for the built-in device */
+    /* '+'-separated PORT or HOST:GUEST ports for the built-in device */
     char *vsock_listen;
+    /* Host AF_VSOCK CID the built-in device bridges to (instead of a path) */
+    uint32_t vsock_forward_cid;
+    /* '+'-separated GUEST:HOST port map for enclave-initiated calls */
+    char *vsock_connect;
     /* Enclave identifier */
     char *id;
     /* Parent instance IAM role ARN */

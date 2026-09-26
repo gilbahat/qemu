@@ -56,24 +56,32 @@ static BusState *find_free_virtio_mmio_bus(void)
  * external vhost-user daemon ('vsock=<chardev>') or by QEMU's own virtio-vsock
  * device ('vsock-path=<host socket>').  The built-in device needs no daemon and
  * nothing from the host kernel, which is what makes it work on hosts without
- * AF_VSOCK.
+ * AF_VSOCK.  Where the host does have AF_VSOCK, 'vsock-forward-cid=<cid>' has
+ * the built-in device bridge to it instead -- to CID 1, the host's loopback,
+ * the enclave's parent is whatever on this host listens on the port it dials.
+ *
+ * 'vsock-listen' and 'vsock-connect' translate ports, so an enclave whose ports
+ * are fixed in its measured image can be given host ports chosen at launch.
  */
 static void nitro_enclave_vsock_init(NitroEnclaveMachineState *nems)
 {
     DeviceState *dev;
     BusState *bus;
 
-    if (nems->vsock && nems->vsock_path) {
-        error_report("'vsock' and 'vsock-path' are mutually exclusive: the "
-                     "first uses an external vhost-user-vsock daemon, the "
-                     "second QEMU's built-in virtio-vsock device");
+    if (!!nems->vsock + !!nems->vsock_path + !!nems->vsock_forward_cid > 1) {
+        error_report("'vsock', 'vsock-path' and 'vsock-forward-cid' are "
+                     "mutually exclusive: the first uses an external "
+                     "vhost-user-vsock daemon, the others QEMU's built-in "
+                     "virtio-vsock device over a host socket path or host "
+                     "AF_VSOCK");
         exit(1);
     }
-    if (!nems->vsock && !nems->vsock_path) {
+    if (!nems->vsock && !nems->vsock_path && !nems->vsock_forward_cid) {
         error_report("A vsock device must be configured, either with the "
                      "'vsock' machine option (chardev id of a "
-                     "vhost-user-vsock daemon) or with 'vsock-path' (host "
-                     "socket path for the built-in virtio-vsock device)");
+                     "vhost-user-vsock daemon), with 'vsock-path' (host "
+                     "socket path for the built-in virtio-vsock device) or "
+                     "with 'vsock-forward-cid' (host AF_VSOCK)");
         exit(1);
     }
 
@@ -83,12 +91,19 @@ static void nitro_enclave_vsock_init(NitroEnclaveMachineState *nems)
         exit(1);
     }
 
-    if (nems->vsock_path) {
+    if (nems->vsock_path || nems->vsock_forward_cid) {
         dev = qdev_new(TYPE_VIRTIO_VSOCK);
         qdev_prop_set_uint64(dev, "guest-cid", nems->vsock_cid);
-        qdev_prop_set_string(dev, "path", nems->vsock_path);
+        if (nems->vsock_path) {
+            qdev_prop_set_string(dev, "path", nems->vsock_path);
+        } else {
+            qdev_prop_set_uint32(dev, "forward-cid", nems->vsock_forward_cid);
+        }
         if (nems->vsock_listen) {
             qdev_prop_set_string(dev, "forward-listen", nems->vsock_listen);
+        }
+        if (nems->vsock_connect) {
+            qdev_prop_set_string(dev, "forward-connect", nems->vsock_connect);
         }
     } else {
         Chardev *chardev = qemu_chr_find(nems->vsock);
@@ -366,6 +381,45 @@ static void nitro_enclave_set_vsock_listen(Object *obj, const char *value,
     nems->vsock_listen = g_strdup(value);
 }
 
+static void nitro_enclave_get_vsock_forward_cid(Object *obj, Visitor *v,
+                                                const char *name, void *opaque,
+                                                Error **errp)
+{
+    NitroEnclaveMachineState *nems = NITRO_ENCLAVE_MACHINE(obj);
+    uint32_t cid = nems->vsock_forward_cid;
+
+    visit_type_uint32(v, name, &cid, errp);
+}
+
+static void nitro_enclave_set_vsock_forward_cid(Object *obj, Visitor *v,
+                                                const char *name, void *opaque,
+                                                Error **errp)
+{
+    NitroEnclaveMachineState *nems = NITRO_ENCLAVE_MACHINE(obj);
+    uint32_t cid;
+
+    if (!visit_type_uint32(v, name, &cid, errp)) {
+        return;
+    }
+    nems->vsock_forward_cid = cid;
+}
+
+static char *nitro_enclave_get_vsock_connect(Object *obj, Error **errp)
+{
+    NitroEnclaveMachineState *nems = NITRO_ENCLAVE_MACHINE(obj);
+
+    return g_strdup(nems->vsock_connect);
+}
+
+static void nitro_enclave_set_vsock_connect(Object *obj, const char *value,
+                                            Error **errp)
+{
+    NitroEnclaveMachineState *nems = NITRO_ENCLAVE_MACHINE(obj);
+
+    g_free(nems->vsock_connect);
+    nems->vsock_connect = g_strdup(value);
+}
+
 static char *nitro_enclave_get_id(Object *obj, Error **errp)
 {
     NitroEnclaveMachineState *nems = NITRO_ENCLAVE_MACHINE(obj);
@@ -457,9 +511,24 @@ static void nitro_enclave_class_init(ObjectClass *oc, const void *data)
                                   nitro_enclave_get_vsock_listen,
                                   nitro_enclave_set_vsock_listen);
     object_class_property_set_description(oc, NITRO_ENCLAVE_VSOCK_LISTEN,
-                                          "'+'-separated enclave ports to "
-                                          "accept host connections on when "
-                                          "using 'vsock-path'");
+                                          "'+'-separated PORT or HOST:GUEST "
+                                          "ports to accept host connections "
+                                          "on with the built-in device");
+
+    object_class_property_add(oc, NITRO_ENCLAVE_VSOCK_FORWARD_CID, "uint32",
+                              nitro_enclave_get_vsock_forward_cid,
+                              nitro_enclave_set_vsock_forward_cid, NULL, NULL);
+    object_class_property_set_description(oc, NITRO_ENCLAVE_VSOCK_FORWARD_CID,
+                                          "Bridge the built-in virtio-vsock "
+                                          "device to this host AF_VSOCK CID "
+                                          "(alternative to 'vsock-path')");
+
+    object_class_property_add_str(oc, NITRO_ENCLAVE_VSOCK_CONNECT,
+                                  nitro_enclave_get_vsock_connect,
+                                  nitro_enclave_set_vsock_connect);
+    object_class_property_set_description(oc, NITRO_ENCLAVE_VSOCK_CONNECT,
+                                          "'+'-separated GUEST:HOST port map "
+                                          "for enclave-initiated connections");
 
     object_class_property_add_str(oc, NITRO_ENCLAVE_ID, nitro_enclave_get_id,
                                   nitro_enclave_set_id);
