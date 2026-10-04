@@ -2022,4 +2022,36 @@ void helper_tdcall(CPUX86State *env, int next_eip_addend)
     }
 }
 
+#else /* !TARGET_X86_64 */
+
+/*
+ * A TD is a 64-bit guest, so qemu-system-i386 has no TDX emulation.  The
+ * page walk and the vCPU setup are shared with x86_64, though, and call in
+ * here unconditionally: give them an emulation that is never enabled.
+ */
+void tdx_tcg_init(void)
+{
+}
+
+bool tdx_sept_enabled(CPUX86State *env)
+{
+    return false;
+}
+
+TdxSeptResult tdx_sept_check(CPUX86State *env, hwaddr gpa, bool shared)
+{
+    return TDX_SEPT_OK;
+}
+
+void tdx_sept_fault(CPUX86State *env, TdxSeptResult res, hwaddr gpa,
+                    bool shared, MMUAccessType access_type, uintptr_t ra)
+{
+    g_assert_not_reached();
+}
+
+bool tdx_sept_gpa_is_shared(CPUX86State *env, hwaddr gpa)
+{
+    return true;
+}
+
 #endif /* TARGET_X86_64 */
