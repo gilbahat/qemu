@@ -14,6 +14,9 @@ prog_run_with_input = find_program('./scripts/run_with_input.sh')
 prog_run_and_check_forbidden_output = find_program(
   './scripts/run_and_check_forbidden_output.sh'
 )
+prog_run_and_check_exit_status = find_program(
+  './scripts/run_and_check_exit_status.sh'
+)
 
 tcg_tests = {}
 # tcg_tests is a dictionary with following structure:

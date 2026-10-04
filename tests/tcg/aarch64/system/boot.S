@@ -14,6 +14,16 @@
  * x1 - semihosting parameter
  */
 #define semihosting_call hlt 0xf000
+
+/*
+ * PL011_CONSOLE: no semihosting, for accelerators that cannot trap HLT (HVF).
+ * Output goes to virt's PL011, the target EL is always the default, and _exit
+ * reports the status on the console and powers off through PSCI over SMC --
+ * the conduit an emulated CCA guest has, which is what these builds are for.
+ * The wrapper running the test judges it by that last line.
+ */
+#define VIRT_UART_BASE		0x09000000
+#define PSCI_SYSTEM_OFF		0x84000008
 #define SYS_WRITEC	0x03	/* character to debug channel */
 #define SYS_WRITE0	0x04	/* string to debug channel */
 #define SYS_GET_CMDLINE 0x15	/* get command line */
@@ -137,8 +147,17 @@ lower_a32_serror:
 generic_exception:
 	adr	x1, .unexp_excp
 exit_msg:
+#ifdef PL011_CONSOLE
+	mov	x19, x1
+1:	ldrb	w0, [x19], #1
+	cbz	w0, 2f
+	bl	__sys_outc
+	b	1b
+2:
+#else
 	mov	x0, SYS_WRITE0
 	semihosting_call
+#endif
 	mov	x0, 1 /* EXIT_FAILURE */
 	bl 	_exit
 	/* never returns */
@@ -150,6 +169,10 @@ exit_msg:
 	.string "Started in lower EL than requested.\n"
 .unexp_el0:
 	.string "Started in invalid EL.\n"
+#ifdef PL011_CONSOLE
+.exit_msg:
+	.string "exit status "
+#endif
 
 	.align 8
 .get_cmd:
@@ -176,6 +199,9 @@ __start:
 	 * end up with -kernel/-append data (see semihosting_arg_fallback).
 	 * Keep the normalised target in w11.
 	 */
+#ifdef PL011_CONSOLE
+	b	el_default
+#endif
 	mov	x0, SYS_GET_CMDLINE
 	adr	x1, .get_cmd
 	semihosting_call
@@ -350,6 +376,19 @@ at_testel:
 	orr	x1, x1, x3
 	str	x1, [x2]			/* 2nd 2mb (.data & .bss)*/
 
+#ifdef PL011_CONSOLE
+	/*
+	 * The low gigabyte, where virt puts its devices, as Device memory
+	 * (AttrIndx=1: MAIR_EL1 below leaves Attr1 as Device-nGnRnE), so
+	 * __sys_outc can reach the UART with translation on.
+	 */
+	adrp	x2, ttb
+	add	x2, x2, :lo12:ttb
+	/* AF, NX, block, Attr1 */
+	ldr	x1, =(3 << 53) | 0x401 | (1 << 2)
+	str	x1, [x2]
+#endif
+
 	/* Third block: at 'mte_page', set in kernel.ld */
 	adrp	x1, mte_page
 	add	x1, x1, :lo12:mte_page
@@ -426,6 +465,26 @@ at_testel:
 
 	/* pass return value to sys exit */
 _exit:
+#ifdef PL011_CONSOLE
+	mov	x20, x0
+	adr	x19, .exit_msg
+1:	ldrb	w0, [x19], #1
+	cbz	w0, 2f
+	bl	__sys_outc
+	b	1b
+2:	cmp	x20, #9
+	mov	x0, #'9'
+	add	x1, x20, #'0'
+	/* one digit: 9 stands for "9 or more" */
+	csel	x0, x0, x1, hi
+	bl	__sys_outc
+	mov	x0, #10			/* newline */
+	bl	__sys_outc
+	ldr	x0, =PSCI_SYSTEM_OFF
+	smc	#0
+3:	wfi
+	b	3b
+#else
 	mov    x1, x0
 	ldr    x0, =0x20026 /* ADP_Stopped_ApplicationExit */
 	stp    x0, x1, [sp, #-16]!
@@ -433,6 +492,7 @@ _exit:
 	mov    x0, SYS_EXIT
 	semihosting_call
 	/* never returns */
+#endif
 
 	/*
 	 * Helper Functions
@@ -441,6 +501,15 @@ _exit:
 	/* Output a single character to serial port */
 	.global __sys_outc
 __sys_outc:
+#ifdef PL011_CONSOLE
+	stp x1, x2, [sp, #-16]!
+	ldr x1, =VIRT_UART_BASE
+1:	ldr w2, [x1, #0x18]		/* UARTFR */
+	tbnz w2, #5, 1b			/* TXFF: wait for room */
+	strb w0, [x1]			/* UARTDR */
+	ldp x1, x2, [sp], #16
+	ret
+#else
 	stp x0, x1, [sp, #-16]!
 	/* pass address of c on stack */
 	mov x1, sp
@@ -448,6 +517,7 @@ __sys_outc:
 	semihosting_call
 	ldp x0, x1, [sp], #16
 	ret
+#endif
 
 	.data
 

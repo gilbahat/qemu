@@ -132,6 +132,36 @@ tests += {
                   qemu_base_args],
   },
 }
+
+# The same guests under HVF.  There is no semihosting there, so boot.S reports
+# on virt's PL011 instead (PL011_CONSOLE) and the wrapper reads the verdict.
+# HVF sizes the VM before -cpu is parsed, so the machine asks for the Realm.
+if host_os == 'darwin' and 'CONFIG_HVF' in config_all_accel
+  cca_hvf_args = ['-accel', 'hvf', '-display', 'none', '-nodefaults',
+                  '-serial', 'stdio']
+  cca_hvf_tests = {
+    'cca.c': {'cpu': 'host'},
+    'cca-attest.c': {'cpu': 'host'},
+    'cca-ripas.c': {'cpu': 'host,x-cca-ripas=1', 'log': true},
+    'cca-stage1.c': {'cpu': 'host,x-cca-ripas=1', 'log': true},
+    'cca-migrate.c': {'cpu': 'host,x-cca-ripas=1'},
+    'cca-dma.c': {'cpu': 'host,x-cca-ripas=1', 'machine': ',highmem-ecam=off',
+                  'args': ['-device', 'edu,dma_mask=0xffffffffffff']},
+  }
+  foreach src, t: cca_hvf_tests
+    tests += {
+      src: {
+        'exe_name': fs.stem(src) + '-hvf',
+        'cflags': [t.get('log', false) ? cca_log_cflags : cflags,
+                   '-DPL011_CONSOLE'],
+        'qemu_args': cca_hvf_args + t.get('args', []) +
+                     ['-M', 'virt,x-cca-guest=on' + t.get('machine', ''),
+                      '-cpu', t['cpu'], '-kernel'],
+        'wrapper': [prog_run_and_check_exit_status],
+      }
+    }
+  endforeach
+endif
 # --- end emulated CCA guest ---
 
 tests += {
