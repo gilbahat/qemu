@@ -20,7 +20,7 @@
 #include "hw/core/sysbus.h"
 #include "hw/core/eif.h"
 #include "hw/arm/virt.h"
-#include "hw/arm/machines-qom.h"
+#include "qemu/target-info.h"
 #include "hw/arm/nitro_enclave.h"
 #include "hw/virtio/virtio-mmio.h"
 #include "hw/virtio/virtio-nsm.h"
@@ -501,10 +501,8 @@ static const TypeInfo nitro_enclave_machine_info = {
     .class_init    = nitro_enclave_class_init,
     /*
      * 64-bit only; TYPE_HOTPLUG_HANDLER is inherited from TYPE_VIRT_MACHINE.
-     * The target-info interface makes the machine appear in
-     * qemu-system-aarch64.
      */
-    .interfaces = aarch64_machine_interfaces,
+    .is_available  = target_aarch64,
 };
 
 static void nitro_enclave_machine_init(void)
