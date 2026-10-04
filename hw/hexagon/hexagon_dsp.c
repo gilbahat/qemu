@@ -26,8 +26,12 @@
 #include "target/hexagon/internal.h"
 #include "system/physmem.h"
 #include "system/reset.h"
+#include "semihosting/semihost.h"
 
 #include "machine_cfg_v66g_1024.h.inc"
+#include "machine_cfg_v68n_1024.h.inc"
+#include "machine_cfg_v81dgb_1.h.inc"
+#include "machine_cfg_v81qa_1.h.inc"
 
 #define TYPE_HEXAGON_DSP_MACHINE "hexagon-dsp-machine"
 OBJECT_DECLARE_SIMPLE_TYPE(HexagonDspMachineState, HEXAGON_DSP_MACHINE)
@@ -124,6 +128,8 @@ static void hexagon_common_init(MachineState *machine, Rev_t rev,
         HexagonCPU *cpu = HEXAGON_CPU(object_new(machine->cpu_type));
         qemu_register_reset(do_cpu_reset, cpu);
 
+        qdev_prop_set_uint32(DEVICE(cpu), "htid", i);
+
         /*
          * CPU #0 is the only CPU running at boot, others must be
          * explicitly enabled via start instruction.
@@ -153,6 +159,7 @@ static void init_mc(MachineClass *mc)
     mc->no_serial = 1;
     mc->is_default = false;
     mc->max_cpus = 8;
+    qemu_semihosting_enable();
 }
 
 /* ----------------------------------------------------------------- */
@@ -177,6 +184,57 @@ static void v66g_1024_init(ObjectClass *oc, const void *data)
     mc->default_cpus = 4;
 }
 
+static void v68n_1024_config_init(MachineState *machine)
+{
+    hexagon_common_init(machine, v68_rev, &v68n_1024);
+}
+
+static void v68n_1024_init(ObjectClass *oc, const void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+
+    mc->desc = "Hexagon V68N_1024";
+    mc->init = v68n_1024_config_init;
+    init_mc(mc);
+    mc->default_cpu_type = TYPE_HEXAGON_CPU_V68;
+    mc->default_cpus = 6;
+}
+
+static void v81dgb_1_config_init(MachineState *machine)
+{
+    hexagon_common_init(machine, v81dgb_1_rev, &v81dgb_1);
+}
+
+static void v81dgb_1_init(ObjectClass *oc, const void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+
+    mc->desc = "Hexagon V81DGB_1";
+    mc->init = v81dgb_1_config_init;
+    init_mc(mc);
+    mc->default_cpu_type = TYPE_HEXAGON_CPU_V81;
+    mc->max_cpus = 12;
+    mc->default_cpus = 12;
+}
+
+static void v81qa_1_config_init(MachineState *machine)
+{
+    hexagon_common_init(machine, v81_rev, &v81qa_1);
+}
+
+static void v81qa_1_init(ObjectClass *oc, const void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+
+    mc->desc = "Hexagon V81QA_1";
+    mc->alias = "sim";
+    mc->init = v81qa_1_config_init;
+    init_mc(mc);
+    mc->default_cpu_type = TYPE_HEXAGON_CPU_V81;
+    mc->max_cpus = 12;
+    mc->default_cpus = 12;
+}
+
 static const TypeInfo hexagon_machine_types[] = {
     {
         .name = TYPE_HEXAGON_COMMON_MACHINE,
@@ -194,6 +252,21 @@ static const TypeInfo hexagon_machine_types[] = {
         .name = MACHINE_TYPE_NAME("V66G_1024"),
         .parent = TYPE_HEXAGON_DSP_MACHINE,
         .class_init = v66g_1024_init,
+    },
+    {
+        .name = MACHINE_TYPE_NAME("V68N_1024"),
+        .parent = TYPE_HEXAGON_DSP_MACHINE,
+        .class_init = v68n_1024_init,
+    },
+    {
+        .name = MACHINE_TYPE_NAME("V81DGB_1"),
+        .parent = TYPE_HEXAGON_DSP_MACHINE,
+        .class_init = v81dgb_1_init,
+    },
+    {
+        .name = MACHINE_TYPE_NAME("V81QA_1"),
+        .parent = TYPE_HEXAGON_DSP_MACHINE,
+        .class_init = v81qa_1_init,
     },
 };
 

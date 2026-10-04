@@ -159,7 +159,7 @@ static CPUArchId *x86_find_cpu_slot(MachineState *ms, uint32_t id, int *idx)
     return found_cpu;
 }
 
-void x86_cpu_plug(HotplugHandler *hotplug_dev,
+void x86_cpu_plug(const HotplugHandler *hotplug_dev,
                   DeviceState *dev, Error **errp)
 {
     CPUArchId *found_cpu;
@@ -200,7 +200,7 @@ out:
     error_propagate(errp, local_err);
 }
 
-void x86_cpu_unplug_request_cb(HotplugHandler *hotplug_dev,
+void x86_cpu_unplug_request_cb(const HotplugHandler *hotplug_dev,
                                DeviceState *dev, Error **errp)
 {
     int idx = -1;
@@ -223,7 +223,7 @@ void x86_cpu_unplug_request_cb(HotplugHandler *hotplug_dev,
                                    errp);
 }
 
-void x86_cpu_unplug_cb(HotplugHandler *hotplug_dev,
+void x86_cpu_unplug_cb(const HotplugHandler *hotplug_dev,
                        DeviceState *dev, Error **errp)
 {
     CPUArchId *found_cpu;
@@ -249,7 +249,7 @@ void x86_cpu_unplug_cb(HotplugHandler *hotplug_dev,
     error_propagate(errp, local_err);
 }
 
-void x86_cpu_pre_plug(HotplugHandler *hotplug_dev,
+void x86_cpu_pre_plug(const HotplugHandler *hotplug_dev,
                       DeviceState *dev, Error **errp)
 {
     int idx;
@@ -1041,9 +1041,9 @@ static void load_bios_from_file(X86MachineState *x86ms, const char *bios_name,
     ssize_t ret;
 
     /* BIOS load */
-    if (machine_require_guest_memfd(MACHINE(x86ms))) {
-        memory_region_init_ram_guest_memfd(&x86ms->bios, NULL, "pc.bios",
-                                           bios_size, &error_fatal);
+    if (machine_require_guest_memfd_private(MACHINE(x86ms))) {
+        memory_region_init_ram_guest_memfd_private(
+            &x86ms->bios, NULL, "pc.bios", bios_size, &error_fatal);
         if (is_tdx_vm()) {
             tdx_set_tdvf_region(&x86ms->bios);
         }
@@ -1111,7 +1111,7 @@ void x86_bios_rom_init(X86MachineState *x86ms, const char *default_firmware,
     bios_size = get_bios_size(x86ms, bios_name, filename);
     load_bios_from_file(x86ms, bios_name, filename, bios_size, isapc_ram_fw);
 
-    if (!machine_require_guest_memfd(MACHINE(x86ms))) {
+    if (!machine_require_guest_memfd_private(MACHINE(x86ms))) {
         /* map the last 128KB of the BIOS in ISA space */
         x86_isa_bios_init(&x86ms->isa_bios, rom_memory, &x86ms->bios,
                           !isapc_ram_fw);

@@ -264,6 +264,9 @@ struct CPUArchState {
 
     uint64_t pc;
     uint64_t load_res;
+#ifdef CONFIG_USER_ONLY
+    uint64_t load_res_size;
+#endif
     uint64_t load_val;
 
     /* Floating-Point state */
@@ -582,6 +585,8 @@ struct ArchCPU {
     /* Mapping of events to counters */
     GHashTable *pmu_event_ctr_map;
     GHashTable *user_options;
+    GHashTable *misa_ext_user_opts;
+    GHashTable *multi_ext_user_opts;
     const GPtrArray *decoders;
 };
 
@@ -646,7 +651,7 @@ int riscv_cpu_sirq_pending(CPURISCVState *env);
 int riscv_cpu_vsirq_pending(CPURISCVState *env);
 int riscv_cpu_pending_to_irq(CPURISCVState *env,
                              int extirq, unsigned int extirq_def_prio,
-                             uint64_t pending, uint8_t *iprio);
+                             uint64_t pending, const uint8_t *iprio);
 
 
 bool riscv_cpu_fp_enabled(CPURISCVState *env);

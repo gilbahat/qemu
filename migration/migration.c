@@ -260,6 +260,19 @@ migration_capabilities_and_transport_compatible(MigrationAddress *addr,
                                        errp);
     }
 
+    if (migrate_local() && migrate_mode() != MIG_MODE_CPR_EXEC &&
+        (addr->transport != MIGRATION_ADDRESS_TYPE_SOCKET ||
+         (addr->u.socket.type != SOCKET_ADDRESS_TYPE_UNIX &&
+          addr->u.socket.type != SOCKET_ADDRESS_TYPE_FD))) {
+        /*
+         * For SOCKET_ADDRESS_TYPE_FD we do check the fd itself later
+         * in migration_fd_valid().
+         */
+        error_setg(errp,
+                   "local migration requires a UNIX domain socket channel");
+        return false;
+    }
+
     return true;
 }
 
@@ -1330,7 +1343,7 @@ void migrate_set_state(MigrationStatus *state, MigrationStatus old_state,
     }
 }
 
-static void migration_cleanup_json_writer(MigrationState *s)
+void migration_cleanup_json_writer(MigrationState *s)
 {
     g_clear_pointer(&s->vmdesc, json_writer_free);
 }
@@ -4039,8 +4052,7 @@ static void migration_instance_finalize(Object *obj)
 {
     MigrationState *ms = MIGRATION(obj);
 
-    qapi_free_BitmapMigrationNodeAliasList(ms->parameters.block_bitmap_mapping);
-    qapi_free_strList(ms->parameters.cpr_exec_command);
+    migrate_params_free(&ms->parameters, NULL);
     qemu_mutex_destroy(&ms->error_mutex);
     qemu_mutex_destroy(&ms->qemu_file_lock);
     qemu_sem_destroy(&ms->wait_unplug_sem);

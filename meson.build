@@ -1,4 +1,4 @@
-project('qemu', ['c'], meson_version: '>=1.5.0',
+project('qemu', ['c'], meson_version: '>=1.6.0',
         default_options: ['warning_level=1', 'c_std=gnu11', 'cpp_std=gnu++23', 'b_colorout=auto',
                           'b_staticpic=false', 'stdsplit=false', 'optimization=2', 'b_pie=true'] +
 
@@ -745,6 +745,10 @@ warn_flags = [
   '-Wno-tautological-type-limit-compare',
   '-Wno-typedef-redefinition',
 ]
+
+if get_option('optimization') == 'g'
+  warn_flags += ['-Wno-error=maybe-uninitialized']
+endif
 
 if host_os != 'darwin'
   tsa_has_cleanup = cc.compiles('''
@@ -4255,6 +4259,15 @@ if host_os == 'darwin'
 endif
 
 traceable = []
+multi_target_libs = []
+multi_target_deps = []
+multi_target_crates = []
+multi_target_supported_targets = [
+  'aarch64-softmmu',
+  'arm-softmmu',
+  'microblaze-softmmu',
+]
+
 emulators = {}
 foreach target : target_dirs
   config_target = config_target_mak[target]
@@ -4410,6 +4423,12 @@ foreach target : target_dirs
                  build_by_default: false)
 
   if target.endswith('-softmmu')
+    if target in multi_target_supported_targets
+      multi_target_libs += lib
+      multi_target_deps += arch_deps
+      multi_target_deps += target_stubs
+      multi_target_crates += main_rs
+    endif
     execs = [{
       'name': 'qemu-system-' + target_name,
       'win_subsystem': 'console',
@@ -4492,6 +4511,14 @@ foreach target : target_dirs
 endforeach
 
 # Other build targets
+
+multi_target_objects = []
+foreach lib: multi_target_libs
+  multi_target_objects += lib.extract_all_objects(recursive: true)
+endforeach
+
+multi_target_link_args = emulator_link_args
+multi_target_link_args += enable_modules ? ['@block.syms', '@qemu.syms'] : []
 
 if get_option('plugins')
   install_headers('include/plugins/qemu-plugin.h')
@@ -4610,7 +4637,8 @@ subdir('docs')
 subdir('pyvenv')
 # Tests are disabled on emscripten because they rely on host features that aren't
 # supported by emscripten (e.g. fork and unix socket).
-if host_os != 'emscripten'
+tcg_tests_summary = {}
+if get_option('tests').allowed() and host_os != 'emscripten'
   subdir('tests')
 endif
 if gtk.found()
@@ -4797,21 +4825,9 @@ summary_info += {'sparse':            sparse}
 summary_info += {'mingw32 support':   host_os == 'windows'}
 summary(summary_info, bool_yn: true, section: 'Compilation')
 
-# snarf the cross-compilation information for tests
-summary_info = {}
-have_cross = false
-foreach target: target_dirs
-  tcg_mak = meson.current_build_dir() / 'tests/tcg' / target / 'config-target.mak'
-  if fs.exists(tcg_mak)
-    config_cross_tcg = keyval.load(tcg_mak)
-    if 'CC' in config_cross_tcg
-      summary_info += {config_cross_tcg['TARGET_NAME']: config_cross_tcg['CC']}
-      have_cross = true
-    endif
-  endif
-endforeach
-if have_cross
-  summary(summary_info, bool_yn: true, section: 'Cross compilers')
+# TCG tests configuration
+if tcg_tests_summary != {}
+  summary(tcg_tests_summary, bool_yn: true, section: 'TCG tests')
 endif
 
 # Targets and accelerators
@@ -5069,4 +5085,10 @@ if not actually_reloc and (host_os == 'windows' or get_option('relocatable'))
   message()
   message('QEMU will have to be installed under ' + get_option('prefix') + '.')
   message('Use --disable-relocatable to remove this warning.')
+endif
+
+if get_option('crypto_afalg').enabled()
+    warning('Use of the AF_ALG crypto backend is deprecated, ' +
+            'since Linux 7.2 has deprecated the AF_ALG interface ' +
+            'and removed its ability to use hardware accelerators.')
 endif

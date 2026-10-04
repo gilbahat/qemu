@@ -307,6 +307,7 @@ config ALLWINNER_A10
     select ALLWINNER_EMAC
     select ALLWINNER_I2C
     select ALLWINNER_A10_SPI
+    select ALLWINNER_GPIO
     select AXP2XX_PMU
     select SERIAL_MM
     select UNIMP
@@ -532,6 +533,7 @@ config ASPEED_SOC
     imply GENERIC_LOADER
     imply PCI_DEVICES
     imply E1000E_PCI_EXPRESS
+    select ASPEED_UDC
     select DS1338
     select FTGMAC100
     select I2C

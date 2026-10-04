@@ -2197,6 +2197,16 @@ typedef struct CPUArchState {
 
     /* exception/interrupt handling */
     int error_code;
+#ifdef CONFIG_USER_ONLY
+    /*
+     * The number of the last cpu exception taken by this thread, mirroring
+     * linux's thread.trap_nr, which is what the kernel reports in
+     * sigcontext.trapno.  CPUState::exception_index cannot be used for this:
+     * cpu_exec() resets it before returning, long before the signal frame is
+     * built during delivery.
+     */
+    int trap_nr;
+#endif
     int exception_is_int;
     target_ulong exception_next_eip;
     target_ulong dr[8]; /* debug registers; note dr4 and dr5 are unused */
@@ -2658,7 +2668,7 @@ void x86_cpu_gdb_init(CPUState *cs);
 int cpu_x86_support_mca_broadcast(CPUX86State *env);
 
 #ifndef CONFIG_USER_ONLY
-int x86_cpu_pending_interrupt(CPUState *cs, int interrupt_request);
+int x86_cpu_pending_interrupt(const CPUState *cs, int interrupt_request);
 
 bool x86_cpu_translate_for_debug(CPUState *cpu, vaddr addr,
                                  TranslateForDebugResult *result);
@@ -2783,6 +2793,8 @@ int cpu_x86_get_descr_debug(CPUX86State *env, unsigned int selector,
  */
 void cpu_x86_load_seg(CPUX86State *s, X86Seg seg_reg, int selector);
 void cpu_x86_fsave(CPUX86State *s, void *host, size_t len);
+/* As cpu_x86_fsave(), but leaving the FPU state undisturbed. */
+void cpu_x86_fsave_noinit(CPUX86State *s, void *host, size_t len);
 void cpu_x86_frstor(CPUX86State *s, void *host, size_t len);
 void cpu_x86_fxsave(CPUX86State *s, void *host, size_t len);
 void cpu_x86_fxrstor(CPUX86State *s, void *host, size_t len);
@@ -3170,7 +3182,7 @@ static inline bool ctl_has_irq(CPUX86State *env)
     return (env->int_ctl & V_IRQ_MASK) && (int_prio >= tpr);
 }
 
-static inline bool x86_cpu_interrupts_enabled(CPUX86State *env)
+static inline bool x86_cpu_interrupts_enabled(const CPUX86State *env)
 {
     return ((env->eflags & IF_MASK) &&
             !(env->hflags & HF_INHIBIT_IRQ_MASK)) ||

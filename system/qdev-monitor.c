@@ -166,6 +166,9 @@ static void qdev_print_devinfo(DeviceClass *dc)
     if (!dc->user_creatable) {
         qemu_printf(", no-user");
     }
+    if (object_class_is_secure(OBJECT_CLASS(dc))) {
+        qemu_printf(", secure");
+    }
     qemu_printf("\n");
 }
 
@@ -672,6 +675,10 @@ DeviceState *qdev_device_add_from_qdict(const QDict *opts,
         return NULL;
     }
 
+    if (!object_class_check_security(OBJECT_CLASS(dc), errp)) {
+        return NULL;
+    }
+
     /* find bus */
     path = qdict_get_try_str(opts, "bus");
     if (path != NULL) {
@@ -917,8 +924,8 @@ static DeviceState *find_device_state(const char *id, bool use_generic_error,
 
 void qdev_unplug(DeviceState *dev, Error **errp)
 {
-    HotplugHandler *hotplug_ctrl;
-    HotplugHandlerClass *hdc;
+    const HotplugHandler *hotplug_ctrl;
+    const HotplugHandlerClass *hdc;
     Error *local_err = NULL;
 
     if (!qdev_hotunplug_allowed(dev, errp)) {

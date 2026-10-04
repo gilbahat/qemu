@@ -3653,7 +3653,7 @@ static void spapr_add_lmbs(DeviceState *dev, uint64_t addr_start, uint64_t size,
     }
 }
 
-static void spapr_memory_plug(HotplugHandler *hotplug_dev, DeviceState *dev)
+static void spapr_memory_plug(const HotplugHandler *hotplug_dev, DeviceState *dev)
 {
     SpaprMachineState *ms = SPAPR_MACHINE(hotplug_dev);
     PCDIMMDevice *dimm = PC_DIMM(dev);
@@ -3679,7 +3679,7 @@ static void spapr_memory_plug(HotplugHandler *hotplug_dev, DeviceState *dev)
     }
 }
 
-static void spapr_memory_pre_plug(HotplugHandler *hotplug_dev, DeviceState *dev,
+static void spapr_memory_pre_plug(const HotplugHandler *hotplug_dev, DeviceState *dev,
                                   Error **errp)
 {
     SpaprMachineState *spapr = SPAPR_MACHINE(hotplug_dev);
@@ -3844,7 +3844,7 @@ void spapr_memory_unplug_rollback(SpaprMachineState *spapr, DeviceState *dev)
 /* Callback to be called during DRC release. */
 void spapr_lmb_release(DeviceState *dev)
 {
-    HotplugHandler *hotplug_ctrl = qdev_get_hotplug_handler(dev);
+    const HotplugHandler *hotplug_ctrl = qdev_get_hotplug_handler(dev);
     SpaprMachineState *spapr = SPAPR_MACHINE(hotplug_ctrl);
     SpaprDimmState *ds = spapr_pending_dimm_unplugs_find(spapr, PC_DIMM(dev));
 
@@ -3869,7 +3869,7 @@ void spapr_lmb_release(DeviceState *dev)
     object_unparent(OBJECT(dev));
 }
 
-static void spapr_memory_unplug(HotplugHandler *hotplug_dev, DeviceState *dev)
+static void spapr_memory_unplug(const HotplugHandler *hotplug_dev, DeviceState *dev)
 {
     SpaprMachineState *spapr = SPAPR_MACHINE(hotplug_dev);
     SpaprDimmState *ds = spapr_pending_dimm_unplugs_find(spapr, PC_DIMM(dev));
@@ -3882,7 +3882,7 @@ static void spapr_memory_unplug(HotplugHandler *hotplug_dev, DeviceState *dev)
     spapr_pending_dimm_unplugs_remove(spapr, ds);
 }
 
-static void spapr_memory_unplug_request(HotplugHandler *hotplug_dev,
+static void spapr_memory_unplug_request(const HotplugHandler *hotplug_dev,
                                         DeviceState *dev, Error **errp)
 {
     SpaprMachineState *spapr = SPAPR_MACHINE(hotplug_dev);
@@ -3936,14 +3936,14 @@ static void spapr_memory_unplug_request(HotplugHandler *hotplug_dev,
 /* Callback to be called during DRC release. */
 void spapr_core_release(DeviceState *dev)
 {
-    HotplugHandler *hotplug_ctrl = qdev_get_hotplug_handler(dev);
+    const HotplugHandler *hotplug_ctrl = qdev_get_hotplug_handler(dev);
 
     /* Call the unplug handler chain. This can never fail. */
     hotplug_handler_unplug(hotplug_ctrl, dev, &error_abort);
     object_unparent(OBJECT(dev));
 }
 
-static void spapr_core_unplug(HotplugHandler *hotplug_dev, DeviceState *dev)
+static void spapr_core_unplug(const HotplugHandler *hotplug_dev, DeviceState *dev)
 {
     MachineState *ms = MACHINE(hotplug_dev);
     CPUCore *cc = CPU_CORE(dev);
@@ -3955,7 +3955,7 @@ static void spapr_core_unplug(HotplugHandler *hotplug_dev, DeviceState *dev)
 }
 
 static
-void spapr_core_unplug_request(HotplugHandler *hotplug_dev, DeviceState *dev,
+void spapr_core_unplug_request(const HotplugHandler *hotplug_dev, DeviceState *dev,
                                Error **errp)
 {
     SpaprMachineState *spapr = SPAPR_MACHINE(OBJECT(hotplug_dev));
@@ -4025,7 +4025,7 @@ int spapr_core_dt_populate(SpaprDrc *drc, SpaprMachineState *spapr,
     return 0;
 }
 
-static void spapr_core_plug(HotplugHandler *hotplug_dev, DeviceState *dev)
+static void spapr_core_plug(const HotplugHandler *hotplug_dev, DeviceState *dev)
 {
     SpaprMachineState *spapr = SPAPR_MACHINE(OBJECT(hotplug_dev));
     MachineClass *mc = MACHINE_GET_CLASS(spapr);
@@ -4080,7 +4080,7 @@ static void spapr_core_plug(HotplugHandler *hotplug_dev, DeviceState *dev)
 
 }
 
-static void spapr_core_pre_plug(HotplugHandler *hotplug_dev, DeviceState *dev,
+static void spapr_core_pre_plug(const HotplugHandler *hotplug_dev, DeviceState *dev,
                                 Error **errp)
 {
     MachineState *machine = MACHINE(OBJECT(hotplug_dev));
@@ -4206,7 +4206,7 @@ static bool spapr_phb_placement(SpaprMachineState *spapr, uint32_t index,
     return true;
 }
 
-static bool spapr_phb_pre_plug(HotplugHandler *hotplug_dev, DeviceState *dev,
+static bool spapr_phb_pre_plug(const HotplugHandler *hotplug_dev, DeviceState *dev,
                                Error **errp)
 {
     SpaprMachineState *spapr = SPAPR_MACHINE(OBJECT(hotplug_dev));
@@ -4235,7 +4235,7 @@ static bool spapr_phb_pre_plug(HotplugHandler *hotplug_dev, DeviceState *dev,
                                windows_supported, sphb->dma_liobn, errp);
 }
 
-static void spapr_phb_plug(HotplugHandler *hotplug_dev, DeviceState *dev)
+static void spapr_phb_plug(const HotplugHandler *hotplug_dev, DeviceState *dev)
 {
     SpaprPhbState *sphb = SPAPR_PCI_HOST_BRIDGE(dev);
     SpaprDrc *drc;
@@ -4257,18 +4257,18 @@ static void spapr_phb_plug(HotplugHandler *hotplug_dev, DeviceState *dev)
 
 void spapr_phb_release(DeviceState *dev)
 {
-    HotplugHandler *hotplug_ctrl = qdev_get_hotplug_handler(dev);
+    const HotplugHandler *hotplug_ctrl = qdev_get_hotplug_handler(dev);
 
     hotplug_handler_unplug(hotplug_ctrl, dev, &error_abort);
     object_unparent(OBJECT(dev));
 }
 
-static void spapr_phb_unplug(HotplugHandler *hotplug_dev, DeviceState *dev)
+static void spapr_phb_unplug(const HotplugHandler *hotplug_dev, DeviceState *dev)
 {
     qdev_unrealize(dev);
 }
 
-static void spapr_phb_unplug_request(HotplugHandler *hotplug_dev,
+static void spapr_phb_unplug_request(const HotplugHandler *hotplug_dev,
                                      DeviceState *dev, Error **errp)
 {
     SpaprPhbState *sphb = SPAPR_PCI_HOST_BRIDGE(dev);
@@ -4288,7 +4288,7 @@ static void spapr_phb_unplug_request(HotplugHandler *hotplug_dev,
 }
 
 static
-bool spapr_tpm_proxy_pre_plug(HotplugHandler *hotplug_dev, DeviceState *dev,
+bool spapr_tpm_proxy_pre_plug(const HotplugHandler *hotplug_dev, DeviceState *dev,
                               Error **errp)
 {
     SpaprMachineState *spapr = SPAPR_MACHINE(OBJECT(hotplug_dev));
@@ -4301,7 +4301,7 @@ bool spapr_tpm_proxy_pre_plug(HotplugHandler *hotplug_dev, DeviceState *dev,
     return true;
 }
 
-static void spapr_tpm_proxy_plug(HotplugHandler *hotplug_dev, DeviceState *dev)
+static void spapr_tpm_proxy_plug(const HotplugHandler *hotplug_dev, DeviceState *dev)
 {
     SpaprMachineState *spapr = SPAPR_MACHINE(OBJECT(hotplug_dev));
     SpaprTpmProxy *tpm_proxy = SPAPR_TPM_PROXY(dev);
@@ -4312,7 +4312,7 @@ static void spapr_tpm_proxy_plug(HotplugHandler *hotplug_dev, DeviceState *dev)
     spapr->tpm_proxy = tpm_proxy;
 }
 
-static void spapr_tpm_proxy_unplug(HotplugHandler *hotplug_dev, DeviceState *dev)
+static void spapr_tpm_proxy_unplug(const HotplugHandler *hotplug_dev, DeviceState *dev)
 {
     SpaprMachineState *spapr = SPAPR_MACHINE(OBJECT(hotplug_dev));
 
@@ -4321,7 +4321,7 @@ static void spapr_tpm_proxy_unplug(HotplugHandler *hotplug_dev, DeviceState *dev
     spapr->tpm_proxy = NULL;
 }
 
-static void spapr_machine_device_plug(HotplugHandler *hotplug_dev,
+static void spapr_machine_device_plug(const HotplugHandler *hotplug_dev,
                                       DeviceState *dev, Error **errp)
 {
     if (object_dynamic_cast(OBJECT(dev), TYPE_PC_DIMM)) {
@@ -4335,7 +4335,7 @@ static void spapr_machine_device_plug(HotplugHandler *hotplug_dev,
     }
 }
 
-static void spapr_machine_device_unplug(HotplugHandler *hotplug_dev,
+static void spapr_machine_device_unplug(const HotplugHandler *hotplug_dev,
                                         DeviceState *dev, Error **errp)
 {
     if (object_dynamic_cast(OBJECT(dev), TYPE_PC_DIMM)) {
@@ -4361,7 +4361,7 @@ bool spapr_memory_hot_unplug_supported(SpaprMachineState *spapr)
         spapr_ovec_empty(spapr->ov5_cas);
 }
 
-static void spapr_machine_device_unplug_request(HotplugHandler *hotplug_dev,
+static void spapr_machine_device_unplug_request(const HotplugHandler *hotplug_dev,
                                                 DeviceState *dev, Error **errp)
 {
     SpaprMachineState *sms = SPAPR_MACHINE(OBJECT(hotplug_dev));
@@ -4386,7 +4386,7 @@ static void spapr_machine_device_unplug_request(HotplugHandler *hotplug_dev,
     }
 }
 
-static void spapr_machine_device_pre_plug(HotplugHandler *hotplug_dev,
+static void spapr_machine_device_pre_plug(const HotplugHandler *hotplug_dev,
                                           DeviceState *dev, Error **errp)
 {
     if (object_dynamic_cast(OBJECT(dev), TYPE_PC_DIMM)) {
@@ -4400,8 +4400,8 @@ static void spapr_machine_device_pre_plug(HotplugHandler *hotplug_dev,
     }
 }
 
-static HotplugHandler *spapr_get_hotplug_handler(MachineState *machine,
-                                                 DeviceState *dev)
+static const HotplugHandler *spapr_get_hotplug_handler(MachineState *machine,
+                                                       DeviceState *dev)
 {
     if (object_dynamic_cast(OBJECT(dev), TYPE_PC_DIMM) ||
         object_dynamic_cast(OBJECT(dev), TYPE_SPAPR_CPU_CORE) ||
