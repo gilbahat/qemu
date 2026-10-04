@@ -2441,12 +2441,15 @@ static void arm_cpu_realizefn(DeviceState *dev, Error **errp)
         }
         if (hvf_enabled()) {
             /*
-             * Page states are tracked but not yet enforced on the guest's
-             * own accesses under HVF: that needs stage 2 to follow them.
+             * Page states are enforced in stage 2 under HVF, and RSI granules
+             * are 4KiB: a coarser stage 2 would deny a granule's neighbours
+             * with it.  The granule is fixed when the VM is created, which
+             * -M virt,x-cca-guest=on asks for on hosts that have it.
              */
-            if (cpu->cca_ripas) {
-                error_setg(errp, "x-cca-ripas is not yet supported under "
-                           "HVF; use x-cca-ripas=0");
+            if (cpu->cca_ripas && !hvf_ipa_granule_is_4k()) {
+                error_setg(errp, "x-cca-ripas under HVF needs a 4KiB stage-2 "
+                           "granule, which this host did not provide "
+                           "(macOS 26 or later); use x-cca-ripas=0");
                 return;
             }
             /* A Realm runs at EL1; there is no EL2 for it to boot into */

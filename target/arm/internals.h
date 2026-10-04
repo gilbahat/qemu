@@ -760,6 +760,9 @@ typedef struct ArmCcaAccelOps {
 
 extern const ArmCcaAccelOps arm_cca_tcg_ops;
 
+/* For an accelerator that cannot be named from target/arm/cca.c */
+void arm_cca_set_accel_ops(const ArmCcaAccelOps *ops);
+
 /* Add the x-cca-* properties to a CPU that can run as an emulated CCA guest */
 void aarch64_add_cca_properties(Object *obj);
 

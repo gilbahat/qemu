@@ -12,6 +12,7 @@
 #include "qemu/osdep.h"
 #include "qemu/error-report.h"
 #include "qemu/log.h"
+#include "qemu/units.h"
 
 #include "system/runstate.h"
 #include "system/hvf.h"
@@ -1332,6 +1333,18 @@ hv_return_t hvf_arch_vm_create(MachineState *ms, uint32_t pa_range)
     }
     chosen_ipa_bit_size = pa_range;
 
+#if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && \
+    __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
+    if (hvf_want_4k_ipa_granule && qemu_real_host_page_size() > 4 * KiB) {
+        if (__builtin_available(macOS 26.0, *)) {
+            if (hv_vm_config_set_ipa_granule(config, HV_IPA_GRANULE_4KB) ==
+                HV_SUCCESS) {
+                hvf_set_ipa_page_size(4 * KiB);
+            }
+        }
+    }
+#endif
+
     if (__builtin_available(macOS 15.0, *)) {
         if (hvf_nested_virt_enabled()) {
             if (!hvf_arm_el2_supported()) {
@@ -1383,6 +1396,8 @@ static uint64_t get_cntfrq_el0(void)
     return freq_hz;
 }
 
+static void hvf_cca_init_vcpu(ARMCPU *cpu);
+
 int hvf_arch_init_vcpu(CPUState *cpu)
 {
     ARMCPU *arm_cpu = ARM_CPU(cpu);
@@ -1392,6 +1407,8 @@ int hvf_arch_init_vcpu(CPUState *cpu)
     uint64_t pfr;
     hv_return_t ret;
     int i;
+
+    hvf_cca_init_vcpu(arm_cpu);
 
     if (__builtin_available(macOS 15.2, *)) {
         if (hvf_arm_sme2_supported()) {
@@ -1536,6 +1553,85 @@ static void hvf_raise_exception(CPUState *cpu, uint32_t excp,
     env->exception.syndrome = syndrome;
 
     arm_cpu_do_interrupt(cpu);
+}
+
+/*
+ * Emulated CCA guest: enforcing page states in stage 2.
+ *
+ * TCG asks arm_cca_ipa_permitted() from its page-table walker.  Here the walk
+ * is in hardware, so the answer is kept in stage 2 instead: a page the Realm
+ * may not reach through a given view is left with no access, through the
+ * accelerator's deny hook, and the abort it takes is turned into the fault
+ * TCG would have raised.  RSI granules are 4KiB, so this needs the 4KiB
+ * stage-2 granule; the CPU refuses x-cca-ripas without it.
+ */
+static ARMCPU *hvf_cca_cpu;
+
+/* Would TCG fault an access to @ipa, as it arrived (alias bit included)? */
+static bool hvf_cca_denied(CPUARMState *env, hwaddr ipa)
+{
+    uint64_t mask = cca_shared_mask(env);
+
+    return !arm_cca_ipa_permitted(env, ipa & ~mask, ipa & mask);
+}
+
+static bool hvf_cca_ipa_denied(hwaddr ipa)
+{
+    return hvf_cca_cpu && hvf_cca_denied(&hvf_cca_cpu->env, ipa);
+}
+
+static void hvf_cca_ripas_changed(ARMCPU *cpu, uint64_t base, uint64_t top,
+                                  bool restricted)
+{
+    uint64_t alias = cca_shared_mask(&cpu->env);
+
+    /* Both views change: the protected one and the unprotected alias */
+    hvf_update_ipa_range(base, top - base);
+    hvf_update_ipa_range(base | alias, top - base);
+}
+
+static void hvf_cca_ripas_reloaded(void)
+{
+    hvf_update_all_ipa();
+}
+
+static const ArmCcaAccelOps hvf_cca_ops = {
+    .ripas_changed = hvf_cca_ripas_changed,
+    .ripas_reloaded = hvf_cca_ripas_reloaded,
+};
+
+/*
+ * Only a Realm with page states to enforce gets the deny hook, so nothing
+ * else pays for a per-page walk.  vCPUs are set up before guest RAM is
+ * mapped, so the hook is in place for its first mapping.
+ */
+static void hvf_cca_init_vcpu(ARMCPU *cpu)
+{
+    if (cpu->cca_guest && cpu->cca_ripas && !hvf_cca_cpu) {
+        hvf_cca_cpu = cpu;
+        hvf_set_ipa_denied_fn(hvf_cca_ipa_denied);
+    }
+}
+
+/*
+ * The fault TCG raises for the same access: a translation fault at level 0,
+ * reported to EL1 as if from the stage the guest cannot see.  ISV is clear,
+ * as it is for any translation fault.
+ */
+static void hvf_cca_inject_abort(CPUState *cpu, bool insn, bool wnr,
+                                 bool s1ptw, uint64_t va)
+{
+    CPUARMState *env = cpu_env(cpu);
+    int same_el;
+    uint32_t syn;
+
+    cpu_synchronize_state(cpu);
+    same_el = arm_current_el(env) == 1;
+    syn = insn ? syn_insn_abort(same_el, 0, s1ptw, 0x4)
+               : syn_data_abort_no_iss(same_el, 0, 0, 0, s1ptw, wnr, 0x4);
+    env->exception.vaddress = va;
+    hvf_raise_exception(cpu, insn ? EXCP_PREFETCH_ABORT : EXCP_DATA_ABORT,
+                        syn, 1);
 }
 
 static void hvf_psci_cpu_off(ARMCPU *arm_cpu)
@@ -2413,6 +2509,17 @@ static int hvf_handle_exception(CPUState *cpu, hv_vcpu_exit_exception_t *excp)
         trace_hvf_data_abort(excp->virtual_address, ipa, isv,
                              iswrite, s1ptw, len, srt);
 
+        /*
+         * First, before dirty logging can reopen the page or MMIO emulation
+         * can read RAM behind its back: is this a page the Realm gave up?
+         */
+        if (unlikely(arm_cpu->cca_guest && arm_cpu->cca_ripas) &&
+            hvf_cca_denied(env, ipa)) {
+            hvf_cca_inject_abort(cpu, false, iswrite, s1ptw,
+                                 excp->virtual_address);
+            break;
+        }
+
         if (cm) {
             /* We don't cache MMIO regions */
             advance_pc = true;
@@ -2565,6 +2672,12 @@ static int hvf_handle_exception(CPUState *cpu, hv_vcpu_exit_exception_t *excp)
 
         trace_hvf_insn_abort(env->pc, set, fnv, ea, s1ptw, ifsc);
 
+        if (arm_cpu->cca_guest && arm_cpu->cca_ripas &&
+            hvf_cca_denied(env, excp->physical_address)) {
+            hvf_cca_inject_abort(cpu, true, false, s1ptw,
+                                 excp->virtual_address);
+            break;
+        }
         /* fall through */
     }
     default:
@@ -2732,6 +2845,7 @@ static void hvf_vm_state_change(void *opaque, bool running, RunState state)
 
 int hvf_arch_init(void)
 {
+    arm_cca_set_accel_ops(&hvf_cca_ops);
     hvf_state->vtimer_offset = mach_absolute_time();
     vmstate_register(NULL, 0, &vmstate_hvf_vtimer, &vtimer);
     qemu_add_vm_change_state_handler(hvf_vm_state_change, &vtimer);

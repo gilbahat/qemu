@@ -10,6 +10,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/error-report.h"
+#include "qemu/units.h"
 #include "qapi/error.h"
 #include "qapi/qapi-visit-common.h"
 #include "accel/accel-ops.h"
@@ -25,11 +26,39 @@
 bool hvf_allowed;
 bool hvf_kernel_irqchip;
 bool hvf_nested_virt;
+bool hvf_want_4k_ipa_granule;
 static bool hvf_kernel_irqchip_override;
+static uint64_t hvf_ipa_granule;
+static HVFIpaDeniedFn *hvf_ipa_denied;
 
 void hvf_nested_virt_enable(bool nested_virt)
 {
     hvf_nested_virt = nested_virt;
+}
+
+void hvf_request_4k_ipa_granule(void)
+{
+    hvf_want_4k_ipa_granule = true;
+}
+
+uint64_t hvf_ipa_page_size(void)
+{
+    return hvf_ipa_granule ?: qemu_real_host_page_size();
+}
+
+void hvf_set_ipa_page_size(uint64_t size)
+{
+    hvf_ipa_granule = size;
+}
+
+bool hvf_ipa_granule_is_4k(void)
+{
+    return hvf_ipa_page_size() == 4 * KiB;
+}
+
+void hvf_set_ipa_denied_fn(HVFIpaDeniedFn *fn)
+{
+    hvf_ipa_denied = fn;
 }
 
 const char *hvf_return_string(hv_return_t ret)
@@ -61,16 +90,17 @@ void assert_hvf_ok_impl(hv_return_t ret, const char *file, unsigned int line,
 }
 
 /*
- * hv_vm_map(), hv_vm_unmap() and hv_vm_protect() all operate at host page
- * granularity.  Sections which are not host page aligned are therefore never
- * mapped into the guest; accesses to them trap and are emulated as MMIO.
- * Since they are never mapped, they must not be unmapped or reprotected
- * either: passing an unaligned range to the hypervisor returns
+ * hv_vm_map(), hv_vm_unmap() and hv_vm_protect() all operate at the stage-2
+ * granule: the host page size, unless a 4KiB granule was asked for and
+ * granted (hvf_ipa_page_size()).  Sections which are not aligned to it are
+ * therefore never mapped into the guest; accesses to them trap and are
+ * emulated as MMIO.  Since they are never mapped, they must not be unmapped
+ * or reprotected either: passing an unaligned range to the hypervisor returns
  * HV_BAD_ARGUMENT.
  */
 static bool hvf_section_is_host_aligned(const MemoryRegionSection *section)
 {
-    uint64_t page_size = qemu_real_host_page_size();
+    uint64_t page_size = hvf_ipa_page_size();
 
     return QEMU_IS_ALIGNED(section->offset_within_address_space, page_size) &&
            QEMU_IS_ALIGNED(int128_get64(section->size), page_size);
@@ -79,7 +109,7 @@ static bool hvf_section_is_host_aligned(const MemoryRegionSection *section)
 static void do_hv_vm_protect(hwaddr start, size_t size,
                              hv_memory_flags_t flags)
 {
-    intptr_t page_mask = qemu_real_host_page_mask();
+    intptr_t page_mask = -(intptr_t)hvf_ipa_page_size();
     hv_return_t ret;
 
     trace_hvf_vm_protect(start, size, flags,
@@ -93,15 +123,131 @@ static void do_hv_vm_protect(hwaddr start, size_t size,
     assert_hvf_ok(ret);
 }
 
+/*
+ * Apply @flags to [start, start + size), except to pages the guest must not
+ * reach at all (see hvf_set_ipa_denied_fn()), which get no access.  Every
+ * path that widens a mapped page's permissions comes through here, so dirty
+ * logging cannot hand a denied page back to the guest.  Runs of pages with
+ * the same outcome are protected together.
+ */
+static void hvf_protect_range(hwaddr start, size_t size,
+                              hv_memory_flags_t flags)
+{
+    uint64_t page_size = hvf_ipa_page_size();
+    hwaddr run_start = start;
+    hv_memory_flags_t run_flags = 0;
+    hwaddr addr;
+
+    if (!hvf_ipa_denied) {
+        do_hv_vm_protect(start, size, flags);
+        return;
+    }
+
+    for (addr = start; addr < start + size; addr += page_size) {
+        hv_memory_flags_t f = hvf_ipa_denied(addr) ? 0 : flags;
+
+        if (addr == start) {
+            run_flags = f;
+        } else if (f != run_flags) {
+            do_hv_vm_protect(run_start, addr - run_start, run_flags);
+            run_start = addr;
+            run_flags = f;
+        }
+    }
+    do_hv_vm_protect(run_start, start + size - run_start, run_flags);
+}
+
 void hvf_protect_clean_range(hwaddr addr, size_t size)
 {
-    do_hv_vm_protect(addr, size, HV_MEMORY_READ | HV_MEMORY_EXEC);
+    hvf_protect_range(addr, size, HV_MEMORY_READ | HV_MEMORY_EXEC);
 }
 
 void hvf_unprotect_dirty_range(hwaddr addr, size_t size)
 {
-    do_hv_vm_protect(addr, size,
-                     HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC);
+    hvf_protect_range(addr, size,
+                      HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC);
+}
+
+/*
+ * The flags a mapped page should have when nothing is denied: what
+ * hvf_set_phys_mem() maps it with, less write while dirty logging has it
+ * clean.  Returns false for an address that is not mapped at all.
+ */
+static bool hvf_mapped_page_flags(hwaddr ipa, hv_memory_flags_t *flags)
+{
+    uint64_t page_size = hvf_ipa_page_size();
+    MemoryRegionSection section;
+    MemoryRegion *mr;
+    bool writable;
+
+    /*
+     * A page is only mapped if one RAM (or ROMD) region covers all of it:
+     * hvf_set_phys_mem() skips sections that are not granule aligned.
+     */
+    section = memory_region_find(get_system_memory(), ipa, page_size);
+    mr = section.mr;
+    if (!mr) {
+        return false;
+    }
+    if ((!memory_region_is_ram(mr) && !memory_region_is_romd(mr)) ||
+        int128_get64(section.size) != page_size) {
+        memory_region_unref(mr);
+        return false;
+    }
+    writable = !mr->readonly && !mr->rom_device &&
+               !memory_region_get_dirty_log_mask(mr);
+    *flags = HV_MEMORY_READ | HV_MEMORY_EXEC | (writable ? HV_MEMORY_WRITE : 0);
+    memory_region_unref(mr);
+    return true;
+}
+
+void hvf_update_ipa_range(hwaddr start, hwaddr size)
+{
+    uint64_t page_size = hvf_ipa_page_size();
+    hwaddr end, addr, run_start = 0;
+    hv_memory_flags_t run_flags = 0;
+    bool in_run = false;
+
+    start = QEMU_ALIGN_DOWN(start, page_size);
+    end = start + QEMU_ALIGN_UP(size, page_size);
+    for (addr = start; addr < end; addr += page_size) {
+        hv_memory_flags_t flags;
+        bool mapped = hvf_mapped_page_flags(addr, &flags);
+
+        if (mapped && hvf_ipa_denied && hvf_ipa_denied(addr)) {
+            flags = 0;
+        }
+        /* One hv_vm_protect() per run of mapped pages with the same flags */
+        if (in_run && (!mapped || flags != run_flags)) {
+            do_hv_vm_protect(run_start, addr - run_start, run_flags);
+            in_run = false;
+        }
+        if (mapped && !in_run) {
+            run_start = addr;
+            run_flags = flags;
+            in_run = true;
+        }
+    }
+    if (in_run) {
+        do_hv_vm_protect(run_start, end - run_start, run_flags);
+    }
+}
+
+static bool hvf_update_flat_range(Int128 start, Int128 len,
+                                  const MemoryRegion *mr,
+                                  hwaddr offset_in_region, void *opaque)
+{
+    if (memory_region_is_ram(mr)) {
+        hvf_update_ipa_range(int128_get64(start), int128_get64(len));
+    }
+    return false;
+}
+
+void hvf_update_all_ipa(void)
+{
+    RCU_READ_LOCK_GUARD();
+    flatview_for_each_range(address_space_to_flatview(&address_space_memory),
+                            hvf_update_flat_range, NULL);
 }
 
 static void hvf_set_phys_mem(MemoryRegionSection *section, bool add)
@@ -151,6 +297,11 @@ static void hvf_set_phys_mem(MemoryRegionSection *section, bool add)
                      flags & HV_MEMORY_EXEC ?  'X' : '-');
     ret = hv_vm_map(mem, gpa, size, flags);
     assert_hvf_ok(ret);
+
+    /* A new mapping starts out fully accessible; take denied pages back */
+    if (hvf_ipa_denied) {
+        hvf_protect_range(gpa, size, flags);
+    }
 }
 
 static void hvf_log_start(MemoryListener *listener,

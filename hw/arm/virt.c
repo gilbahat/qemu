@@ -4343,6 +4343,11 @@ static int virt_get_physical_address_range(MachineState *ms,
      */
     int cca_bits = vms->cca_guest ? ARM_CCA_DEFAULT_IPA_BITS : 0;
 
+    if (cca_bits) {
+        /* Page states are 4KiB granules; see the CPU's x-cca-ripas check */
+        hvf_request_4k_ipa_granule();
+    }
+
     if (cca_bits > max_ipa_size) {
         error_report("x-cca-guest needs an IPA range of %d bits, larger than "
                      "the one supported by the host (%d bits)",

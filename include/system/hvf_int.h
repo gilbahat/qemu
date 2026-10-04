@@ -79,6 +79,32 @@ void hvf_arch_update_guest_debug(CPUState *cpu);
 void hvf_protect_clean_range(hwaddr addr, size_t size);
 void hvf_unprotect_dirty_range(hwaddr addr, size_t size);
 
+/* Set by hvf_request_4k_ipa_granule(); honoured by hvf_arch_vm_create() */
+extern bool hvf_want_4k_ipa_granule;
+
+/*
+ * The stage-2 granule the VM was created with: the host page size unless
+ * hvf_arch_vm_create() was granted a smaller one and recorded it here.
+ */
+uint64_t hvf_ipa_page_size(void);
+void hvf_set_ipa_page_size(uint64_t size);
+
+/**
+ * HVFIpaDeniedFn: may the guest not reach @ipa at all?
+ *
+ * Optional, for guests whose own memory is partly off-limits to them, such as
+ * an emulated CCA guest's protected pages after it has handed them back.
+ * Denied pages are kept with no access in stage 2 whatever else wants them
+ * mapped, so the guest takes a data abort on them.  Whoever changes the
+ * answer calls hvf_update_ipa_range() for what changed.
+ */
+typedef bool HVFIpaDeniedFn(hwaddr ipa);
+void hvf_set_ipa_denied_fn(HVFIpaDeniedFn *fn);
+
+/* Recompute stage-2 permissions for a range, or for all mapped RAM */
+void hvf_update_ipa_range(hwaddr start, hwaddr size);
+void hvf_update_all_ipa(void);
+
 struct hvf_sw_breakpoint {
     vaddr pc;
     vaddr saved_insn;

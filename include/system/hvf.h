@@ -38,6 +38,15 @@ extern bool hvf_nested_virt;
 
 void hvf_nested_virt_enable(bool nested_virt);
 
+/*
+ * Ask for a 4KiB stage-2 granule rather than the host page size, for a guest
+ * whose memory permissions change at that granularity.  Takes effect when the
+ * VM is created, and only where the host supports it.
+ */
+void hvf_request_4k_ipa_granule(void);
+/* Whether that was granted; false before the VM exists */
+bool hvf_ipa_granule_is_4k(void);
+
 #define TYPE_HVF_ACCEL ACCEL_CLASS_NAME("hvf")
 
 typedef struct HVFState HVFState;

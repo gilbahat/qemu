@@ -185,6 +185,11 @@ static CcaState *cca_state;
 /* How the running accelerator applies page-state changes; see arm_cca_init */
 static const ArmCcaAccelOps *cca_accel_ops;
 
+void arm_cca_set_accel_ops(const ArmCcaAccelOps *ops)
+{
+    cca_accel_ops = ops;
+}
+
 /*
  * Realm-scoped state has to survive migration.
  *
@@ -239,12 +244,8 @@ static int cca_pre_save(void *opaque)
     return 0;
 }
 
-static int cca_post_load(void *opaque, int version_id)
+static void cca_post_load_locked(CcaState *s)
 {
-    CcaState *s = opaque;
-
-    QEMU_LOCK_GUARD(&s->lock);
-
     if (!s->ripas) {
         s->ripas = g_hash_table_new(NULL, NULL);
     }
@@ -263,8 +264,20 @@ static int cca_post_load(void *opaque, int version_id)
         g_byte_array_append(s->token, s->token_bytes, s->token_len);
     }
     s->token_off = s->token_taken;
+}
 
-    /* The page states just changed under everything decided against them */
+static int cca_post_load(void *opaque, int version_id)
+{
+    CcaState *s = opaque;
+
+    WITH_QEMU_LOCK_GUARD(&s->lock) {
+        cca_post_load_locked(s);
+    }
+
+    /*
+     * The page states just changed under everything decided against them.
+     * Outside the lock, because applying that asks arm_cca_ipa_permitted().
+     */
     if (cca_accel_ops) {
         cca_accel_ops->ripas_reloaded();
     }
@@ -331,13 +344,22 @@ static void cca_reset(void *opaque)
 {
     CcaState *s = opaque;
 
-    QEMU_LOCK_GUARD(&s->lock);
-    if (s->ripas) {
-        g_hash_table_remove_all(s->ripas);
+    WITH_QEMU_LOCK_GUARD(&s->lock) {
+        if (s->ripas) {
+            g_hash_table_remove_all(s->ripas);
+        }
+        memset(s->rem, 0, sizeof(s->rem));
+        memset(s->challenge, 0, sizeof(s->challenge));
+        cca_token_discard(s);
     }
-    memset(s->rem, 0, sizeof(s->rem));
-    memset(s->challenge, 0, sizeof(s->challenge));
-    cca_token_discard(s);
+
+    /*
+     * Every granule is RAM again.  Outside the lock, because applying that
+     * asks arm_cca_ipa_permitted(), which takes it.
+     */
+    if (cca_accel_ops) {
+        cca_accel_ops->ripas_reloaded();
+    }
 }
 
 static bool cca_sha256(const struct iovec *iov, size_t niov, uint8_t *out)

@@ -22,3 +22,13 @@ void hvf_nested_virt_enable(bool nested_virt)
      * As such, do nothing here instead of marking as unreachable.
      */
 }
+
+void hvf_request_4k_ipa_granule(void)
+{
+    /* As above: called before anyone knows whether HVF will be used */
+}
+
+bool hvf_ipa_granule_is_4k(void)
+{
+    return false;
+}
