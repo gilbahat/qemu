@@ -179,6 +179,8 @@ struct VirtMachineState {
     OnOffAuto dtb_randomness;
     /* Seeds asked for in create_fdt(), added once the CPUs exist. */
     bool dtb_randomness_pending;
+    /* -M virt,x-cca-guest: an emulated CCA guest, known before the CPUs */
+    bool cca_guest;
     bool second_ns_uart_present;
     OnOffAuto acpi;
     VirtGICType gic_version;

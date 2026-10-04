@@ -2433,11 +2433,28 @@ static void arm_cpu_realizefn(DeviceState *dev, Error **errp)
     }
 
     if (cpu->cca_guest) {
-        if (!tcg_enabled()) {
+        if (!tcg_enabled() && !hvf_enabled()) {
             error_setg(errp, "x-cca-guest emulates the Arm CCA guest interface "
-                       "in TCG; a real Realm is created with "
+                       "under TCG or HVF; a real Realm is created with "
                        "-object rme-guest");
             return;
+        }
+        if (hvf_enabled()) {
+            /*
+             * Page states are tracked but not yet enforced on the guest's
+             * own accesses under HVF: that needs stage 2 to follow them.
+             */
+            if (cpu->cca_ripas) {
+                error_setg(errp, "x-cca-ripas is not yet supported under "
+                           "HVF; use x-cca-ripas=0");
+                return;
+            }
+            /* A Realm runs at EL1; there is no EL2 for it to boot into */
+            if (arm_feature(env, ARM_FEATURE_EL2)) {
+                error_setg(errp, "x-cca-guest cannot be combined with "
+                           "virtualization=on");
+                return;
+            }
         }
         /*
          * The guest derives the bit that separates protected from unprotected
@@ -2449,7 +2466,7 @@ static void arm_cpu_realizefn(DeviceState *dev, Error **errp)
                        "(got %u)", cpu->cca_ipa_bits);
             return;
         }
-        warn_report("x-cca-guest is an EXPERIMENTAL TCG emulation of the Arm "
+        warn_report("x-cca-guest is an EXPERIMENTAL emulation of the Arm "
                     "CCA *guest* interface. There is no Realm, no memory "
                     "protection enforced by hardware and NO GENUINE "
                     "ATTESTATION. Do not rely on it for any security "

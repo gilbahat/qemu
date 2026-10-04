@@ -545,7 +545,7 @@ void aarch64_add_cca_properties(Object *obj)
 {
     ARMCPU *cpu = ARM_CPU(obj);
 
-    cpu->cca_ipa_bits = 40;
+    cpu->cca_ipa_bits = ARM_CCA_DEFAULT_IPA_BITS;
     object_property_add_bool(obj, "x-cca-guest", cpu_arm_get_cca_guest,
                              cpu_arm_set_cca_guest);
     object_property_add_uint8_ptr(obj, "x-cca-ipa-bits", &cpu->cca_ipa_bits,
@@ -964,6 +964,7 @@ void aarch64_host_initfn(Object *obj)
     aarch64_add_kvm_writable_properties(obj);
 #elif defined(CONFIG_HVF)
     hvf_arm_set_cpu_features_from_host(cpu);
+    aarch64_add_cca_properties(obj);
 #elif defined(CONFIG_WHPX)
     whpx_arm_set_cpu_features_from_host(cpu);
 #else

@@ -763,6 +763,13 @@ extern const ArmCcaAccelOps arm_cca_tcg_ops;
 /* Add the x-cca-* properties to a CPU that can run as an emulated CCA guest */
 void aarch64_add_cca_properties(Object *obj);
 
+/*
+ * x-cca-ipa-bits unless set.  Not tighter, because the guest derives the
+ * alias bit as ipa_bits - 1 and folds device addresses against it, so the
+ * bit has to clear everything virt places; 1 << 39 does.
+ */
+#define ARM_CCA_DEFAULT_IPA_BITS 40
+
 /**
  * arm_cca_find_guest_cpu: the first CPU running as an emulated CCA guest.
  *

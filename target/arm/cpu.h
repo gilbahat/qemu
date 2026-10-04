@@ -1074,11 +1074,11 @@ struct ArchCPU {
     bool kvm_rme;
 
     /*
-     * Emulated Arm CCA guest interface (TCG only).  Unrelated to kvm_rme
+     * Emulated Arm CCA guest interface (TCG and HVF).  Unrelated to kvm_rme
      * above, which is the host side of a real Realm.
      */
     bool cca_guest;
-    uint8_t cca_ipa_bits;
+    uint8_t cca_ipa_bits;   /* ARM_CCA_DEFAULT_IPA_BITS unless set */
     uint8_t cca_ripas;
     uint8_t cca_dma;
 

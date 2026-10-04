@@ -1647,6 +1647,15 @@ static bool hvf_handle_psci_call(CPUState *cpu, int *excp_ret)
         ret = QEMU_PSCI_RET_NOT_SUPPORTED;
         break;
     case QEMU_PSCI_1_0_FN_PSCI_FEATURES:
+        /*
+         * An emulated CCA guest answers ARM_SMCCC_VERSION, and a Realm-aware
+         * guest asks here before it will make that call; see the same case
+         * in target/arm/tcg/psci.c.
+         */
+        if (arm_cpu->cca_guest && param[1] == ARM_SMCCC_VERSION_FID) {
+            ret = 0;
+            break;
+        }
         switch (param[1]) {
         case QEMU_PSCI_0_2_FN_PSCI_VERSION:
         case QEMU_PSCI_0_2_FN_MIGRATE_INFO_TYPE:
@@ -2454,6 +2463,14 @@ static int hvf_handle_exception(CPUState *cpu, hv_vcpu_exit_exception_t *excp)
         assert(isv);
 
         /*
+         * An emulated CCA guest reaches its devices through the unprotected
+         * alias: the top IPA bit is a view, not part of the address.  RAM is
+         * mapped at both (see virt's alias of machine->ram), so only device
+         * accesses get here with the bit set.
+         */
+        ipa &= ~cca_shared_mask(env);
+
+        /*
          * Emulate MMIO.
          * TODO: Inject faults for errors.
          */
@@ -2519,6 +2536,12 @@ static int hvf_handle_exception(CPUState *cpu, hv_vcpu_exit_exception_t *excp)
         break;
     case EC_AA64_SMC:
         cpu_synchronize_state(cpu);
+        if (arm_is_cca_call(arm_cpu, EXCP_SMC)) {
+            /* RSI, for the emulated CCA guest interface in target/arm/cca.c */
+            advance_pc = true;
+            arm_handle_cca_call(arm_cpu);
+            break;
+        }
         if (arm_cpu->psci_conduit == QEMU_PSCI_CONDUIT_SMC) {
             /* Secure Monitor Call exception, we need to advance $pc */
             advance_pc = true;

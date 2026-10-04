@@ -294,6 +294,57 @@ static void create_randomness(MachineState *ms, const char *node)
 }
 
 /*
+ * Under an accelerator that sizes the VM itself (HVF), the memory map and the
+ * IPA size are fixed in virt_get_physical_address_range(), before any -cpu
+ * option has been parsed.  So an emulated CCA guest has to be asked for on the
+ * machine there, and the CPUs have to agree with what was sized for.
+ */
+static void virt_check_cca_guest(VirtMachineState *vms)
+{
+    ARMCPU *cca_cpu = arm_cca_find_guest_cpu();
+
+    if (!cca_cpu || tcg_enabled()) {
+        return;
+    }
+    if (!vms->cca_guest) {
+        error_report("an emulated CCA guest under this accelerator is "
+                     "requested with -M virt,x-cca-guest=on, so that the "
+                     "memory map can be laid out for it");
+        exit(1);
+    }
+    if (cca_cpu->cca_ipa_bits != ARM_CCA_DEFAULT_IPA_BITS) {
+        error_report("x-cca-ipa-bits must be %d under this accelerator "
+                     "(got %u)", ARM_CCA_DEFAULT_IPA_BITS,
+                     cca_cpu->cca_ipa_bits);
+        exit(1);
+    }
+}
+
+/*
+ * A Realm reaches shared memory through the top IPA bit.  TCG folds that bit
+ * away in the page-table walk; a hardware stage 2 cannot, so map guest RAM a
+ * second time at its unprotected alias.  It is the same memory and the same
+ * RAMBlock, so dirty logging and migration see one RAM.
+ */
+static void virt_add_cca_ram_alias(VirtMachineState *vms, MemoryRegion *sysmem)
+{
+    MachineState *ms = MACHINE(vms);
+    ARMCPU *cca_cpu = arm_cca_find_guest_cpu();
+    MemoryRegion *alias;
+
+    if (!cca_cpu || tcg_enabled()) {
+        return;
+    }
+    alias = g_new(MemoryRegion, 1);
+    memory_region_init_alias(alias, OBJECT(vms), "cca-unprotected-ram",
+                             ms->ram, 0, memory_region_size(ms->ram));
+    memory_region_add_subregion(sysmem,
+                                vms->memmap[VIRT_MEM].base |
+                                BIT_ULL(cca_cpu->cca_ipa_bits - 1),
+                                alias);
+}
+
+/*
  * Add the DTB's random seeds, unless this turned out to be a Realm.
  *
  * The seeds are part of what a Realm is measured over, so leaving them in
@@ -3055,7 +3106,8 @@ static void machvirt_init(MachineState *machine)
          * that the device "does not have VIRTIO_F_VERSION_1" -- reading zeroes
          * from an address nothing answers.
          */
-        if (armcpu->cca_guest && (int)armcpu->cca_ipa_bits - 1 < pa_bits) {
+        if ((armcpu->cca_guest || vms->cca_guest) &&
+            (int)armcpu->cca_ipa_bits - 1 < pa_bits) {
             pa_bits = armcpu->cca_ipa_bits - 1;
         }
 
@@ -3203,6 +3255,16 @@ static void machvirt_init(MachineState *machine)
             object_property_set_bool(cpuobj, "has_el2", false, NULL);
         }
 
+        if (vms->cca_guest) {
+            if (!object_property_find(cpuobj, "x-cca-guest")) {
+                error_report("x-cca-guest requested, but the CPU type does "
+                             "not support it");
+                exit(1);
+            }
+            object_property_set_bool(cpuobj, "x-cca-guest", true,
+                                     &error_abort);
+        }
+
         if (vmc->no_kvm_steal_time &&
             object_property_find(cpuobj, "kvm-steal-time")) {
             object_property_set_bool(cpuobj, "kvm-steal-time", false, NULL);
@@ -3286,6 +3348,7 @@ static void machvirt_init(MachineState *machine)
         object_unref(cpuobj);
     }
 
+    virt_check_cca_guest(vms);
     virt_add_dtb_randomness(vms);
     virt_cca_guest_psci_conduit(vms);
 
@@ -3298,6 +3361,7 @@ static void machvirt_init(MachineState *machine)
 
     memory_region_add_subregion(sysmem, vms->memmap[VIRT_MEM].base,
                                 machine->ram);
+    virt_add_cca_ram_alias(vms, sysmem);
 
     cxl_fmws_update_mmio();
 
@@ -3510,6 +3574,16 @@ static void virt_set_highmem_ecam(Object *obj, bool value, Error **errp)
     VirtMachineState *vms = VIRT_MACHINE(obj);
 
     vms->highmem_ecam = value;
+}
+
+static bool virt_get_cca_guest(Object *obj, Error **errp)
+{
+    return VIRT_MACHINE(obj)->cca_guest;
+}
+
+static void virt_set_cca_guest(Object *obj, bool value, Error **errp)
+{
+    VIRT_MACHINE(obj)->cca_guest = value;
 }
 
 static bool virt_get_highmem_mmio(Object *obj, Error **errp)
@@ -4261,11 +4335,26 @@ static int virt_get_physical_address_range(MachineState *ms,
     int default_ipa_size, int max_ipa_size)
 {
     VirtMachineState *vms = VIRT_MACHINE(ms);
+    /*
+     * An emulated CCA guest reaches its unprotected alias through the top bit
+     * of an IPA this wide, so nothing may be placed at or above that bit and
+     * the VM must still be able to address it.  See the same reservation for
+     * TCG in machvirt_init().
+     */
+    int cca_bits = vms->cca_guest ? ARM_CCA_DEFAULT_IPA_BITS : 0;
+
+    if (cca_bits > max_ipa_size) {
+        error_report("x-cca-guest needs an IPA range of %d bits, larger than "
+                     "the one supported by the host (%d bits)",
+                     cca_bits, max_ipa_size);
+        return -1;
+    }
 
     /* We freeze the memory map to compute the highest gpa */
-    virt_set_memmap(vms, max_ipa_size);
+    virt_set_memmap(vms, cca_bits ? MIN(max_ipa_size, cca_bits - 1)
+                                  : max_ipa_size);
 
-    int requested_ipa_size = 64 - clz64(vms->highest_gpa);
+    int requested_ipa_size = MAX(64 - clz64(vms->highest_gpa), cca_bits);
 
     /*
      * If we're <= the default IPA size just use the default.
@@ -4436,6 +4525,12 @@ static void virt_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "highmem-ecam",
                                           "Set on/off to enable/disable high "
                                           "memory region for PCI ECAM");
+
+    object_class_property_add_bool(oc, "x-cca-guest", virt_get_cca_guest,
+                                   virt_set_cca_guest);
+    object_class_property_set_description(oc, "x-cca-guest",
+                                          "Run the CPUs as an emulated Arm "
+                                          "CCA guest (sets their x-cca-guest)");
 
     object_class_property_add_bool(oc, "highmem-mmio",
                                    virt_get_highmem_mmio,
