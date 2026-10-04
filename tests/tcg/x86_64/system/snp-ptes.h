@@ -46,7 +46,7 @@ static unsigned long snp_split_base;
  */
 static unsigned long snp_cbit_value;
 
-static unsigned long snp_cbit(void)
+static inline unsigned long snp_cbit(void)
 {
     unsigned int a, b, c, d;
 
@@ -60,7 +60,7 @@ static unsigned long snp_cbit(void)
     return snp_cbit_value;
 }
 
-static unsigned int snp_cbitpos(void)
+static inline unsigned int snp_cbitpos(void)
 {
     unsigned long bit = snp_cbit();
     unsigned int pos = 0;
@@ -73,7 +73,7 @@ static unsigned int snp_cbitpos(void)
 }
 
 /* Build the tables and load them.  @split_addr picks the 2MiB region to split. */
-static void snp_tables_init(unsigned long split_addr)
+static inline void snp_tables_init(unsigned long split_addr)
 {
     unsigned long g, i;
 
@@ -102,25 +102,25 @@ static void snp_tables_init(unsigned long split_addr)
                          : : "r"((unsigned long)snp_pml4) : "memory");
 }
 
-static unsigned long *snp_pte_for(unsigned long va)
+static inline unsigned long *snp_pte_for(unsigned long va)
 {
     return &snp_pt[(va - snp_split_base) / SNP_PAGE_SIZE];
 }
 
-static void snp_invlpg(unsigned long va)
+static inline void snp_invlpg(unsigned long va)
 {
     __asm__ __volatile__("invlpg (%0)" : : "r"(va) : "memory");
 }
 
 /* Map a page encrypted, and drop any translation cached for it. */
-static void snp_map_private(unsigned long va)
+static inline void snp_map_private(unsigned long va)
 {
     *snp_pte_for(va) |= snp_cbit();
     snp_invlpg(va);
 }
 
 /* And back, for a page being handed to a device. */
-static void snp_map_shared(unsigned long va)
+static inline void snp_map_shared(unsigned long va)
 {
     *snp_pte_for(va) &= ~snp_cbit();
     snp_invlpg(va);
