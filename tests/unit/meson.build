@@ -90,7 +90,7 @@ if have_block
     # cca-token.c builds the Arm CCA attestation token for the emulated guest
     # interface.  Compiled in directly, as snp-gcm.c is, because it otherwise
     # lives in a target-specific library.
-    'test-cca-token': [files('../../target/arm/tcg/cca-token.c'), crypto],
+    'test-cca-token': [files('../../target/arm/cca-token.c'), crypto],
     'test-crypto-akcipher': [crypto],
     'test-crypto-secret': [crypto, keyutils],
     'test-crypto-der': [crypto],

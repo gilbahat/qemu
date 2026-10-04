@@ -1,5 +1,5 @@
 /*
- * Emulated Arm CCA guest interface (RSI) for TCG.
+ * Emulated Arm CCA guest interface (RSI).
  *
  * A Realm talks to the Realm Management Monitor through RSI, a set of SMCs.
  * On hardware the RMM is real software running at R-EL2 and the CPU is in
@@ -12,6 +12,11 @@
  * It is not a Realm.  Nothing here is measured by anything trustworthy and
  * nothing enforces confidentiality; the guest is told so on stderr at start-up.
  *
+ * None of this depends on the accelerator.  What does is where an RSI call is
+ * intercepted and how a page-state decision reaches the guest's accesses;
+ * each accelerator that supports this provides an ArmCcaAccelOps for the
+ * latter.
+ *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
@@ -20,7 +25,6 @@
 #include "qemu/lockable.h"
 #include "qemu/error-report.h"
 #include "crypto/hash.h"
-#include "exec/cputlb.h"
 #include "hw/arm/cca-dma.h"
 #include "hw/core/loader.h"
 #include "cpu.h"
@@ -30,6 +34,7 @@
 #include "system/memory.h"
 #include "system/reset.h"
 #include "system/runstate.h"
+#include "system/tcg.h"
 
 /*
  * RSI function IDs.  All are SMC64 with the standard-service owning entity, so
@@ -131,7 +136,7 @@
  * default are stored, so there is nothing to size against guest RAM and
  * nothing to grow when memory is hotplugged.
  */
-typedef struct CcaTcgState {
+typedef struct CcaState {
     QemuMutex lock;
     GHashTable *ripas;
 
@@ -160,14 +165,14 @@ typedef struct CcaTcgState {
     GByteArray *token;
     size_t token_off;
 
-    /* Migration scratch; see vmstate_cca_tcg. */
+    /* Migration scratch; see vmstate_cca. */
     uint32_t ripas_count;
     uint64_t *ripas_gfn;
     uint8_t *ripas_st;
     uint32_t token_len;
     uint8_t *token_bytes;
     uint32_t token_taken;
-} CcaTcgState;
+} CcaState;
 
 typedef struct CcaLaunchRegion {
     hwaddr base;
@@ -175,7 +180,10 @@ typedef struct CcaLaunchRegion {
     const uint8_t *data;
 } CcaLaunchRegion;
 
-static CcaTcgState *cca_state;
+static CcaState *cca_state;
+
+/* How the running accelerator applies page-state changes; see arm_cca_init */
+static const ArmCcaAccelOps *cca_accel_ops;
 
 /*
  * Realm-scoped state has to survive migration.
@@ -199,7 +207,7 @@ static CcaTcgState *cca_state;
  */
 static int cca_pre_save(void *opaque)
 {
-    CcaTcgState *s = opaque;
+    CcaState *s = opaque;
     GHashTableIter it;
     gpointer k, v;
     uint32_t i = 0;
@@ -233,7 +241,7 @@ static int cca_pre_save(void *opaque)
 
 static int cca_post_load(void *opaque, int version_id)
 {
-    CcaTcgState *s = opaque;
+    CcaState *s = opaque;
 
     QEMU_LOCK_GUARD(&s->lock);
 
@@ -256,50 +264,50 @@ static int cca_post_load(void *opaque, int version_id)
     }
     s->token_off = s->token_taken;
 
-    /*
-     * The page states just changed under every cached translation, so nothing
-     * decided against the old ones may be reused.
-     */
-    tlb_flush_all_cpus_synced(first_cpu);
+    /* The page states just changed under everything decided against them */
+    if (cca_accel_ops) {
+        cca_accel_ops->ripas_reloaded();
+    }
     return 0;
 }
 
-static const VMStateDescription vmstate_cca_tcg = {
+static const VMStateDescription vmstate_cca = {
+    /* Named when this was TCG-only; the name is part of the migration stream */
     .name = "cca-tcg",
     .version_id = 1,
     .minimum_version_id = 1,
     .pre_save = cca_pre_save,
     .post_load = cca_post_load,
     .fields = (const VMStateField[]) {
-        VMSTATE_UINT8_ARRAY(rim, CcaTcgState, CCA_HASH_LEN),
-        VMSTATE_UINT8_2DARRAY(rem, CcaTcgState, CCA_REM_COUNT, CCA_HASH_LEN),
-        VMSTATE_BOOL(rim_valid, CcaTcgState),
-        VMSTATE_UINT8_ARRAY(challenge, CcaTcgState, CCA_CHALLENGE_LEN),
-        VMSTATE_BOOL(token_requested, CcaTcgState),
-        VMSTATE_UINT32(token_len, CcaTcgState),
-        VMSTATE_UINT32(token_taken, CcaTcgState),
-        VMSTATE_VBUFFER_ALLOC_UINT32(token_bytes, CcaTcgState, 0, NULL,
+        VMSTATE_UINT8_ARRAY(rim, CcaState, CCA_HASH_LEN),
+        VMSTATE_UINT8_2DARRAY(rem, CcaState, CCA_REM_COUNT, CCA_HASH_LEN),
+        VMSTATE_BOOL(rim_valid, CcaState),
+        VMSTATE_UINT8_ARRAY(challenge, CcaState, CCA_CHALLENGE_LEN),
+        VMSTATE_BOOL(token_requested, CcaState),
+        VMSTATE_UINT32(token_len, CcaState),
+        VMSTATE_UINT32(token_taken, CcaState),
+        VMSTATE_VBUFFER_ALLOC_UINT32(token_bytes, CcaState, 0, NULL,
                                      token_len),
-        VMSTATE_UINT32(ripas_count, CcaTcgState),
-        VMSTATE_VARRAY_UINT32_ALLOC(ripas_gfn, CcaTcgState, ripas_count, 0,
+        VMSTATE_UINT32(ripas_count, CcaState),
+        VMSTATE_VARRAY_UINT32_ALLOC(ripas_gfn, CcaState, ripas_count, 0,
                                     vmstate_info_uint64, uint64_t),
-        VMSTATE_VARRAY_UINT32_ALLOC(ripas_st, CcaTcgState, ripas_count, 0,
+        VMSTATE_VARRAY_UINT32_ALLOC(ripas_st, CcaState, ripas_count, 0,
                                     vmstate_info_uint8, uint8_t),
         VMSTATE_END_OF_LIST()
     }
 };
 
-static CcaTcgState *cca_get_state(void)
+static CcaState *cca_get_state(void)
 {
     if (!cca_state) {
-        cca_state = g_new0(CcaTcgState, 1);
+        cca_state = g_new0(CcaState, 1);
         qemu_mutex_init(&cca_state->lock);
     }
     return cca_state;
 }
 
 /* Discard the token in flight, if any.  The lock is held. */
-static void cca_token_discard(CcaTcgState *s)
+static void cca_token_discard(CcaState *s)
 {
     if (s->token) {
         g_byte_array_free(s->token, TRUE);
@@ -321,7 +329,7 @@ static void cca_token_discard(CcaTcgState *s)
  */
 static void cca_reset(void *opaque)
 {
-    CcaTcgState *s = opaque;
+    CcaState *s = opaque;
 
     QEMU_LOCK_GUARD(&s->lock);
     if (s->ripas) {
@@ -358,7 +366,7 @@ static gint cca_compare_regions(gconstpointer a, gconstpointer b)
  */
 static void cca_rom_load_notify(Notifier *notifier, void *data)
 {
-    CcaTcgState *s = container_of(notifier, CcaTcgState, rom_load_notifier);
+    CcaState *s = container_of(notifier, CcaState, rom_load_notifier);
     RomLoaderNotifyData *rom = data;
     CcaLaunchRegion *region;
 
@@ -401,7 +409,7 @@ static void cca_rom_load_notify(Notifier *notifier, void *data)
  */
 static void cca_measure_launch_image(void *opaque, bool running, RunState state)
 {
-    CcaTcgState *s = opaque;
+    CcaState *s = opaque;
     g_autoptr(GByteArray) buf = g_byte_array_new();
     unsigned granules = 0;
     struct iovec iov;
@@ -457,16 +465,22 @@ static void cca_measure_launch_image(void *opaque, bool running, RunState state)
 void arm_cca_init(void)
 {
     static bool registered;
-    CcaTcgState *s = cca_get_state();
+    CcaState *s = cca_get_state();
 
     if (registered) {
         return;
     }
     registered = true;
 
+#ifdef CONFIG_TCG
+    if (tcg_enabled()) {
+        cca_accel_ops = &arm_cca_tcg_ops;
+    }
+#endif
+
     s->rom_load_notifier.notify = cca_rom_load_notify;
     rom_add_load_notifier(&s->rom_load_notifier);
-    vmstate_register(NULL, 0, &vmstate_cca_tcg, s);
+    vmstate_register(NULL, 0, &vmstate_cca, s);
     qemu_add_vm_change_state_handler(cca_measure_launch_image, s);
     qemu_register_reset(cca_reset, s);
 }
@@ -476,7 +490,7 @@ static gpointer cca_ripas_key(uint64_t ipa)
     return GSIZE_TO_POINTER(ipa >> 12);
 }
 
-static uint64_t cca_ripas_get_locked(CcaTcgState *s, uint64_t ipa)
+static uint64_t cca_ripas_get_locked(CcaState *s, uint64_t ipa)
 {
     gpointer v;
     bool found = s->ripas &&
@@ -489,7 +503,7 @@ static uint64_t cca_ripas_get_locked(CcaTcgState *s, uint64_t ipa)
 
 static uint64_t cca_ripas_get(uint64_t ipa)
 {
-    CcaTcgState *s = cca_get_state();
+    CcaState *s = cca_get_state();
 
     QEMU_LOCK_GUARD(&s->lock);
     return cca_ripas_get_locked(s, ipa);
@@ -497,7 +511,7 @@ static uint64_t cca_ripas_get(uint64_t ipa)
 
 static void cca_ripas_set(uint64_t ipa, uint64_t ripas)
 {
-    CcaTcgState *s = cca_get_state();
+    CcaState *s = cca_get_state();
 
     QEMU_LOCK_GUARD(&s->lock);
     if (!s->ripas) {
@@ -648,14 +662,8 @@ static uint64_t cca_ipa_state_set(ARMCPU *cpu, uint64_t base, uint64_t top,
         cca_ripas_set(ipa, ripas);
     }
 
-    /*
-     * Handing a range back takes access away, so anything already cached for
-     * it has to go.  A transition the other way only adds access and cannot
-     * leave a stale entry behind, which is worth keeping in mind before making
-     * this unconditional: a guest claiming memory does it a granule at a time.
-     */
-    if (ripas != RSI_RIPAS_RAM) {
-        tlb_flush(CPU(cpu));
+    if (cca_accel_ops) {
+        cca_accel_ops->ripas_changed(cpu, base, top, ripas != RSI_RIPAS_RAM);
     }
 
     *new_base = top;
@@ -674,7 +682,7 @@ static uint64_t cca_ipa_state_set(ARMCPU *cpu, uint64_t base, uint64_t top,
  */
 static uint64_t cca_measurement_read(ARMCPU *cpu, uint64_t index)
 {
-    CcaTcgState *s = cca_get_state();
+    CcaState *s = cca_get_state();
     uint8_t value[CCA_MEASUREMENT_LEN] = { 0 };
 
     if (index > RSI_MEASUREMENT_INDEX_MAX) {
@@ -712,7 +720,7 @@ static uint64_t cca_measurement_read(ARMCPU *cpu, uint64_t index)
 static uint64_t cca_measurement_extend(ARMCPU *cpu, uint64_t index,
                                        uint64_t size)
 {
-    CcaTcgState *s = cca_get_state();
+    CcaState *s = cca_get_state();
     uint8_t value[CCA_MEASUREMENT_LEN] = { 0 };
     uint8_t current[CCA_HASH_LEN];
     struct iovec iov[2];
@@ -757,7 +765,7 @@ static uint64_t cca_measurement_extend(ARMCPU *cpu, uint64_t index,
  */
 static uint64_t cca_attest_token_init(ARMCPU *cpu, uint64_t *max_size)
 {
-    CcaTcgState *s = cca_get_state();
+    CcaState *s = cca_get_state();
 
     QEMU_LOCK_GUARD(&s->lock);
     cca_token_discard(s);
@@ -789,7 +797,7 @@ static uint64_t cca_attest_token_continue(ARMCPU *cpu, uint64_t addr,
                                           uint64_t offset, uint64_t size,
                                           uint64_t *written)
 {
-    CcaTcgState *s = cca_get_state();
+    CcaState *s = cca_get_state();
     size_t n;
 
     *written = 0;
@@ -867,7 +875,7 @@ static uint64_t cca_attest_token_continue(ARMCPU *cpu, uint64_t addr,
 static uint64_t cca_ipa_state_get(ARMCPU *cpu, uint64_t base, uint64_t top,
                                   uint64_t *new_top, uint64_t *ripas)
 {
-    CcaTcgState *s = cca_get_state();
+    CcaState *s = cca_get_state();
     uint64_t ipa;
 
     if ((base & (RSI_GRANULE_SIZE - 1)) || (top & (RSI_GRANULE_SIZE - 1)) ||

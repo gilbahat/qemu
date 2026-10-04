@@ -14,7 +14,7 @@
 #include "qemu/osdep.h"
 #include "crypto/hash.h"
 #include "crypto/init.h"
-#include "../../target/arm/tcg/cca-token.h"
+#include "../../target/arm/cca-token.h"
 
 #define CBOR_UINT   0
 #define CBOR_NINT   1

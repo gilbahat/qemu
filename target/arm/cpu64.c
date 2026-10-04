@@ -531,6 +531,31 @@ void aarch64_add_sve_properties(Object *obj)
 #endif
 }
 
+static bool cpu_arm_get_cca_guest(Object *obj, Error **errp)
+{
+    return ARM_CPU(obj)->cca_guest;
+}
+
+static void cpu_arm_set_cca_guest(Object *obj, bool value, Error **errp)
+{
+    ARM_CPU(obj)->cca_guest = value;
+}
+
+void aarch64_add_cca_properties(Object *obj)
+{
+    ARMCPU *cpu = ARM_CPU(obj);
+
+    cpu->cca_ipa_bits = 40;
+    object_property_add_bool(obj, "x-cca-guest", cpu_arm_get_cca_guest,
+                             cpu_arm_set_cca_guest);
+    object_property_add_uint8_ptr(obj, "x-cca-ipa-bits", &cpu->cca_ipa_bits,
+                                  OBJ_PROP_FLAG_READWRITE);
+    object_property_add_uint8_ptr(obj, "x-cca-ripas", &cpu->cca_ripas,
+                                  OBJ_PROP_FLAG_READWRITE);
+    object_property_add_uint8_ptr(obj, "x-cca-dma", &cpu->cca_dma,
+                                  OBJ_PROP_FLAG_READWRITE);
+}
+
 void aarch64_add_sme_properties(Object *obj)
 {
     ARMCPU *cpu = ARM_CPU(obj);

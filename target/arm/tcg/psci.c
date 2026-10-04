@@ -180,7 +180,7 @@ void arm_handle_psci_call(ARMCPU *cpu)
          * it will use the conduit for anything else -- Linux's
          * psci_init_smccc() asks about ARM_SMCCC_VERSION and, told no,
          * settles on 1.0 and never looks for RSI.  The emulated CCA interface
-         * answers that call (see target/arm/tcg/cca.c); this is what lets the
+         * answers that call (see target/arm/cca.c); this is what lets the
          * guest find out it may make it.
          *
          * Only for a CCA guest.  Every other guest sees exactly what it did

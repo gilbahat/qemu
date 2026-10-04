@@ -714,7 +714,7 @@ bool arm_is_psci_call(ARMCPU *cpu, int excp_type);
 /* Actually handle a PSCI call */
 void arm_handle_psci_call(ARMCPU *cpu);
 
-#if defined(CONFIG_USER_ONLY) || !defined(CONFIG_TCG)
+#ifdef CONFIG_USER_ONLY
 static inline bool arm_is_cca_call(ARMCPU *cpu, int excp_type)
 {
     return false;
@@ -730,13 +730,38 @@ void arm_handle_cca_call(ARMCPU *cpu);
  * Arm Architecture Service calls.  Not RSI, but answered by the emulated CCA
  * guest interface, because a Realm always has an RMM underneath it that
  * provides them and a Realm-aware guest checks for SMCCC 1.1 before it will
- * look for RSI at all.  See target/arm/tcg/cca.c.
+ * look for RSI at all.  See target/arm/cca.c.
  */
 #define ARM_SMCCC_VERSION_FID       0x80000000
 #define ARM_SMCCC_ARCH_FEATURES_FID 0x80000001
 
 /* Create the CCA state up front, so it exists before the guest runs */
 void arm_cca_init(void);
+
+/**
+ * ArmCcaAccelOps: how an accelerator applies the emulated Realm's page states.
+ *
+ * target/arm/cca.c decides what a Realm may reach; the accelerator decides
+ * how that decision is enforced on the guest's own accesses, so it is told
+ * whenever the answer may have changed.
+ */
+typedef struct ArmCcaAccelOps {
+    /**
+     * @ripas_changed: the guest changed the RIPAS of [@base, @top)
+     * @restricted: the change can only have taken access away, so anything
+     * cached from before it is now stale.  A change that only grants access
+     * cannot leave a stale decision behind.
+     */
+    void (*ripas_changed)(ARMCPU *cpu, uint64_t base, uint64_t top,
+                          bool restricted);
+    /** @ripas_reloaded: every page state was just replaced, e.g. by loadvm */
+    void (*ripas_reloaded)(void);
+} ArmCcaAccelOps;
+
+extern const ArmCcaAccelOps arm_cca_tcg_ops;
+
+/* Add the x-cca-* properties to a CPU that can run as an emulated CCA guest */
+void aarch64_add_cca_properties(Object *obj);
 
 /**
  * arm_cca_find_guest_cpu: the first CPU running as an emulated CCA guest.
@@ -760,9 +785,7 @@ bool arm_cca_gpa_is_shared(CPUARMState *env, uint64_t ipa);
 /**
  * cca_shared_mask: the IPA bit that selects the unprotected alias
  *
- * Zero unless this is an emulated CCA guest.  Inline here rather than in
- * cca.c because the translation path needs it and is built for
- * configurations where cca.c is not.
+ * Zero unless this is an emulated CCA guest.
  */
 static inline uint64_t cca_shared_mask(CPUARMState *env)
 {

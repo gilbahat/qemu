@@ -57,6 +57,8 @@ arm_common_system_ss.add(when: 'CONFIG_ARM_COMPATIBLE_SEMIHOSTING',
 arm_common_system_ss.add(files(
   'arch_dump.c',
   'arm-powerctl.c',
+  'cca.c',
+  'cca-token.c',
   'cortex-regs.c',
   'cpregs-omap.c',
   'cpu-irq.c',

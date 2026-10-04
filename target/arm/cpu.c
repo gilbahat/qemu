@@ -1312,10 +1312,7 @@ static void arm_cpu_initfn(Object *obj)
 #ifndef CONFIG_USER_ONLY
 /*
  * A Realm is one thing, but it is selected with a CPU property, so this is how
- * anything outside target/arm asks whether it is running one.  It lives here
- * rather than in tcg/cca.c because callers in hw/arm are built for
- * configurations that have no TCG at all, where the emulation is absent and
- * the answer is simply no.
+ * anything outside target/arm asks whether it is running one.
  */
 ARMCPU *arm_cca_find_guest_cpu(void)
 {
